@@ -115,6 +115,7 @@ impl AppSession for SvtSession {
             streams,
             stream_type: normalize_stream_type(media.stream_type),
             content_id: None,
+            metadata: None,
             title: resolved.title.or_else(|| metadata_title(metadata)),
             subtitle: resolved.subtitle.or_else(|| metadata_subtitle(metadata)),
             images: metadata.map(|m| m.images.clone()).unwrap_or_default(),

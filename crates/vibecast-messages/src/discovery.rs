@@ -51,7 +51,7 @@ impl DeviceInfoResponse {
             device_id,
             device_model,
             friendly_name,
-            device_capabilities: 4101,
+            device_capabilities: 199428,
             device_icon_url: String::new(),
             control_notifications: 1,
             receiver_metrics_id: String::new(),

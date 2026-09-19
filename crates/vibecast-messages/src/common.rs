@@ -215,7 +215,7 @@ pub struct MediaImage {
 }
 
 /// Metadata for a media item.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaMetadata {
     /// Metadata schema selector (0 = generic, 1 = movie, ...).
@@ -227,6 +227,15 @@ pub struct MediaMetadata {
     /// Subtitle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    /// Track artist (music metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// Album title (music metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_name: Option<String>,
+    /// Album artist (music metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
     /// Series title (TV).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_title: Option<String>,

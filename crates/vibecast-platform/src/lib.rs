@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use vibecast_apps_default_media::DefaultMedia;
 use vibecast_apps_primevideo::PrimeVideo;
 use vibecast_apps_svtplay::SvtPlay;
 use vibecast_apps_tv4play::Tv4Play;
@@ -318,7 +319,8 @@ pub async fn run(
 fn load_or_create_installation_id(data_dir: &Path) -> Result<uuid::Uuid, PlatformError> {
     let path = data_dir.join(INSTALLATION_ID_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(value) => parse_installation_id(&path, &value),
+        Ok(value) => parse_installation_id(&path, &value)
+            .or_else(|_| read_concurrently_created_installation_id(&path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_installation_id(&path),
         Err(source) => Err(PlatformError::StateRead { path, source }),
     }
@@ -390,6 +392,7 @@ fn build_app_providers() -> Vec<Arc<dyn AppProvider>> {
         Arc::new(Viaplay::new()),
         Arc::new(PrimeVideo::new()),
         Arc::new(YouTube::new()),
+        Arc::new(DefaultMedia),
     ]
 }
 
@@ -687,6 +690,7 @@ mod tests {
         assert!(keys.contains(&"viaplay"));
         assert!(keys.contains(&"primevideo"));
         assert!(keys.contains(&"youtube"));
+        assert!(keys.contains(&"default_media"));
     }
 
     #[tokio::test]
@@ -816,6 +820,26 @@ mod tests {
 
         assert_eq!(ids[0], ids[1]);
         assert_eq!(ids[0], load_or_create_installation_id(&data_dir).unwrap());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn initially_empty_installation_id_waits_for_writer() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "vibecast-platform-empty-installation-id-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join(INSTALLATION_ID_FILE);
+        std::fs::write(&path, "").unwrap();
+        let id = uuid::Uuid::new_v4();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(path, id.to_string()).unwrap();
+        });
+        let result = load_or_create_installation_id(&data_dir);
+        writer.join().unwrap();
+        assert_eq!(result.unwrap(), id);
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 

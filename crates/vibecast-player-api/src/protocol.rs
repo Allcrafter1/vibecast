@@ -8,8 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use vibecast_messages::{IdleReason, MediaImage, PlayerState, StreamType};
+use vibecast_messages::{IdleReason, MediaImage, MediaMetadata, PlayerState, StreamType};
 use vibecast_settings::SettingValue;
+
+/// Current external-player wire protocol. Missing registration versions are
+/// treated as legacy v1; v2 adds explicit output-origin control requests.
+pub const PLAYER_PROTOCOL_VERSION: u16 = 2;
 
 /// Supported DRM key systems (EME key-system identifiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +62,9 @@ pub struct PlaybackStreamPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackMediaPayload {
+    /// Original typed sender metadata, when retained by the app provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MediaMetadata>,
     /// Stream candidates in preference order.
     #[serde(default)]
     pub streams: Vec<PlaybackStreamPayload>,
@@ -89,6 +96,7 @@ pub struct PlaybackMediaPayload {
 impl Default for PlaybackMediaPayload {
     fn default() -> Self {
         Self {
+            metadata: None,
             streams: Vec::new(),
             stream_type: StreamType::default(),
             title: None,
@@ -181,6 +189,17 @@ impl PlayerCommand {
     rename_all_fields = "camelCase"
 )]
 pub enum PlayerReport {
+    /// Optional processed cover, correlated with its original image URL.
+    Artwork {
+        session_id: String,
+        source_url: String,
+        url: String,
+    },
+    /// A user action originating at the physical output device.
+    ControlRequest {
+        session_id: String,
+        control: PlayerControlRequest,
+    },
     /// Player state update.
     State {
         /// Owning session id.
@@ -196,6 +215,10 @@ pub enum PlayerReport {
         /// Reason for entering IDLE, if applicable.
         #[serde(default)]
         idle_reason: Option<IdleReason>,
+        #[serde(default)]
+        volume: Option<f64>,
+        #[serde(default)]
+        muted: Option<bool>,
     },
     /// Player error.
     Error {
@@ -213,17 +236,50 @@ impl PlayerReport {
     #[must_use]
     pub fn session_id(&self) -> &str {
         match self {
-            PlayerReport::State { session_id, .. } | PlayerReport::Error { session_id, .. } => {
-                session_id
-            }
+            PlayerReport::State { session_id, .. }
+            | PlayerReport::Error { session_id, .. }
+            | PlayerReport::Artwork { session_id, .. }
+            | PlayerReport::ControlRequest { session_id, .. } => session_id,
         }
     }
+}
+
+/// Explicit controls supported from an output device back into the active app.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "command", rename_all = "camelCase")]
+pub enum PlayerControlRequest {
+    Play,
+    Pause,
+    Stop,
+    Seek { position: f64 },
+    Volume { level: f64, muted: bool },
+    Next,
+    Previous,
+}
+
+/// Capability names advertised independently from a concrete control event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlayerControlKind {
+    Play,
+    Pause,
+    Stop,
+    Seek,
+    Volume,
+    Next,
+    Previous,
+}
+
+fn legacy_protocol_version() -> u16 {
+    1
 }
 
 /// Player identity and capabilities supplied by the mandatory registration frame.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerRegistration {
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
     pub player_id: String,
     pub name: String,
     #[serde(default)]
@@ -243,6 +299,7 @@ pub struct PlayerCapabilitiesPayload {
     pub frame_rates: Vec<u32>,
     pub subtitle_formats: Vec<String>,
     pub hdcp_level: Option<String>,
+    pub control_requests: Vec<PlayerControlKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -296,6 +353,17 @@ pub struct AppSettingsPayload {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ClientMessage {
+    #[serde(rename = "artwork")]
+    Artwork {
+        session_id: String,
+        source_url: String,
+        url: String,
+    },
+    #[serde(rename = "controlRequest")]
+    ControlRequest {
+        session_id: String,
+        control: PlayerControlRequest,
+    },
     #[serde(rename = "register")]
     Register { player: PlayerRegistration },
     #[serde(rename = "state")]
@@ -308,6 +376,10 @@ pub enum ClientMessage {
         duration: Option<f64>,
         #[serde(default)]
         idle_reason: Option<IdleReason>,
+        #[serde(default)]
+        volume: Option<f64>,
+        #[serde(default)]
+        muted: Option<bool>,
     },
     #[serde(rename = "error")]
     Error {
@@ -327,18 +399,38 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn into_report(self) -> Option<PlayerReport> {
         match self {
+            Self::Artwork {
+                session_id,
+                source_url,
+                url,
+            } => Some(PlayerReport::Artwork {
+                session_id,
+                source_url,
+                url,
+            }),
+            Self::ControlRequest {
+                session_id,
+                control,
+            } => Some(PlayerReport::ControlRequest {
+                session_id,
+                control,
+            }),
             Self::State {
                 session_id,
                 player_state,
                 current_time,
                 duration,
                 idle_reason,
+                volume,
+                muted,
             } => Some(PlayerReport::State {
                 session_id,
                 player_state,
                 current_time,
                 duration,
                 idle_reason,
+                volume,
+                muted,
             }),
             Self::Error {
                 session_id,
@@ -446,6 +538,7 @@ mod tests {
         assert_eq!(value["media"]["startTime"], 0.0);
         // drm omitted when absent
         assert!(value["media"]["streams"][0].get("drm").is_none());
+        assert!(value["media"].get("metadata").is_none());
     }
 
     #[test]
@@ -480,8 +573,27 @@ mod tests {
                 assert_eq!(player_state, PlayerState::Playing);
                 assert_eq!(current_time, 21.5);
             }
-            PlayerReport::Error { .. } => panic!("expected state report"),
+            _ => panic!("expected state report"),
         }
+    }
+
+    #[test]
+    fn output_control_report_is_typed_and_session_scoped() {
+        let message: ClientMessage = serde_json::from_value(json!({
+            "type": "controlRequest",
+            "sessionId": "s1",
+            "control": { "command": "seek", "position": 42.5 }
+        }))
+        .unwrap();
+        let report = message.into_report().expect("control report");
+        assert_eq!(report.session_id(), "s1");
+        assert!(matches!(
+            report,
+            PlayerReport::ControlRequest {
+                control: PlayerControlRequest::Seek { position: 42.5 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -512,6 +624,7 @@ mod tests {
             panic!("expected registration");
         };
         assert_eq!(player.player_id, "p1");
+        assert_eq!(player.protocol_version, 1);
         assert_eq!(player.capabilities.video_codecs, ["h264"]);
     }
 

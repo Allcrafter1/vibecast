@@ -1,5 +1,7 @@
 //! YouTube video metadata and progressive-stream resolution.
 
+use std::process::Stdio;
+
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use prost::Message as _;
@@ -11,10 +13,12 @@ use vibecast_sdk::{
     StreamType,
 };
 
-const CLIENT_NAME: &str = "ANDROID_VR";
-const CLIENT_VERSION: &str = "1.57";
-const CLIENT_USER_AGENT: &str =
-    "com.google.android.apps.youtube.vr.oculus/1.57 (Linux; U; Android 12L; en_US)";
+// The VR client is currently challenged by YouTube for otherwise public
+// videos.  The regular Android client returns the same clear adaptive
+// formats without requiring a browser login or cookies.
+const CLIENT_NAME: &str = "ANDROID";
+const CLIENT_VERSION: &str = "20.10.38";
+const CLIENT_USER_AGENT: &str = "com.google.android.youtube/20.10.38";
 
 pub(crate) const PREFERRED_VIDEO_CODEC_KEY: SettingKey<String> =
     SettingKey::new("preferred_video_codec");
@@ -53,6 +57,13 @@ impl PreferredVideoCodec {
 pub(crate) struct Resolver {
     http: reqwest::Client,
     endpoints: Endpoints,
+    #[cfg(test)]
+    test_requests: Option<
+        tokio::sync::mpsc::UnboundedSender<(
+            String,
+            tokio::sync::oneshot::Sender<Result<PlaybackMedia, ResolveError>>,
+        )>,
+    >,
 }
 
 #[derive(Clone)]
@@ -71,10 +82,25 @@ impl Default for Endpoints {
 }
 
 impl Resolver {
+    #[cfg(test)]
+    pub(crate) fn controlled() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<(
+            String,
+            tokio::sync::oneshot::Sender<Result<PlaybackMedia, ResolveError>>,
+        )>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut resolver = Self::new(reqwest::Client::new());
+        resolver.test_requests = Some(tx);
+        (resolver, rx)
+    }
     pub(crate) fn new(http: reqwest::Client) -> Self {
         Self {
             http,
             endpoints: Endpoints::default(),
+            #[cfg(test)]
+            test_requests: None,
         }
     }
 
@@ -86,10 +112,53 @@ impl Resolver {
                 watch: format!("{base}/watch"),
                 player: format!("{base}/youtubei/v1/player"),
             },
+            test_requests: None,
         }
     }
 
     pub(crate) async fn resolve(
+        &self,
+        video_id: &str,
+        start_time: f64,
+        capabilities: &PlayerCapabilities,
+        preferred_video_codec: PreferredVideoCodec,
+    ) -> Result<PlaybackMedia, ResolveError> {
+        #[cfg(test)]
+        if let Some(requests) = &self.test_requests {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            requests.send((video_id.to_owned(), tx)).unwrap();
+            return rx.await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        // Metadata and checked audio extraction are independent network work.
+        // Join both futures rather than waiting for metadata before extraction.
+        let metadata =
+            self.resolve_metadata(video_id, start_time, capabilities, preferred_video_codec);
+        let audio = async {
+            let result = external_audio_url(video_id).await;
+            let elapsed = started.elapsed().as_millis();
+            (result, elapsed)
+        };
+        let metadata = async {
+            let result = metadata.await;
+            (result, started.elapsed().as_millis())
+        };
+        let ((media, metadata_ms), (audio, audio_ms)) = tokio::join!(metadata, audio);
+        tracing::info!(%video_id, metadata_ms = metadata_ms as u64,
+            audio_ms = audio_ms as u64, total_ms = started.elapsed().as_millis() as u64,
+            "YouTube parallel resolution completed");
+        let mut media = media?;
+        let url = audio.ok_or(ResolveError::Protocol("external audio resolver failed"))?;
+        let content_type = if url.contains("/manifest/") {
+            "application/vnd.apple.mpegurl"
+        } else {
+            "application/octet-stream"
+        };
+        media.streams = vec![PlaybackStream::url(url, content_type)];
+        Ok(media)
+    }
+
+    async fn resolve_metadata(
         &self,
         video_id: &str,
         start_time: f64,
@@ -138,6 +207,170 @@ impl Resolver {
         }
 
         playback_media(response, start_time, capabilities, preferred_video_codec)
+    }
+}
+
+async fn external_audio_url(video_id: &str) -> Option<String> {
+    let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
+    let mut command = tokio::process::Command::new("yt-dlp");
+    command.args([
+        "--no-warnings",
+        "--no-playlist",
+        // A listed format may still return HTTP 403. Let the upstream
+        // extractor probe candidates before handing a URL to the player.
+        "--check-formats",
+        "-f",
+        "ba",
+        "--get-url",
+        &watch_url,
+    ]);
+    let output = checked_process_output(command, std::time::Duration::from_secs(35)).await?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|line| line.starts_with("https://"))
+        .map(str::to_owned)
+}
+
+// A cancelled resolver must terminate the owned process group before the next
+// resolver starts. The supervisor continues draining/reaping after cancellation.
+struct ProcessCancellation {
+    pid: u32,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ProcessCancellation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            if cancel.is_closed() {
+                return;
+            } // supervisor already completed/reaped
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", self.pid)])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = cancel.send(());
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tests {
+    use super::*;
+
+    async fn process_tree_case(cancel: bool) {
+        let path = std::env::temp_dir().join(format!("vibecast-child-{}", uuid::Uuid::new_v4()));
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo $$ $! > \"$1\"; wait", "test"])
+            .arg(&path);
+        let job = tokio::spawn(checked_process_output(
+            command,
+            std::time::Duration::from_millis(if cancel { 10_000 } else { 500 }),
+        ));
+        let pids = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let pids: Vec<u32> = text
+                        .split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            job.abort();
+            assert!(job.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(job.await.unwrap().is_none());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let leader_gone = !std::path::Path::new(&format!("/proc/{}", pids[0])).exists();
+                let child_dead = std::fs::read_to_string(format!("/proc/{}/stat", pids[1]))
+                    .map(|s| s.split_once(") ").unwrap().1.starts_with('Z'))
+                    .unwrap_or(true);
+                if leader_gone && child_dead {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader must be reaped and helper must not keep running");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminates_process_tree() {
+        process_tree_case(true).await;
+    }
+    #[tokio::test]
+    async fn timeout_terminates_process_tree() {
+        process_tree_case(false).await;
+    }
+    #[tokio::test]
+    async fn normal_process_completion_preserves_output() {
+        let mut command = tokio::process::Command::new("printf");
+        command.arg("checked-output");
+        let output = checked_process_output(command, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"checked-output");
+    }
+}
+
+async fn checked_process_output(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().ok()?;
+    let pid = child.id()?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut guard = ProcessCancellation {
+        pid,
+        cancel: Some(cancel_tx),
+    };
+    let supervisor = tokio::spawn(async move {
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        tokio::select! {
+            result = &mut output => result.ok(),
+            _ = cancel_rx => {
+                // Unix group was already killed by the cancellation guard.
+                #[cfg(unix)]
+                { let _ = output.await; }
+                None
+            }
+        }
+    });
+    match tokio::time::timeout(timeout, supervisor).await {
+        Ok(Ok(output)) => {
+            guard.cancel.take();
+            output
+        }
+        _ => None, // guard terminates the process group and wakes the reaper
     }
 }
 
@@ -396,20 +629,30 @@ fn playback_media(
         .map(|tracklist| tracklist.caption_tracks)
         .unwrap_or_default();
 
-    let (manifest, stream_duration) = build_dash_manifest(
-        &formats,
-        &caption_tracks,
-        capabilities,
-        preferred_video_codec,
-    )?;
+    // This receiver is primarily an audio endpoint.  Returning the selected
+    // audio rendition directly avoids handing MPV a synthetic DASH document
+    // whose signed Googlevideo BaseURLs require special HTTP headers and are
+    // otherwise intercepted by MPV's yt-dlp hook.  The URL is freshly signed
+    // for every LOAD, so it remains short-lived and is never persisted.
+    let audio = formats
+        .iter()
+        .filter_map(AudioRep::from_format)
+        .filter(|rep| {
+            capabilities
+                .audio_codecs
+                .iter()
+                .any(|codec| codec == rep.codec.token())
+        })
+        .max_by_key(|rep| rep.bitrate)
+        .ok_or(ResolveError::NoCompatibleStream)?;
+    let audio_url = audio.url.to_owned();
+    let audio_content_type = audio.container.to_owned();
 
-    let duration = stream_duration.or_else(|| {
+    let duration = details.as_ref().and_then(|details| {
         details
-            .as_ref()?
             .length_seconds
-            .as_deref()?
-            .parse::<f64>()
-            .ok()
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
     });
     let images = details
         .as_ref()
@@ -430,16 +673,14 @@ fn playback_media(
 
     Ok(PlaybackMedia {
         session_id: String::new(),
-        streams: vec![PlaybackStream::inline_manifest(
-            manifest,
-            "application/dash+xml",
-        )],
+        streams: vec![PlaybackStream::url(audio_url, audio_content_type)],
         stream_type: StreamType::Buffered,
         content_id: details
             .as_ref()
             .and_then(|details| details.video_id.clone()),
         title: details.as_ref().and_then(|details| details.title.clone()),
         subtitle: details.as_ref().and_then(|details| details.author.clone()),
+        metadata: None,
         images,
         duration,
         autoplay: true,
@@ -1125,6 +1366,28 @@ fn valid_video_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "explicit live network probe; requires yt-dlp on PATH"]
+    async fn live_parallel_audio_resolution() {
+        let resolver = super::Resolver::new(reqwest::Client::new());
+        for id in ["b7l31agg58g", "qXCwga3LUO0"] {
+            let started = std::time::Instant::now();
+            let result = resolver
+                .resolve(
+                    id,
+                    0.0,
+                    &Default::default(),
+                    super::PreferredVideoCodec::Auto,
+                )
+                .await;
+            println!(
+                "live probe video={id} elapsed_ms={} success={}",
+                started.elapsed().as_millis(),
+                result.is_ok()
+            );
+            assert!(result.is_ok(), "live resolution failed for {id}");
+        }
+    }
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1603,7 +1866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_returns_inline_dash_manifest() {
+    async fn metadata_fixture_returns_audio_and_metadata_without_external_extraction() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/watch"))
@@ -1621,6 +1884,7 @@ mod tests {
                     "videoId": "dQw4w9WgXcQ",
                     "title": "Example",
                     "author": "Channel",
+                    "lengthSeconds": "213",
                     "thumbnail": {"thumbnails": [{
                         "url": "https://img.example/large.jpg", "width": 1280, "height": 720
                     }]}
@@ -1642,23 +1906,16 @@ mod tests {
         let mut capabilities = caps(&["av1", "vp9", "h264"], &["opus", "aac"], &[], (3840, 2160));
         capabilities.subtitle_formats = vec!["vtt".into()];
         let media = resolver
-            .resolve("dQw4w9WgXcQ", 12.5, &capabilities, PreferredVideoCodec::Vp9)
+            .resolve_metadata("dQw4w9WgXcQ", 12.5, &capabilities, PreferredVideoCodec::Vp9)
             .await
             .unwrap();
 
         assert_eq!(media.streams.len(), 1);
-        assert_eq!(media.streams[0].content_type, "application/dash+xml");
-        let StreamSource::InlineManifest(manifest) = &media.streams[0].source else {
-            panic!("expected an inline manifest");
-        };
-        assert!(manifest.starts_with("<?xml"));
-        assert!(manifest.contains("<MPD"));
-        assert!(manifest.contains("codecs=\"vp9\""));
-        assert!(!manifest.contains("av01"));
-        assert!(manifest.contains("<Label>English</Label>"));
+        assert_eq!(media.streams[0].content_type, "audio/webm");
+        assert!(matches!(&media.streams[0].source, StreamSource::Url(_)));
         assert_eq!(media.title.as_deref(), Some("Example"));
         assert_eq!(media.subtitle.as_deref(), Some("Channel"));
-        assert!((media.duration.unwrap() - 213.04).abs() < 0.001);
+        assert_eq!(media.duration, Some(213.0));
         assert_eq!(media.start_time, 12.5);
     }
 }

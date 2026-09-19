@@ -57,7 +57,7 @@ impl CastServiceTxt {
             friendly_name: friendly_name.into(),
             id: clean_id.into(),
             cd: cert_digest.to_uppercase(),
-            ca: "463365".into(),
+            ca: "199428".into(),
             bs: bs.into(),
             st: "0".into(),
             nf: "1".into(),
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(txt.friendly_name, "Living Room");
         assert_eq!(txt.id, "12345678123412341234123456789abc");
         assert_eq!(txt.cd, "ABCDEF"); // uppercased
-        assert_eq!(txt.ca, "463365");
+        assert_eq!(txt.ca, "199428");
         assert_eq!(txt.st, "0");
         assert_eq!(txt.ic, "/setup/icon.png");
         assert_eq!(

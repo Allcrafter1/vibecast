@@ -172,7 +172,7 @@ impl PlayerManager {
         }
 
         let device_id = player_device_id(&self.config.installation_id, &player_id);
-        let friendly_name = format!("{} [vibecast]", registration.name);
+        let friendly_name = registration.name.clone();
         let eureka_identity = self.eureka_identity(&friendly_name, &device_id);
 
         let params = ReceiverParams {

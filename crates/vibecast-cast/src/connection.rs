@@ -265,6 +265,16 @@ fn device_auth_response(message: &CastMessage, auth: &AuthMaterial) -> Option<Ve
         ),
     };
 
+    tracing::info!(
+        requested_hash,
+        requested_sig,
+        nonce_bytes = challenge
+            .challenge
+            .as_ref()
+            .and_then(|inner| inner.sender_nonce.as_ref())
+            .map_or(0, |nonce| nonce.len()),
+        "device auth parameters (hash 0=SHA1, 1=SHA256)"
+    );
     if requested_sig != SignatureAlgorithm::RsassaPkcs1v15 as i32 {
         return Some(build_auth_error(
             AuthErrorType::SignatureAlgorithmUnavailable,

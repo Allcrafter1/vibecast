@@ -342,6 +342,7 @@ impl AppSession for PrimeSession {
             streams,
             stream_type,
             content_id: Some(title_id.to_string()),
+            metadata: None,
             title,
             subtitle,
             images: metadata.map(|m| m.images.clone()).unwrap_or_default(),

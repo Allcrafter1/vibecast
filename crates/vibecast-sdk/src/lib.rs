@@ -92,8 +92,8 @@ pub use context::{
 pub use error::{LaunchError, MediaResolveCode, MediaResolveError};
 pub use license::{LicenseForwarder, LicenseRequest, LicenseResponse, LicenseRoute};
 pub use types::{
-    DrmInfo, DrmSystem, LaunchCredentials, PlaybackMedia, PlaybackState, PlaybackStream,
-    StreamSource,
+    DrmInfo, DrmSystem, LaunchCredentials, OutputControl, PlaybackMedia, PlaybackState,
+    PlaybackStream, StreamSource,
 };
 
 // Re-export the Cast protocol types apps need so they depend on this crate only.
@@ -249,6 +249,12 @@ pub trait AppSession: Send + Sync {
 
     /// Called when canonical playback state changes.
     async fn on_playback_update(&self, _ctx: &AppContext, _state: PlaybackState) {}
+
+    /// Output volume, including changes made directly at the player.
+    async fn on_volume_update(&self, _ctx: &AppContext, _level: f64, _muted: bool) {}
+
+    /// Queue navigation initiated at the physical output device.
+    async fn on_output_control(&self, _ctx: &AppContext, _control: OutputControl) {}
 
     /// Called before the session is torn down.
     async fn on_stop(&self, _ctx: &AppContext) {}

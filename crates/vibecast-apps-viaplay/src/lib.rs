@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 const NS_VIAPLAY: &str = "urn:x-cast:tv.viaplay.chromecast";
-const APP_IDS: &[&str] = &["6313CF39", "2DB7CC49"];
+const APP_IDS: &[&str] = &["6313CF39"];
 const ICON_URL: &str = "https://lh3.googleusercontent.com/qXqoFPVkEZBwm7f1Yo8_7Xjv8wVeqbBeI-HfbD_KHjt0aOJf5dP_kbyQKMB1stIc0HIywc__C_Qq2CKjsg";
 
 // ---------------------------------------------------------------------------
@@ -299,6 +299,7 @@ impl AppSession for ViaplaySession {
             streams,
             stream_type: resolved_stream_type,
             content_id: Some(request.media.content_id.clone()),
+            metadata: None,
             title,
             subtitle,
             images,

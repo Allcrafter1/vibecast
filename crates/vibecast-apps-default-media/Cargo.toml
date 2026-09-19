@@ -1,0 +1,17 @@
+[package]
+name = "vibecast-apps-default-media"
+description = "URL-based Default Media Receiver Cast application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+vibecast-sdk = { path = "../vibecast-sdk" }
+async-trait = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

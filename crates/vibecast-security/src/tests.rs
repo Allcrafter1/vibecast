@@ -193,3 +193,45 @@ fn tls_server_config_builds_and_resolver_hot_reloads() {
     // Hot-reload with the same bundle succeeds (exercises key reload path).
     resolver.update(bundle).unwrap();
 }
+
+#[test]
+fn rotation_boundaries_gaps_and_clock_rollback_are_explicit() {
+    let (dev, _, _) = cert("Device", (2000, 1, 1), (2099, 1, 1));
+    let (ica, _, _) = cert("ICA", (2000, 1, 1), (2099, 1, 1));
+    let (a, ak, ader) = cert("A", (2000, 1, 1), (2030, 1, 1));
+    let (b, bk, bder) = cert("B", (2030, 1, 2), (2040, 1, 1));
+    let json = manifest(
+        &dev,
+        &ica,
+        &[(a, ak, vec![1], vec![2]), (b, bk, vec![3], vec![4])],
+        None,
+    );
+    let mut store = CertificateStore::from_manifest_str(&json).unwrap();
+    // Test synthetic instants; never change the machine or phone clock.
+    assert!(store.rotate_if_needed(unix(2030, 1, 1)).unwrap().is_none());
+    assert!(matches!(
+        store.rotate_if_needed(unix(2030, 1, 1) + 1),
+        Err(SecurityError::NoValidCert)
+    ));
+    assert_eq!(store.active_bundle().peer_cert_der, ader);
+    assert_eq!(
+        store
+            .rotate_if_needed(unix(2030, 1, 2))
+            .unwrap()
+            .unwrap()
+            .peer_cert_der,
+        bder
+    );
+    assert_eq!(
+        store
+            .rotate_if_needed(unix(2027, 1, 1))
+            .unwrap()
+            .unwrap()
+            .peer_cert_der,
+        ader
+    );
+    assert!(matches!(
+        store.rotate_if_needed(unix(2040, 1, 1) + 1),
+        Err(SecurityError::NoValidCert)
+    ));
+}

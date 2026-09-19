@@ -489,8 +489,18 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
         tracing::warn!("player registration has an empty id or name");
         return;
     }
+    if !(1..=vibecast_player_api::PLAYER_PROTOCOL_VERSION).contains(&registration.protocol_version)
+    {
+        tracing::warn!(
+            version = registration.protocol_version,
+            supported = vibecast_player_api::PLAYER_PROTOCOL_VERSION,
+            "unsupported player protocol version"
+        );
+        return;
+    }
 
     let player_id = registration.player_id.clone();
+    let protocol_version = registration.protocol_version;
     let epoch = state.epochs.fetch_add(1, Ordering::Relaxed);
     let player_settings = match state.settings.player(player_id.clone()) {
         Ok(settings) => settings,
@@ -621,10 +631,22 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
                             Ok(message @ ClientMessage::State { .. })
+                            | Ok(message @ ClientMessage::Artwork { .. })
                             | Ok(message @ ClientMessage::Error { .. }) => {
                                 if let Some(report) = message.into_report() {
                                     let _ = reports_tx.send(report).await;
                                 }
+                            }
+                            Ok(message @ ClientMessage::ControlRequest { .. })
+                                if protocol_version >= 2 =>
+                            {
+                                if let Some(report) = message.into_report() {
+                                    let _ = reports_tx.send(report).await;
+                                }
+                            }
+                            Ok(ClientMessage::ControlRequest { .. }) => {
+                                tracing::warn!(player_id, protocol_version,
+                                    "legacy player sent a v2 control request");
                             }
                             Ok(ClientMessage::SettingsUpdate {
                                 request_id,
@@ -939,6 +961,7 @@ mod tests {
         json!({
             "type": "register",
             "player": {
+                "protocolVersion": 2,
                 "playerId": "  player-1  ",
                 "name": "  Test Player  ",
                 "capabilities": {
@@ -1062,8 +1085,31 @@ mod tests {
                 assert_eq!(session_id, "s1");
                 assert_eq!(player_state, PlayerState::Playing);
             }
-            PlayerReport::Error { .. } => panic!("expected state report"),
+            _ => panic!("expected state report"),
         }
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "controlRequest",
+                "sessionId": "s1",
+                "control": { "command": "next" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send output control");
+        let report = tokio::time::timeout(Duration::from_secs(2), reports.recv())
+            .await
+            .expect("control within timeout")
+            .expect("control report");
+        assert!(matches!(
+            report,
+            PlayerReport::ControlRequest {
+                session_id,
+                control: vibecast_player_api::PlayerControlRequest::Next,
+            } if session_id == "s1"
+        ));
 
         // Closing the socket emits Disconnected.
         ws.close(None).await.ok();

@@ -101,7 +101,7 @@ fn fake_manifest() -> AppManifest {
         }],
     )
     .expect("fake settings schema");
-    AppManifest::new("fake", &["APP1"], "Fake App", settings)
+    AppManifest::new("fake", &["APP1", "CC1AD845"], "Fake App", settings)
         .with_icon_url("https://example.test/fake.png")
         .with_namespaces(&[FAKE_NS])
 }
@@ -146,7 +146,7 @@ impl AppSession for FakeSession {
                 "https://cdn.example/manifest.mpd",
                 "application/dash+xml",
             )],
-            StreamType::Buffered,
+            request.media.stream_type,
         );
         media.title = Some("Fake Title".into());
         media.duration = Some(120.0);
@@ -330,6 +330,10 @@ async fn next_json(client: &mut Framed<DuplexStream, CastCodec>) -> Value {
 }
 
 async fn launch(client: &mut Framed<DuplexStream, CastCodec>) -> String {
+    launch_id(client, "APP1").await
+}
+
+async fn launch_id(client: &mut Framed<DuplexStream, CastCodec>, app_id: &str) -> String {
     send(
         client,
         ns::CONNECTION,
@@ -341,13 +345,13 @@ async fn launch(client: &mut Framed<DuplexStream, CastCodec>) -> String {
         client,
         ns::RECEIVER,
         "receiver-0",
-        r#"{"type":"LAUNCH","requestId":1,"appId":"APP1"}"#,
+        &serde_json::json!({"type":"LAUNCH","requestId":1,"appId":app_id}).to_string(),
     )
     .await;
     let status = next_json(client).await;
     assert_eq!(status["type"], "RECEIVER_STATUS");
     let app = &status["status"]["applications"][0];
-    assert_eq!(app["appId"], "APP1");
+    assert_eq!(app["appId"], app_id);
     assert_eq!(app["displayName"], "Fake App");
     assert_eq!(app["iconUrl"], "https://example.test/fake.png");
     assert_eq!(
@@ -462,11 +466,14 @@ async fn launch_load_and_play_end_to_end() {
     assert_eq!(playing["status"][0]["playerState"], "PLAYING");
     assert_eq!(playing["status"][0]["supportedMediaCommands"], 15);
 
-    // The player received Load then Play; the manifest proxy was registered.
+    // Restore receiver volume before Load/Play; register the manifest proxy.
     let commands = harness.player.commands();
-    assert!(matches!(commands.first(), Some(PlayerCommand::Load { .. })));
+    assert!(matches!(
+        commands.first(),
+        Some(PlayerCommand::Volume { .. })
+    ));
     assert!(matches!(commands.last(), Some(PlayerCommand::Play { .. })));
-    if let Some(PlayerCommand::Load { media, .. }) = commands.first() {
+    if let Some(PlayerCommand::Load { media, .. }) = commands.get(1) {
         assert!(media.streams[0].url.contains("/manifest/"));
     }
     assert!(harness
@@ -476,6 +483,78 @@ async fn launch_load_and_play_end_to_end() {
         .unwrap()
         .iter()
         .any(|event| event.starts_with("+manifest:")));
+}
+
+#[tokio::test]
+async fn default_media_rejects_queue_load_without_poisoning_next_load() {
+    let mut harness = setup().await;
+    let transport = launch_id(&mut harness.client, "CC1AD845").await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    let before = harness.player.commands().len();
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_LOAD","requestId":71,"items":[]}"#,
+    )
+    .await;
+    let rejected = next_json(&mut harness.client).await;
+    assert_eq!(rejected["type"], "INVALID_REQUEST");
+    assert_eq!(rejected["requestId"], 71);
+    assert_eq!(harness.player.commands().len(), before);
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":72,"media":{"contentId":"abc","contentType":"audio/mpeg"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        let _ = next_json(&mut harness.client).await;
+    }
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Load { .. })));
+}
+
+#[tokio::test]
+async fn live_seek_is_rejected_without_player_command() {
+    let mut harness = setup().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    send(&mut harness.client, ns::MEDIA, &transport,
+        r#"{"type":"LOAD","requestId":72,"media":{"contentId":"abc","contentType":"audio/mpeg","streamType":"LIVE"}}"#).await;
+    for _ in 0..3 {
+        let _ = next_json(&mut harness.client).await;
+    }
+    let before = harness.player.commands().len();
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"SEEK","requestId":73,"mediaSessionId":1,"currentTime":5}"#,
+    )
+    .await;
+    let rejected = next_json(&mut harness.client).await;
+    assert_eq!(rejected["type"], "INVALID_REQUEST");
+    assert_eq!(rejected["reason"], "Seek position unavailable");
+    assert_eq!(harness.player.commands().len(), before);
 }
 
 #[tokio::test]
@@ -542,6 +621,8 @@ async fn primary_player_report_broadcasts_status() {
             current_time: 33.5,
             duration: Some(120.0),
             idle_reason: None,
+            volume: None,
+            muted: None,
         })
         .await
         .unwrap();
@@ -628,14 +709,165 @@ async fn app_driven_playback_uses_canonical_media_path() {
     assert_eq!(stopped["status"][0]["idleReason"], "CANCELLED");
 
     let commands = harness.player.commands();
-    assert!(matches!(commands[0], PlayerCommand::Load { .. }));
-    assert!(matches!(commands[1], PlayerCommand::Pause { .. }));
+    assert!(matches!(commands[0], PlayerCommand::Volume { .. }));
+    assert!(matches!(commands[1], PlayerCommand::Load { .. }));
+    assert!(matches!(commands[2], PlayerCommand::Pause { .. }));
     assert!(matches!(
-        commands[2],
+        commands[3],
         PlayerCommand::Seek { position: 33.0, .. }
     ));
-    assert!(matches!(commands[3], PlayerCommand::Play { .. }));
-    assert!(matches!(commands[4], PlayerCommand::Stop { .. }));
+    assert!(matches!(commands[4], PlayerCommand::Play { .. }));
+    assert!(matches!(commands[5], PlayerCommand::Stop { .. }));
+}
+
+#[tokio::test]
+async fn receiver_stop_publishes_terminal_media_before_removing_app() {
+    let mut harness = setup().await;
+    let client = &mut harness.client;
+    let transport = launch(client).await;
+    send(client, ns::CONNECTION, &transport, r#"{"type":"CONNECT"}"#).await;
+    let _ = next_json(client).await;
+    send(client, FAKE_NS, &transport, r#"{"type":"PUSH_MEDIA"}"#).await;
+    let _ = next_json(client).await;
+    let _ = next_json(client).await;
+    send(client, FAKE_NS, &transport, r#"{"type":"APP_PLAY"}"#).await;
+    assert_eq!(
+        next_json(client).await["status"][0]["playerState"],
+        "PLAYING"
+    );
+    send(
+        client,
+        ns::RECEIVER,
+        "receiver-0",
+        &serde_json::json!({
+            "type":"STOP", "requestId":90, "sessionId":transport
+        })
+        .to_string(),
+    )
+    .await;
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), next_json(client))
+        .await
+        .unwrap();
+    assert_eq!(terminal["type"], "MEDIA_STATUS");
+    assert_eq!(terminal["status"][0]["playerState"], "IDLE");
+    assert_eq!(terminal["status"][0]["idleReason"], "CANCELLED");
+    let receiver = next_json(client).await;
+    assert_eq!(
+        receiver["status"]["applications"].as_array().unwrap().len(),
+        0
+    );
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Stop { .. })));
+}
+
+#[tokio::test]
+async fn app_close_refreshes_platform_status_without_transport_disconnect() {
+    let mut harness = setup().await;
+    let client = &mut harness.client;
+    let transport = launch(client).await;
+    send(client, ns::CONNECTION, &transport, r#"{"type":"CONNECT"}"#).await;
+    let _ = next_json(client).await;
+    send(client, FAKE_NS, &transport, r#"{"type":"PUSH_MEDIA"}"#).await;
+    let _ = next_json(client).await;
+    let _ = next_json(client).await;
+    // The sender closes its app channel, not the still-subscribed platform
+    // connection. No later socket disconnect or GET_STATUS should be required.
+    send(client, ns::CONNECTION, &transport, r#"{"type":"CLOSE"}"#).await;
+    let receiver = tokio::time::timeout(std::time::Duration::from_secs(2), next_json(client))
+        .await
+        .expect("platform observer must learn that the app stopped");
+    assert_eq!(receiver["type"], "RECEIVER_STATUS");
+    assert!(receiver["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Stop { .. })));
+    // The same socket can immediately create a new app session.
+    assert_ne!(launch(client).await, transport);
+}
+
+/// A separate monitoring connection must not retain the owner's stopped media.
+#[tokio::test]
+async fn owner_disconnect_notifies_a_separate_observer_and_allows_takeover() {
+    let mut harness = setup().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    let _ = next_json(&mut harness.client).await;
+
+    let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+    let (events_tx, mut events_rx) = mpsc::channel::<ServerEvent>(32);
+    tokio::spawn(run_connection(
+        server_end,
+        2,
+        Arc::from("observer"),
+        Arc::new(dummy_auth()),
+        events_tx,
+    ));
+    let hub = harness.hub.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if hub.send_server_event(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut observer = Framed::new(client_end, CastCodec);
+    send(
+        &mut observer,
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send(
+        &mut observer,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut observer).await["type"], "MEDIA_STATUS");
+    drop(harness.client);
+    let terminal =
+        tokio::time::timeout(std::time::Duration::from_secs(2), next_json(&mut observer))
+            .await
+            .expect("observer must receive terminal media state");
+    assert_eq!(terminal["type"], "MEDIA_STATUS");
+    assert_eq!(terminal["status"][0]["playerState"], "IDLE");
+    assert_eq!(terminal["status"][0]["idleReason"], "CANCELLED");
+    let receiver = next_json(&mut observer).await;
+    assert!(receiver["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_ne!(launch(&mut observer).await, transport);
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Stop { .. })));
 }
 
 /// An app session whose `resolve_license` reverses the challenge instead of
@@ -804,4 +1036,61 @@ async fn platform_set_volume_broadcasts_receiver_status() {
     assert_eq!(reply["status"]["volume"]["level"], 0.5);
     // muted was omitted, so it stays at its prior value.
     assert_eq!(reply["status"]["volume"]["muted"], false);
+}
+
+#[tokio::test]
+async fn platform_volume_subscription_survives_app_connect() {
+    let mut harness = setup().await;
+    let client = &mut harness.client;
+    let transport = launch(client).await;
+    send(client, ns::CONNECTION, &transport, r#"{"type":"CONNECT"}"#).await;
+    // CONNECT generates no reply. Barrier through GET_STATUS drains prior work.
+    send(
+        client,
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"GET_STATUS","requestId":50}"#,
+    )
+    .await;
+    loop {
+        if next_json(client).await["requestId"] == 50 {
+            break;
+        }
+    }
+    send(
+        client,
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"SET_VOLUME","requestId":51,"volume":{"level":0.42}}"#,
+    )
+    .await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let reply = next_json(client).await;
+            if reply["type"] == "RECEIVER_STATUS" && reply["requestId"] == 51 {
+                break reply;
+            }
+        }
+    })
+    .await
+    .expect("platform status must arrive during an app session");
+    assert_eq!(reply["status"]["volume"]["level"], 0.42);
+    send(
+        client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"SET_VOLUME","requestId":52,"mediaSessionId":1,"volume":{"level":0.43}}"#,
+    )
+    .await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let reply = next_json(client).await;
+            if reply["type"] == "RECEIVER_STATUS" {
+                break reply;
+            }
+        }
+    })
+    .await
+    .expect("media volume changes must update platform observers too");
+    assert_eq!(reply["status"]["volume"]["level"], 0.43);
 }

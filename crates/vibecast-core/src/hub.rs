@@ -26,12 +26,12 @@ use vibecast_messages::{
     MultizoneGetStatusRequest, MultizoneStatusResponse, PlayerState, QueueItemIdsResponse,
     ReceiverRequest, ReceiverStatus, ReceiverStatusResponse, SetupRequest, SetupResponse, Volume,
 };
-use vibecast_player_api::{Player, PlayerCommand, PlayerReport};
+use vibecast_player_api::{Player, PlayerCommand, PlayerControlRequest, PlayerReport};
 use vibecast_proto::CastMessage;
 use vibecast_sdk::{
     AppContext, AppSession, LaunchCredentials, MediaResolveError, MessageDisposition,
-    NoopSenderChannel, PlaybackController, PlaybackMedia, PlaybackState, PlayerCapabilities,
-    ReceiverContext, SenderChannel,
+    NoopSenderChannel, OutputControl, PlaybackController, PlaybackMedia, PlaybackState,
+    PlayerCapabilities, ReceiverContext, SenderChannel,
 };
 use vibecast_settings::PlayerSettings;
 
@@ -212,6 +212,11 @@ impl DeviceHubHandle {
 /// slow app (HTTP auth, token exchange, ...) never blocks the hub mailbox. Jobs
 /// for one session run in the order the hub enqueues them.
 enum AppJob {
+    VolumeUpdate {
+        ctx: AppContext,
+        level: f64,
+        muted: bool,
+    },
     /// A sender connected to the app transport.
     SenderConnected { ctx: AppContext, sender_id: String },
     /// A custom-namespace message arrived.
@@ -225,6 +230,11 @@ enum AppJob {
         ctx: AppContext,
         state: PlaybackState,
     },
+    /// Queue navigation requested at the physical output.
+    OutputControl {
+        ctx: AppContext,
+        control: OutputControl,
+    },
     /// The session is being torn down (final job).
     Stop { ctx: AppContext },
 }
@@ -233,6 +243,9 @@ enum AppJob {
 async fn run_app_session(app: Arc<dyn AppSession>, mut jobs: mpsc::Receiver<AppJob>) {
     while let Some(job) = jobs.recv().await {
         match job {
+            AppJob::VolumeUpdate { ctx, level, muted } => {
+                app.on_volume_update(&ctx, level, muted).await
+            }
             AppJob::SenderConnected { ctx, sender_id } => {
                 app.on_sender_connected(&ctx, &sender_id).await;
             }
@@ -246,6 +259,7 @@ async fn run_app_session(app: Arc<dyn AppSession>, mut jobs: mpsc::Receiver<AppJ
                 }
             }
             AppJob::PlaybackUpdate { ctx, state } => app.on_playback_update(&ctx, state).await,
+            AppJob::OutputControl { ctx, control } => app.on_output_control(&ctx, control).await,
             AppJob::Stop { ctx } => {
                 app.on_stop(&ctx).await;
                 break;
@@ -311,10 +325,25 @@ pub struct DeviceHub {
     connections: HashMap<u64, ConnectionHandle>,
     /// `(connection, sender)` -> transport id.
     subscriptions: HashMap<(u64, String), String>,
+    // Platform and app channels coexist for the same Cast sender ID.
+    platform_subscriptions: HashSet<(u64, String)>,
     /// session id (== transport id) -> session.
     sessions: HashMap<String, Session>,
+    session_owners: HashMap<String, u64>,
     self_tx: mpsc::Sender<HubEvent>,
     events: Option<mpsc::Receiver<HubEvent>>,
+}
+
+fn volume_path(base: &std::path::Path, device_id: &str) -> PathBuf {
+    let key: String = device_id.bytes().map(|b| format!("{b:02x}")).collect();
+    base.join(format!("volume-{key}.json"))
+}
+
+fn prepare_volume_for_session(volume: &mut Volume) {
+    if volume.level == 0.0 {
+        volume.level = 0.1;
+        volume.muted = false;
+    }
 }
 
 impl DeviceHub {
@@ -323,6 +352,11 @@ impl DeviceHub {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let (tx, rx) = mpsc::channel(128);
+        let volume = std::fs::read(volume_path(&config.data_dir, &config.identity.device_id))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Volume>(&bytes).ok())
+            .filter(|v| v.level.is_finite() && (0.0..=1.0).contains(&v.level))
+            .unwrap_or(config.volume);
         Self {
             identity: config.identity,
             registry: config.registry,
@@ -330,14 +364,16 @@ impl DeviceHub {
             proxy: config.proxy,
             http: config.http,
             data_dir: config.data_dir,
-            volume: config.volume,
+            volume,
             user_agent: config.user_agent,
             cast_device_capabilities: config.cast_device_capabilities,
             capabilities: config.capabilities,
             player_settings: config.player_settings,
             connections: HashMap::new(),
             subscriptions: HashMap::new(),
+            platform_subscriptions: HashSet::new(),
             sessions: HashMap::new(),
+            session_owners: HashMap::new(),
             self_tx: tx,
             events: Some(rx),
         }
@@ -372,8 +408,39 @@ impl DeviceHub {
                 self.connections.insert(handle.id(), handle);
             }
             HubEvent::Server(ServerEvent::Disconnected { id, .. }) => {
+                let owned: Vec<String> = self
+                    .session_owners
+                    .iter()
+                    .filter(|(_, owner)| **owner == id)
+                    .map(|(session, _)| session.clone())
+                    .collect();
+                for session in owned {
+                    self.stop_session(&session).await;
+                }
+                // A sender can leave without sending an explicit Cast STOP.
+                // Keep sessions that still have another subscribed sender, but
+                // tear down sessions whose last sender connection disappeared;
+                // otherwise receiver status advertises a stale app forever.
+                let affected_sessions: Vec<String> = self
+                    .subscriptions
+                    .iter()
+                    .filter(|((conn, _), _)| *conn == id)
+                    .map(|(_, transport)| transport.clone())
+                    .collect();
                 self.subscriptions.retain(|(conn, _), _| *conn != id);
+                self.platform_subscriptions.retain(|(conn, _)| *conn != id);
                 self.connections.remove(&id);
+                for session_id in affected_sessions {
+                    let still_subscribed = self
+                        .subscriptions
+                        .values()
+                        .any(|transport| transport == &session_id);
+                    if !still_subscribed {
+                        self.stop_session(&session_id).await;
+                    }
+                }
+                let response = self.receiver_status(0);
+                self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
             }
             HubEvent::Server(ServerEvent::Message { handle, message }) => {
                 self.on_message(&handle, message).await;
@@ -412,11 +479,10 @@ impl DeviceHub {
         match message.namespace.as_str() {
             ns::CONNECTION => match serde_json::from_value::<ConnectionMessage>(payload) {
                 Ok(ConnectionMessage::Connect(_)) => {
-                    self.subscriptions
-                        .insert((conn_id, source), RECEIVER_0.to_string());
+                    self.platform_subscriptions.insert((conn_id, source));
                 }
                 _ => {
-                    self.subscriptions.remove(&(conn_id, source));
+                    self.platform_subscriptions.remove(&(conn_id, source));
                 }
             },
             ns::RECEIVER => self.handle_receiver(conn_id, &source, payload).await,
@@ -488,6 +554,17 @@ impl DeviceHub {
             }
             ReceiverRequest::SetVolume(r) => {
                 self.volume.apply_update(&r.volume);
+                for (id, session) in &mut self.sessions {
+                    session.coordinator.volume = self.volume.clone();
+                    self.player
+                        .send(PlayerCommand::Volume {
+                            session_id: id.clone(),
+                            level: self.volume.level,
+                            muted: self.volume.muted,
+                        })
+                        .await;
+                }
+                self.publish_volume().await;
                 let response = self.receiver_status(r.request_id);
                 self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
             }
@@ -495,6 +572,7 @@ impl DeviceHub {
     }
 
     async fn handle_launch(&mut self, conn_id: u64, source: &str, request: LaunchRequest) {
+        prepare_volume_for_session(&mut self.volume);
         tracing::info!(
             app_id = %request.app_id,
             request_id = request.request_id,
@@ -532,6 +610,7 @@ impl DeviceHub {
         }
 
         let session_id = Uuid::new_v4().to_string();
+        self.session_owners.insert(session_id.clone(), conn_id);
         let (credentials, credentials_type) = request.resolved_credentials();
         let app_key = manifest.app_key;
         let data_dir = self.data_dir.join("apps").join(app_key);
@@ -591,6 +670,16 @@ impl DeviceHub {
             }
         };
 
+        app.on_volume_update(&ctx, self.volume.level, self.volume.muted)
+            .await;
+        self.player
+            .send(PlayerCommand::Volume {
+                session_id: session_id.clone(),
+                level: self.volume.level,
+                muted: self.volume.muted,
+            })
+            .await;
+
         let mut namespaces: Vec<String> = manifest
             .namespaces
             .iter()
@@ -618,16 +707,24 @@ impl DeviceHub {
             jobs: jobs_tx,
         };
         self.sessions.insert(session_id, session);
+        self.publish_volume().await;
 
         let response = self.receiver_status(request.request_id);
         self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
     }
 
     async fn stop_session(&mut self, session_id: &str) {
-        let Some(session) = self.sessions.remove(session_id) else {
+        self.session_owners.remove(session_id);
+        let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
         tracing::info!(session_id = %session_id, app_key = %session.app_key, "stopping session");
+        // Observers (e.g. Home Assistant) retain their last MEDIA_STATUS even
+        // after the application disappears. Publish the terminal state while
+        // its subscriptions still exist; later player reports are too late.
+        session.coordinator.set_idle(Some(IdleReason::Cancelled));
+        let terminal = session.coordinator.status_response(0);
+        self.broadcast(session_id, ns::MEDIA, &terminal).await;
         if session.coordinator.playback_media.is_some() {
             self.player
                 .send(PlayerCommand::Stop {
@@ -718,7 +815,21 @@ impl DeviceHub {
                         })
                         .await;
                 }
-                _ => {
+                Ok(ConnectionMessage::Close(_)) => {
+                    self.subscriptions.remove(&(conn_id, source));
+                    let still_subscribed = self
+                        .subscriptions
+                        .values()
+                        .any(|target| target == &transport);
+                    if !still_subscribed {
+                        self.stop_session(&transport).await;
+                    }
+                    // CLOSE only leaves the app channel. The platform socket
+                    // can remain open, so no Disconnected event will refresh it.
+                    let response = self.receiver_status(0);
+                    self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+                }
+                Err(_) => {
                     self.subscriptions.remove(&(conn_id, source));
                 }
             },
@@ -766,7 +877,20 @@ impl DeviceHub {
         };
 
         match request {
-            MediaRequest::Load(load) => self.media_load(conn_id, transport, source, load).await,
+            MediaRequest::Load(load) => {
+                let metadata = load.media.metadata.as_ref();
+                tracing::info!(
+                    session_id = %transport,
+                    stream_type = ?load.media.stream_type,
+                    is_live = ?load.media.is_live_media,
+                    has_duration = load.media.duration.is_some(),
+                    has_title = metadata.is_some_and(|m| m.title.is_some()),
+                    has_subtitle = metadata.is_some_and(|m| m.subtitle.is_some()),
+                    image_count = metadata.map_or(0, |m| m.images.len()),
+                    "media LOAD field summary"
+                );
+                self.media_load(conn_id, transport, source, load).await;
+            }
             MediaRequest::Play(r) => {
                 tracing::debug!(session_id = %transport, request_id = r.request_id, "PLAY");
                 self.play(transport, r.request_id).await;
@@ -777,6 +901,22 @@ impl DeviceHub {
             }
             MediaRequest::Seek(r) => {
                 let position = r.current_time;
+                let live = self.sessions.get(transport).is_some_and(|session| {
+                    session
+                        .coordinator
+                        .current_media
+                        .as_ref()
+                        .is_some_and(|media| {
+                            media.stream_type == vibecast_messages::StreamType::Live
+                        })
+                });
+                if live || !position.is_finite() || position < 0.0 {
+                    let response =
+                        MediaInvalidRequestResponse::new(r.request_id, "Seek position unavailable");
+                    self.send_to(conn_id, transport, source, ns::MEDIA, &response)
+                        .await;
+                    return;
+                }
                 tracing::debug!(session_id = %transport, request_id = r.request_id, position, "SEEK");
                 self.seek(transport, r.request_id, position).await;
             }
@@ -808,6 +948,12 @@ impl DeviceHub {
                     })
                     .await;
                 self.notify_app(transport).await;
+                self.volume.level = level;
+                self.volume.muted = muted;
+                self.publish_volume().await;
+                let receiver_status = self.receiver_status(0);
+                self.broadcast(RECEIVER_0, ns::RECEIVER, &receiver_status)
+                    .await;
             }
             MediaRequest::GetStatus(r) => {
                 if let Some(session) = self.sessions.get(transport) {
@@ -831,6 +977,19 @@ impl DeviceHub {
                     .await;
             }
             MediaRequest::QueueLoad(r) => {
+                if self
+                    .sessions
+                    .get(transport)
+                    .is_some_and(|session| session.app_id == "CC1AD845")
+                {
+                    let response = MediaInvalidRequestResponse::new(
+                        r.request_id,
+                        "QUEUE_LOAD is not supported; use a single-item LOAD",
+                    );
+                    self.send_to(conn_id, transport, source, ns::MEDIA, &response)
+                        .await;
+                    return;
+                }
                 let response =
                     vibecast_messages::MediaStatusResponse::new(r.request_id, Vec::new());
                 self.send_to(conn_id, transport, source, ns::MEDIA, &response)
@@ -1151,19 +1310,73 @@ impl DeviceHub {
 
     // -- player reports ---------------------------------------------------
 
+    async fn publish_volume(&mut self) {
+        let path = volume_path(&self.data_dir, &self.identity.device_id);
+        let tmp = path.with_extension("tmp");
+        let result = std::fs::create_dir_all(&self.data_dir).and_then(|_| {
+            std::fs::write(
+                &tmp,
+                serde_json::to_vec(&self.volume).expect("finite volume"),
+            )?;
+            std::fs::rename(&tmp, &path)
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "cannot persist receiver volume");
+        }
+        for session in self.sessions.values_mut() {
+            session.coordinator.volume = self.volume.clone();
+            let _ = session
+                .jobs
+                .send(AppJob::VolumeUpdate {
+                    ctx: session.ctx.clone(),
+                    level: self.volume.level,
+                    muted: self.volume.muted,
+                })
+                .await;
+        }
+    }
+
     async fn on_report(&mut self, report: PlayerReport) {
         let session_id = report.session_id().to_string();
         if !self.sessions.contains_key(&session_id) {
             return;
         }
         match report {
+            PlayerReport::Artwork {
+                source_url, url, ..
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                if session.coordinator.update_artwork(&source_url, &url) {
+                    let response = session.coordinator.status_response(0);
+                    self.broadcast(&session_id, ns::MEDIA, &response).await;
+                }
+            }
+            PlayerReport::ControlRequest { control, .. } => {
+                self.on_output_control(&session_id, control).await;
+            }
             PlayerReport::State {
                 player_state,
                 current_time,
                 duration,
                 idle_reason,
+                volume,
+                muted,
                 ..
             } => {
+                let before = self.volume.clone();
+                if let Some(level) = volume.filter(|v| v.is_finite()) {
+                    self.volume.level = level.clamp(0.0, 1.0);
+                }
+                if let Some(muted) = muted {
+                    self.volume.muted = muted;
+                }
+                if self.volume != before {
+                    self.publish_volume().await;
+                    let response = self.receiver_status(0);
+                    self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+                }
                 tracing::debug!(
                     session_id = %session_id,
                     state = ?player_state,
@@ -1202,6 +1415,40 @@ impl DeviceHub {
                     Some(IdleReason::Error),
                 )
                 .await;
+            }
+        }
+    }
+
+    async fn on_output_control(&mut self, session_id: &str, control: PlayerControlRequest) {
+        match control {
+            PlayerControlRequest::Play => self.play(session_id, 0).await,
+            PlayerControlRequest::Pause => self.pause(session_id, 0).await,
+            PlayerControlRequest::Stop => self.stop_playback(session_id, 0).await,
+            PlayerControlRequest::Seek { position } if position.is_finite() => {
+                self.seek(session_id, 0, position.max(0.0)).await
+            }
+            PlayerControlRequest::Seek { .. } => {}
+            PlayerControlRequest::Volume { level, muted } if level.is_finite() => {
+                self.volume.level = level.clamp(0.0, 1.0);
+                self.volume.muted = muted;
+                self.publish_volume().await;
+                let response = self.receiver_status(0);
+                self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+            }
+            PlayerControlRequest::Volume { .. } => {}
+            PlayerControlRequest::Next | PlayerControlRequest::Previous => {
+                let control = if matches!(control, PlayerControlRequest::Next) {
+                    OutputControl::Next
+                } else {
+                    OutputControl::Previous
+                };
+                if let Some((jobs, ctx)) = self
+                    .sessions
+                    .get(session_id)
+                    .map(|session| (session.jobs.clone(), session.ctx.clone()))
+                {
+                    let _ = jobs.send(AppJob::OutputControl { ctx, control }).await;
+                }
             }
         }
     }
@@ -1329,12 +1576,18 @@ impl DeviceHub {
         let Ok(value) = serde_json::to_value(message) else {
             return;
         };
-        let connection_ids: HashSet<u64> = self
-            .subscriptions
-            .iter()
-            .filter(|(_, target)| target.as_str() == transport)
-            .map(|((conn, _), _)| *conn)
-            .collect();
+        let connection_ids: HashSet<u64> = if transport == RECEIVER_0 {
+            self.platform_subscriptions
+                .iter()
+                .map(|(conn, _)| *conn)
+                .collect()
+        } else {
+            self.subscriptions
+                .iter()
+                .filter(|(_, target)| target.as_str() == transport)
+                .map(|((conn, _), _)| *conn)
+                .collect()
+        };
         for conn_id in connection_ids {
             if let Some(handle) = self.connections.get(&conn_id) {
                 let _ = handle.send_json(transport, "*", namespace, &value).await;
@@ -1346,4 +1599,38 @@ impl DeviceHub {
 fn parse_payload(message: &CastMessage) -> Option<serde_json::Value> {
     let text = message.payload_utf8.as_deref()?;
     serde_json::from_str(text).ok()
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+    #[test]
+    fn zero_promotes_only_at_session_start() {
+        let mut volume = Volume {
+            level: 0.0,
+            muted: true,
+            ..Default::default()
+        };
+        prepare_volume_for_session(&mut volume);
+        assert_eq!(volume.level, 0.1);
+        assert!(!volume.muted);
+        volume.level = 0.5;
+        prepare_volume_for_session(&mut volume);
+        assert_eq!(volume.level, 0.5);
+    }
+    #[test]
+    fn device_volume_paths_are_distinct_and_safe() {
+        let base = std::path::Path::new("/tmp");
+        let a = volume_path(base, "../a");
+        assert_eq!(a.parent(), Some(base));
+        assert_ne!(a, volume_path(base, "other"));
+        let volume = Volume {
+            level: 0.5,
+            muted: true,
+            ..Default::default()
+        };
+        let restored: Volume =
+            serde_json::from_slice(&serde_json::to_vec(&volume).unwrap()).unwrap();
+        assert_eq!(restored, volume);
+    }
 }

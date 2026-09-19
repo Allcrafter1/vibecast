@@ -28,8 +28,9 @@ pub use player::Player;
 pub use protocol::{
     AppSettingsPayload, ClientMessage, DrmCapabilityPayload, DrmPayload, DrmSystem,
     PlaybackMediaPayload, PlaybackStreamPayload, PlayerCapabilitiesPayload, PlayerCommand,
-    PlayerRegistration, PlayerReport, ResolutionPayload, ServerMessage, SettingOptionPayload,
-    SettingPayload, SettingsSnapshotMessage, SettingsUpdateResultMessage, SettingsUpdateStatus,
+    PlayerControlKind, PlayerControlRequest, PlayerRegistration, PlayerReport, ResolutionPayload,
+    ServerMessage, SettingOptionPayload, SettingPayload, SettingsSnapshotMessage,
+    SettingsUpdateResultMessage, SettingsUpdateStatus, PLAYER_PROTOCOL_VERSION,
 };
 pub use proxy::{
     LicenseHandler, LicenseRequest, LicenseResponse, ManifestHandler, ManifestProxyRequest,

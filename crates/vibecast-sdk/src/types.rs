@@ -1,7 +1,7 @@
 //! Owned data types exchanged between apps and the coordinator.
 
 use serde_json::Value;
-use vibecast_messages::{IdleReason, MediaImage, PlayerState, StreamType};
+use vibecast_messages::{IdleReason, MediaImage, MediaMetadata, PlayerState, StreamType};
 
 /// Supported DRM key systems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +119,9 @@ pub struct PlaybackMedia {
     pub stream_type: StreamType,
     /// Original content identifier from the LOAD request.
     pub content_id: Option<String>,
+    /// Original typed metadata when the provider preserves sender metadata.
+    /// None retains the legacy title/subtitle/images normalization.
+    pub metadata: Option<MediaMetadata>,
     /// Display title.
     pub title: Option<String>,
     /// Display subtitle.
@@ -148,6 +151,7 @@ impl PlaybackMedia {
             streams,
             stream_type,
             content_id: None,
+            metadata: None,
             title: None,
             subtitle: None,
             images: Vec::new(),
@@ -170,6 +174,13 @@ pub struct PlaybackState {
     pub duration: Option<f64>,
     /// Reason for entering IDLE, if applicable.
     pub idle_reason: Option<IdleReason>,
+}
+
+/// Queue navigation requested by a user at the physical output device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputControl {
+    Next,
+    Previous,
 }
 
 /// Credentials supplied with a `LAUNCH` request.

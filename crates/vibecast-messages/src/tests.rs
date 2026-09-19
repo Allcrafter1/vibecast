@@ -153,7 +153,7 @@ fn device_info_response_has_defaults_and_camel_case() {
     .unwrap();
     assert_eq!(value["type"], "DEVICE_INFO");
     assert_eq!(value["deviceId"], "dev-id");
-    assert_eq!(value["deviceCapabilities"], 4101);
+    assert_eq!(value["deviceCapabilities"], 199428);
     assert_eq!(value["controlNotifications"], 1);
 }
 
@@ -178,4 +178,12 @@ fn extract_request_id_handles_both_casings() {
     assert_eq!(extract_request_id(&json!({"requestId": 11})), 11);
     assert_eq!(extract_request_id(&json!({"request_id": 12})), 12);
     assert_eq!(extract_request_id(&Value::Null), 0);
+}
+
+#[test]
+fn music_metadata_roundtrip_preserves_typed_fields() {
+    let value = json!({"metadataType": 3, "title": "Track", "artist": "Artist",
+        "albumName": "Album", "albumArtist": "Album artist"});
+    let parsed: crate::MediaMetadata = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), value);
 }

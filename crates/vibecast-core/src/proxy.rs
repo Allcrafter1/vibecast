@@ -459,6 +459,7 @@ pub(crate) fn to_payload(media: &PlaybackMedia) -> PlaybackMediaPayload {
             })
             .collect(),
         stream_type: media.stream_type,
+        metadata: media.metadata.clone(),
         title: media.title.clone(),
         subtitle: media.subtitle.clone(),
         images: media.images.clone(),
