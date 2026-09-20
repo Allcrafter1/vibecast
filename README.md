@@ -76,6 +76,7 @@ The audio work starts from upstream commit
 Git history preserves that origin and the subsequent integration changes.
 
 This fork retains Vibecast's **MIT licence** and copyright notice: see
-[`LICENSE`](LICENSE). Protocol schemas and other third-party files retain their
-own notices. The separate Python/product repository uses GPL-3.0-or-later;
+[`LICENSE`](LICENSE). The Chromium Cast envelope schema retains its
+[BSD notice](crates/vibecast-proto/proto/LICENSE); other third-party files retain
+their own notices. The separate Python/product repository uses GPL-3.0-or-later;
 that does not relicense Vibecast or imply endorsement by upstream authors.
