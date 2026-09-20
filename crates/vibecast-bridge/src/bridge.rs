@@ -41,6 +41,7 @@ use vibecast_settings::{
     SettingValue, SettingsService, SettingsServiceError, SettingsSnapshot,
 };
 
+#[cfg(feature = "browser-player")]
 use crate::web::{PLAYER_HTML, PLAYER_HTML_CONTENT_TYPE, PLAYER_JS, PLAYER_JS_CONTENT_TYPE};
 
 /// Lifecycle events emitted by the bridge as players connect and disconnect.
@@ -215,7 +216,7 @@ impl PlayerBridge {
         tracing::info!(
             host = %self.state.resolved_host,
             port,
-            "player bridge started (web=http://{}:{}/)",
+            "internal player bridge started (http://{}:{}/player)",
             self.state.resolved_host,
             port
         );
@@ -314,11 +315,13 @@ impl ProxyRegistrar for PlayerBridge {
 }
 
 fn router(state: BridgeState) -> Router {
-    Router::new()
+    let app = Router::new();
+    #[cfg(feature = "browser-player")]
+    let app = app
         .route("/", get(serve_page))
         .route("/index.html", get(serve_page))
-        .route("/player.js", get(serve_script))
-        .route("/player", get(ws_handler))
+        .route("/player.js", get(serve_script));
+    app.route("/player", get(ws_handler))
         .route("/license/{session_id}", post(license_handler))
         .route(
             "/manifest/{session_id}/{route_path}",
@@ -327,10 +330,12 @@ fn router(state: BridgeState) -> Router {
         .with_state(state)
 }
 
+#[cfg(feature = "browser-player")]
 async fn serve_page() -> impl IntoResponse {
     ([(CONTENT_TYPE, PLAYER_HTML_CONTENT_TYPE)], PLAYER_HTML)
 }
 
+#[cfg(feature = "browser-player")]
 async fn serve_script() -> impl IntoResponse {
     ([(CONTENT_TYPE, PLAYER_JS_CONTENT_TYPE)], PLAYER_JS)
 }
@@ -930,6 +935,7 @@ mod tests {
             .unwrap_or("")
     }
 
+    #[cfg(feature = "browser-player")]
     #[tokio::test]
     async fn serves_default_shaka_player_page() {
         let (bridge, _events) = bridge().await;
@@ -939,6 +945,7 @@ mod tests {
         assert!(!body.is_empty());
     }
 
+    #[cfg(feature = "browser-player")]
     #[tokio::test]
     async fn serves_player_script() {
         let (bridge, _events) = bridge().await;
@@ -946,6 +953,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(content_type(&headers).contains("javascript"));
         assert!(!body.is_empty());
+    }
+
+    #[cfg(not(feature = "browser-player"))]
+    #[tokio::test]
+    async fn product_build_does_not_serve_browser_player() {
+        let (bridge, _events) = bridge().await;
+        for path in ["/", "/index.html", "/player.js"] {
+            let (status, _, _) = http_get(&bridge, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]

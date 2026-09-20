@@ -98,8 +98,10 @@ impl Default for DeviceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Host/interface to bind all listeners to.
+    /// Host/interface for LAN Cast/eureka listeners.
     pub bind_host: String,
+    /// Internal adapter/proxy bridge; separate from LAN discovery/listeners.
+    pub player_bind_host: String,
     /// Player bridge port (players connect here to register).
     pub player_port: u16,
     /// HTTP client timeout (seconds).
@@ -112,6 +114,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             bind_host: "0.0.0.0".into(),
+            player_bind_host: "127.0.0.1".into(),
             player_port: 8010,
             http_timeout: 15.0,
             cert_rotation_poll: 60.0,
@@ -226,6 +229,8 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.device.model, "Chromecast");
         assert_eq!(config.network.player_port, 8010);
+        assert_eq!(config.network.bind_host, "0.0.0.0");
+        assert_eq!(config.network.player_bind_host, "127.0.0.1");
         assert_eq!(config.volume.level, 1.0);
         assert!(config.cast.user_agent.contains("CrKey"));
         assert!(config.device.capabilities.cast_connect_supported);

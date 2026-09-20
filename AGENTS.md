@@ -1,5 +1,14 @@
 # AGENTS.md
 
+## Maintained audio-fork context
+
+On the `cast-audio-receiver` branch, README.md describes the actual audio-product
+scope. The Python management/output runtime lives in Cast Audio Receiver Lab.
+The player bridge defaults to loopback and the browser page is not enabled in
+normal builds. The upstream guide below retains useful layering conventions;
+its browser-player, app-coverage and automatic-release claims are upstream
+context, not validation or release instructions for this maintained audio fork.
+
 Canonical agent & developer guide for vibecast. `CLAUDE.md` imports this file via
 `@AGENTS.md` so Claude Code and other coding agents (Codex, Cursor, Aider, etc.)
 read the same single source.

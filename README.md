@@ -1,109 +1,81 @@
-# vibecast
+# Vibecast — Cast Audio Receiver Lab frontend
 
-[![CI](https://github.com/emilsvennesson/vibecast/actions/workflows/ci.yml/badge.svg)](https://github.com/emilsvennesson/vibecast/actions/workflows/ci.yml)
-[![Release](https://github.com/emilsvennesson/vibecast/actions/workflows/release.yml/badge.svg)](https://github.com/emilsvennesson/vibecast/actions/workflows/release.yml)
+This is the **audio-oriented frontend fork** used by
+[Cast Audio Receiver Lab](https://github.com/Allcrafter1/cast-audio-receiver-lab).
+It is built on [Nils Emil Svensson's Vibecast](https://github.com/emilsvennesson/vibecast),
+not an independently developed Cast implementation. Thank you to the upstream
+author and contributors for the protocol, application and player architecture
+on which this project depends.
 
-Turn any computer into a Chromecast. vibecast is a native Google Cast
-receiver — it impersonates a Chromecast on your network so the Cast button in
-supported apps works against a PC, HTPC, or media server instead of a dongle.
-Cast from your phone; playback happens on the machine running vibecast.
+The maintained project branch is **`cast-audio-receiver`**. The `main` branch
+retains the upstream snapshot; upstream releases, Homebrew packages and container
+images are **not builds of this fork**. Product releases and deployment guidance
+belong in the linked main project. If that repository is still private, its
+public release has not yet been completed.
 
-It's a single Rust binary with no cloud dependency: it speaks the full CastV2
-TLS protocol, advertises itself over mDNS, and runs an embedded Shaka Player
-for playback. A Kodi add-on is included for boxes that prefer Kodi's player.
+## What this repository does
 
-## Quick start
+Vibecast supplies the Rust CastV2 transport, certificate handling, mDNS/device
+discovery, per-player receivers, application routing and player bridge. The fork
+adapts that foundation for an experimental audio receiver, focused on YouTube
+Music and supported direct-media Cast loads.
 
-```sh
-cargo run -p vibecast-cli
-```
+Our changes include:
 
-Open `http://localhost:8010/` for the bundled browser player, or connect the
-Kodi add-on. Each connected player becomes its own advertised Cast receiver
-named `<player name> [vibecast]`; Cast and eureka ports are assigned dynamically.
+- audio-speaker advertisement and stable installation-scoped identities;
+- YouTube audio-source resolution, queue/preloading and session/control fixes;
+- a Default Media Receiver for supported direct-media Cast loads;
+- playback, volume, position, end-state and artwork feedback improvements;
+- an internal player bridge, bound to loopback by default, with the inherited
+  browser player disabled in normal builds.
 
-You'll need a Cast device-auth certificate bundle (`certs.json`) in the data
-directory (`$HOME/.vibecast` by default). Vibecast uses pre-harvested static
-signatures for device auth — no runtime RSA signing.
+The Python supervisor, speaker management UI, local mpv output, AirPlay sender
+integration, DLNA/Sonos adapters and Home Assistant packaging live in the **main
+project**, not here. Running this Rust binary alone does not install that product
+or create its management interface. Each connected output adapter registers a
+player, which becomes a separately advertised Cast speaker.
 
-## Install
+## Build and integration
 
-Prebuilt artifacts are published on each [release](https://github.com/emilsvennesson/vibecast/releases).
-
-```sh
-# Homebrew (macOS Apple Silicon + Linux)
-brew install emilsvennesson/vibecast/vibecast
-
-# Docker / GHCR (multi-arch). mDNS needs host networking; mount a data dir.
-docker run --rm --network host \
-  -v "$HOME/.vibecast:/data" \
-  ghcr.io/emilsvennesson/vibecast:latest --data-dir /data
-```
-
-Or grab a binary tarball / the Android APK directly from the release assets.
-Build, CI, and release details live in [`docs/ci-cd.md`](docs/ci-cd.md).
-
-## Bundled apps
-
-| App | Notes |
-| --- | --- |
-| SVT Play | DASH + ditto manifests, ClearKey/Widevine |
-| TV4 Play | OAuth refresh, Yospace ad-stitching, Widevine |
-| Viaplay | Device-code auth, Widevine |
-| Prime Video | Custom Widevine license flow, VOD + live |
-| YouTube | Lounge control, generated DASH manifests, per-player codec preference |
-
-## Configuration
-
-Receiver config lives at `{data_dir}/config.toml` (default data dir:
-`$HOME/.vibecast`). A missing file yields Chromecast-like defaults; partial
-config overrides only the keys you name. CLI flags override config for one run.
-
-```toml
-[device]
-model = "Chromecast"
-
-[network]
-player_port = 8010
-```
-
-Apps declare typed runtime settings in their manifests. Values are stored in
-`{data_dir}/settings.json` and synchronized with each connected player. The
-bundled browser player and Kodi add-on render those settings generically.
-
-## Writing an app
-
-App crates depend only on `vibecast-sdk`. Implement `AppProvider` (a manifest +
-factory) and `AppSession` (an owned per-launch session) — `resolve_media` turns
-a Cast `LOAD` request into playable streams + DRM info. Model new apps on
-`vibecast-apps-svtplay` and register them in
-`crates/vibecast-platform/src/lib.rs::build_app_providers`.
+The main project's lock records select an immutable source revision. Follow
+those records for a product build, rather than blindly following the newest
+branch commit. The reviewed product toolchain is Rust 1.98.1:
 
 ```sh
-cargo doc -p vibecast-sdk --open   # full app-author docs
+cargo +1.98.1 build --locked --release -p vibecast-cli
 ```
 
-## Kodi
+The executable is `target/release/vibecast`. The product supervisor supplies its
+data directory, authentication bundle and registered player adapters. The normal
+bridge is `ws://127.0.0.1:8010/player`; it is not a second management UI. Keep it
+internal. The earlier dev13 bridge overlay is incorporated into this branch;
+do not apply it again on top of this branch.
 
-`kodi/service.vibecast/` is a Python Kodi add-on that bridges Kodi's player to
-vibecast's WebSocket endpoint. It's a **client** of the receiver, not part of
-it — the Rust receiver serves the `/player` endpoint by default. See
-[`kodi/service.vibecast/README.md`](kodi/service.vibecast/README.md).
+## Scope and limitations
 
-## Status
+This is not an official Google Cast device or a universal replacement for all
+Cast receiver applications. It does not use the official Google Cast SDK.
+Google Home adoption/groups and Spotify Cast are not supported product goals.
+Inherited app crates, Android/Kodi code and upstream documentation remain in the
+tree; their presence does not establish support or testing in the audio product.
 
-Working receiver with the four bundled apps above. Limitations:
+Compatible authentication material must be provided separately. No private
+bundle or keys are included here. Service changes or identity revocation can
+break reception independently of software updates. A successful build is not
+evidence of compatibility with every sender, renderer or future service version.
 
-- No Windows CI (ubuntu + macos).
-- `vibecast-bridge` uses `std::sync::Mutex::lock().unwrap()` in production
-  paths (poison = panic; deliberate for a server).
-- `cargo-deny` ignores one build-time-only advisory (`RUSTSEC-2024-0370`,
-  proc-macro-error via the `xot` manifest crate); the shipped binary has no
-  ignored vulnerabilities.
+Much of the product integration was developed with AI assistance, including
+GPT/Astra, and iterated through automated and user-operated playback tests.
+Independent reviews, fixes and contributions are welcome. Please do not include
+private keys, account tokens, pairing data or signed media URLs in issues.
 
-See [`AGENTS.md`](AGENTS.md) for the full developer guide (architecture,
-layering, build/test/lint commands, conventions).
+## Origin and licence
 
-## License
+The audio work starts from upstream commit
+[`b4616f8f399be706a1409ed21922aa2df892e303`](https://github.com/emilsvennesson/vibecast/commit/b4616f8f399be706a1409ed21922aa2df892e303).
+Git history preserves that origin and the subsequent integration changes.
 
-MIT. See [`LICENSE`](LICENSE).
+This fork retains Vibecast's **MIT licence** and copyright notice: see
+[`LICENSE`](LICENSE). Protocol schemas and other third-party files retain their
+own notices. The separate Python/product repository uses GPL-3.0-or-later;
+that does not relicense Vibecast or imply endorsement by upstream authors.

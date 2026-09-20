@@ -18,8 +18,10 @@
 #![forbid(unsafe_code)]
 
 mod bridge;
+#[cfg(feature = "browser-player")]
 mod web;
 
 pub use bridge::{PlayerBridge, PlayerEvent};
 pub use vibecast_player_api::PlayerRegistration;
+#[cfg(feature = "browser-player")]
 pub use web::{PLAYER_HTML, PLAYER_JS};

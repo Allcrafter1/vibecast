@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+browser-player = []
+
 [dependencies]
 vibecast-messages = { path = "../vibecast-messages" }
 vibecast-player-api = { path = "../vibecast-player-api" }

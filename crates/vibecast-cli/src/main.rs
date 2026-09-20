@@ -83,14 +83,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         local_ip: None,
     };
 
+    let player_host = config.network.player_bind_host.clone();
     let receiver = vibecast_platform::run(config, inputs, None)
         .await
         .context("starting receiver")?;
 
     tracing::info!(
         ip = %receiver.local_ip,
-        register = format_args!("ws://{}:{}/player", receiver.local_ip, receiver.player_port),
-        web = format_args!("http://{}:{}/", receiver.local_ip, receiver.player_port),
+        register = format_args!("ws://{}:{}/player", player_host, receiver.player_port),
         "vibecast server started; waiting for players to register"
     );
 

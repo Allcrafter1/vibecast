@@ -267,7 +267,7 @@ pub async fn run(
     // --- shared player bridge (registration + proxy hosting) ---
     let (events_tx, events_rx) = mpsc::channel(64);
     let bridge = Arc::new(PlayerBridge::new(
-        bind_host.clone(),
+        config.network.player_bind_host.clone(),
         config.network.player_port,
         events_tx,
         settings,
