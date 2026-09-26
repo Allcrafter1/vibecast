@@ -14,6 +14,33 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/120 Safari/537.36 CrKey/1.56";
 const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum LoopMode {
+    #[default]
+    Off,
+    One,
+    All,
+}
+
+impl LoopMode {
+    fn parse(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "LOOP_MODE_OFF" => Some(Self::Off),
+            "LOOP_MODE_ONE" => Some(Self::One),
+            "LOOP_MODE_ALL" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "LOOP_MODE_OFF",
+            Self::One => "LOOP_MODE_ONE",
+            Self::All => "LOOP_MODE_ALL",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LoungeCommand {
     SetPlaylist {
@@ -62,6 +89,7 @@ struct BoundSession {
 
 #[derive(Default)]
 struct CurrentMedia {
+    loop_mode: LoopMode,
     volume: Option<(f64, bool)>,
     awaiting_load: bool,
     video_ids: Vec<String>,
@@ -73,7 +101,30 @@ struct CurrentMedia {
 }
 
 impl CurrentMedia {
+    // Translate repeats into an ordinary selection so the playback queue and
+    // Lounge feedback share the same index and existing cancellation path.
+    fn next_command(&self, finished: bool) -> LoungeCommand {
+        let index = match self.loop_mode {
+            LoopMode::One if finished => Some(self.current_index),
+            LoopMode::All if self.current_index + 1 >= self.video_ids.len() => Some(0),
+            _ => None,
+        };
+        if let Some(index) = index.filter(|index| self.video_ids.get(*index).is_some()) {
+            LoungeCommand::SetPlaylist {
+                video_ids: self.video_ids.clone(),
+                current_index: index,
+                current_time: 0.0,
+                list_id: self.list_id.clone(),
+            }
+        } else {
+            LoungeCommand::Next
+        }
+    }
+
     fn coalesce_pending_selection(&self, incoming: Incoming) -> Incoming {
+        if matches!(incoming, Incoming::Command(LoungeCommand::Next)) {
+            return Incoming::Command(self.next_command(false));
+        }
         let incoming = match incoming {
             Incoming::QueueAddition(command) => {
                 if let LoungeCommand::SetPlaylist {
@@ -296,7 +347,7 @@ impl LoungeConnection {
                     control = output_control_rx.recv() => {
                         let Some(control) = control else { return Ok(()); };
                         let command = match control {
-                            OutputControl::Next => LoungeCommand::Next,
+                            OutputControl::Next => self.current.next_command(false),
                             OutputControl::Previous => LoungeCommand::Previous,
                         };
                         let incoming = Incoming::Command(command.clone());
@@ -328,10 +379,10 @@ impl LoungeConnection {
                         self.current.state = Some(state.clone());
                         self.post(Outbound::State(state)).await?;
                         if ended {
-                            if let Some(outbound) = self.handle_internal(&Incoming::Command(LoungeCommand::Next)) {
-                                self.post(outbound).await?;
-                            }
-                            let _ = command_tx.send(LoungeCommand::Next).await;
+                            let command = self.current.next_command(true);
+                            let outbound = self.handle_internal(&Incoming::Command(command.clone()));
+                            let _ = command_tx.send(command).await;
+                            if let Some(outbound) = outbound { self.post(outbound).await?; }
                         }
                     }
                     result = &mut poll => {
@@ -366,6 +417,12 @@ impl LoungeConnection {
 
     fn handle_internal(&mut self, incoming: &Incoming) -> Option<Outbound> {
         match incoming {
+            Incoming::SetLoopMode(mode) => {
+                self.current.loop_mode = *mode;
+                tracing::info!(loop_mode = mode.as_str(), "YouTube repeat mode changed");
+                Some(Outbound::LoopMode)
+            }
+            Incoming::GetLoopMode => Some(Outbound::LoopMode),
             Incoming::Command(LoungeCommand::SetPlaylist {
                 video_ids,
                 current_index,
@@ -465,7 +522,11 @@ impl LoungeConnection {
             &self.discovery_device_id,
             &self.device_id,
         );
-        self.bound.ofs += 1;
+        self.bound.ofs += if matches!(outbound, Outbound::NowPlaying) {
+            2
+        } else {
+            1
+        };
         self.http
             .post(url)
             .header("User-Agent", USER_AGENT)
@@ -481,6 +542,7 @@ impl LoungeConnection {
 }
 
 enum Outbound {
+    LoopMode,
     NowPlaying,
     State(PlaybackState),
     PlaybackSpeed,
@@ -497,9 +559,20 @@ impl Outbound {
         lounge_device_id: &str,
     ) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
-        form.append_pair("count", "1")
-            .append_pair("ofs", &ofs.to_string());
+        form.append_pair(
+            "count",
+            if matches!(self, Self::NowPlaying) {
+                "2"
+            } else {
+                "1"
+            },
+        )
+        .append_pair("ofs", &ofs.to_string());
         match self {
+            Self::LoopMode => {
+                form.append_pair("req0__sc", "onLoopModeChanged")
+                    .append_pair("req0_loopMode", current.loop_mode.as_str());
+            }
             Self::NowPlaying => {
                 form.append_pair("req0__sc", "nowPlaying");
                 if let Some(video_id) = &current.video_id {
@@ -512,6 +585,8 @@ impl Outbound {
                     form.append_pair("req0_listId", list_id);
                 }
                 form.append_pair("req0_currentIndex", &current.current_index.to_string());
+                form.append_pair("req1__sc", "onLoopModeChanged")
+                    .append_pair("req1_loopMode", current.loop_mode.as_str());
             }
             Self::State(state) => {
                 form.append_pair("req0__sc", "onStateChange");
@@ -665,6 +740,8 @@ struct IncomingBatch {
 }
 
 enum Incoming {
+    SetLoopMode(LoopMode),
+    GetLoopMode,
     QueueAddition(LoungeCommand),
     Command(LoungeCommand),
     GetNowPlaying,
@@ -695,6 +772,18 @@ fn parse_incoming(bytes: &[u8]) -> Result<IncomingBatch, LoungeError> {
                 "Lounge incoming command"
             );
             let incoming = parse_message(message);
+            // The sender can carry its existing repeat mode into a new cast.
+            if message.first().and_then(Value::as_str) == Some("setPlaylist")
+                && matches!(&incoming, Incoming::Command(_) | Incoming::QueueAddition(_))
+            {
+                if let Some(mode) = message
+                    .get(1)
+                    .and_then(|p| p.get("loopMode"))
+                    .and_then(LoopMode::parse)
+                {
+                    messages.push(Incoming::SetLoopMode(mode));
+                }
+            }
             if tracing::enabled!(tracing::Level::DEBUG)
                 && message.first().and_then(Value::as_str) == Some("setPlaylist")
             {
@@ -1029,6 +1118,12 @@ fn parse_message(message: &[Value]) -> Incoming {
         return Incoming::Command(command);
     }
     match name {
+        "setLoopMode" => params
+            .and_then(|p| p.get("loopMode"))
+            .and_then(LoopMode::parse)
+            .map(Incoming::SetLoopMode)
+            .unwrap_or(Incoming::Ignored),
+        "getLoopMode" => Incoming::GetLoopMode,
         "getNowPlaying" => Incoming::GetNowPlaying,
         "getPlaybackSpeed" => Incoming::GetPlaybackSpeed,
         "getVolume" => Incoming::GetVolume,
@@ -1192,7 +1287,7 @@ fn build_bind_url(
         .append_pair("theme", "cl")
         .append_pair(
             "capabilities",
-            "dsp,dpa,mic,ntb,vsp,ads,pas,dcn,dcp,drq,sads",
+            "dsp,dpa,mic,ntb,vsp,ads,pas,dcn,dcp,drq,sads,mlm",
         )
         .append_pair("cst", "m")
         .append_pair("mdxVersion", "2")
@@ -1240,6 +1335,124 @@ struct LoungeTokenScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_capability_and_sender_modes_round_trip() {
+        let receiver = ReceiverContext::new("Test", "Model", "device", PathBuf::new());
+        let url = build_bind_url(
+            &Url::parse(LOUNGE_BASE).unwrap(),
+            "secret",
+            "token",
+            "device",
+            &receiver,
+        )
+        .unwrap();
+        let capabilities = url
+            .query_pairs()
+            .find(|(key, _)| key == "capabilities")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(capabilities.split(',').any(|value| value == "mlm"));
+        for mode in [LoopMode::Off, LoopMode::One, LoopMode::All] {
+            let incoming = parse_message(&[
+                Value::from("setLoopMode"),
+                serde_json::json!({"loopMode": mode.as_str()}),
+            ]);
+            assert!(matches!(incoming, Incoming::SetLoopMode(value) if value == mode));
+            let current = CurrentMedia {
+                loop_mode: mode,
+                ..Default::default()
+            };
+            for (outbound, prefix) in [
+                (Outbound::LoopMode, "req0_"),
+                (Outbound::NowPlaying, "req1_"),
+            ] {
+                let body = outbound.form_body(7, &current, "device", "lounge");
+                let values: std::collections::HashMap<_, _> =
+                    url::form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                assert_eq!(values[&format!("{prefix}_sc")], "onLoopModeChanged");
+                assert_eq!(values[&format!("{prefix}loopMode")], mode.as_str());
+            }
+        }
+        for value in [Value::Null, Value::from(1), Value::from("unknown")] {
+            assert!(matches!(
+                parse_message(&[
+                    Value::from("setLoopMode"),
+                    serde_json::json!({"loopMode": value})
+                ]),
+                Incoming::Ignored
+            ));
+        }
+    }
+
+    #[test]
+    fn initial_playlist_preserves_sender_repeat_mode() {
+        let batch = parse_incoming(
+            frame(r#"[[5,["setPlaylist",{"videoIds":"a,b","loopMode":"LOOP_MODE_ALL"}]]]"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            batch.messages[0],
+            Incoming::SetLoopMode(LoopMode::All)
+        ));
+        assert!(matches!(
+            batch.messages[1],
+            Incoming::Command(LoungeCommand::SetPlaylist { .. })
+        ));
+    }
+
+    #[test]
+    fn repeat_one_restarts_on_finish_but_manual_next_still_advances() {
+        let current = CurrentMedia {
+            loop_mode: LoopMode::One,
+            video_ids: vec!["a".into(), "b".into()],
+            current_index: 1,
+            list_id: Some("queue".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            current.next_command(true),
+            LoungeCommand::SetPlaylist {
+                video_ids: vec!["a".into(), "b".into()],
+                current_index: 1,
+                current_time: 0.0,
+                list_id: Some("queue".into()),
+            }
+        );
+        assert_eq!(current.next_command(false), LoungeCommand::Next);
+    }
+
+    #[test]
+    fn repeat_all_wraps_only_at_queue_end_and_off_keeps_queue_extension() {
+        let mut current = CurrentMedia {
+            loop_mode: LoopMode::All,
+            video_ids: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert_eq!(current.next_command(true), LoungeCommand::Next);
+        current.current_index = 1;
+        for finished in [true, false] {
+            assert!(matches!(
+                current.next_command(finished),
+                LoungeCommand::SetPlaylist {
+                    current_index: 0,
+                    current_time: 0.0,
+                    ..
+                }
+            ));
+        }
+        current.loop_mode = LoopMode::Off;
+        assert_eq!(current.next_command(true), LoungeCommand::Next);
+        for mode in [LoopMode::One, LoopMode::All] {
+            current.loop_mode = mode;
+            current.video_ids.clear();
+            assert_eq!(current.next_command(true), LoungeCommand::Next);
+        }
+    }
     #[test]
     fn volume_reply_uses_actual_level_and_mute() {
         let current = CurrentMedia {
@@ -1453,6 +1666,125 @@ mod tests {
         connection.bound.aid = 4;
         connection.post(Outbound::NowPlaying).await.unwrap();
         assert_eq!(connection.bound.aid, 4, "forward ACK must not advance AID");
+    }
+
+    #[tokio::test]
+    async fn repeat_commands_reach_playback_and_feedback_without_reloading_on_toggle() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // Hold the poll open: playback EOF and receiver controls must still work.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let mut connection = LoungeConnection {
+            volume_rx: None,
+            http: reqwest::Client::new(),
+            bind_url: Url::parse(&format!("{}/api/lounge/bc/bind", server.uri())).unwrap(),
+            bound: BoundSession {
+                sid: "SID".into(),
+                gsession_id: "GSID".into(),
+                aid: 0,
+                rid: 1,
+                ofs: 0,
+            },
+            screen_id: "screen".into(),
+            device_id: "device".into(),
+            discovery_device_id: "cast".into(),
+            current: CurrentMedia {
+                video_ids: vec!["a".into(), "b".into()],
+                video_id: Some("b".into()),
+                current_index: 1,
+                list_id: Some("queue".into()),
+                state: Some(PlaybackState {
+                    player_state: PlayerState::Playing,
+                    current_time: 12.0,
+                    duration: Some(20.0),
+                    idle_reason: None,
+                }),
+                ..Default::default()
+            },
+        };
+        for mode in [LoopMode::Off, LoopMode::All, LoopMode::One] {
+            let incoming = parse_message(&[
+                Value::from("setLoopMode"),
+                serde_json::json!({"loopMode": mode.as_str()}),
+            ]);
+            let outbound = connection.handle_internal(&incoming).unwrap();
+            assert!(matches!(outbound, Outbound::LoopMode));
+            assert_eq!(
+                connection.current.state.as_ref().unwrap().current_time,
+                12.0
+            );
+            assert!(!connection.current.awaiting_load);
+            connection.post(outbound).await.unwrap();
+        }
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let (playback_tx, mut playback_rx) = mpsc::channel(4);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            connection
+                .run_bound(
+                    &command_tx,
+                    &mut playback_rx,
+                    &mut control_rx,
+                    &mut cancel_rx,
+                )
+                .await
+        });
+        playback_tx
+            .send(PlaybackState {
+                player_state: PlayerState::Idle,
+                current_time: 20.0,
+                duration: Some(20.0),
+                idle_reason: Some(IdleReason::Finished),
+            })
+            .await
+            .unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(2), command_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command,
+            LoungeCommand::SetPlaylist {
+                current_index: 1,
+                current_time: 0.0,
+                ..
+            }
+        ));
+        // A duplicate EOF while the repeat is loading must not start it twice.
+        playback_tx
+            .send(PlaybackState {
+                player_state: PlayerState::Idle,
+                current_time: 20.0,
+                duration: Some(20.0),
+                idle_reason: Some(IdleReason::Finished),
+            })
+            .await
+            .unwrap();
+        control_tx.send(OutputControl::Next).await.unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(2), command_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command, LoungeCommand::Next);
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(command_rx.try_recv().is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().any(|r| {
+            let body = String::from_utf8_lossy(&r.body);
+            body.contains("req0_currentIndex=1") && body.contains("req1_loopMode=LOOP_MODE_ONE")
+        }));
     }
 
     #[tokio::test]

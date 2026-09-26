@@ -1,5 +1,15 @@
 # Changelog
 
+## Audio receiver fork — 2026-09-26
+
+- Support YouTube Music's multi-state repeat control (`mlm`), initial playlist
+  loop mode, `setLoopMode` and `onLoopModeChanged` feedback. Repeat One restarts
+  at natural EOF; All wraps the queue. Manual Next still advances in One mode.
+- Keep repeat session-local and route repeated selections through the existing
+  playback/cancellation path. Add protocol and asynchronous EOF regressions.
+- Validation: 149 tests passed across the seven affected frontend crates;
+  one opt-in live resolver test ignored. Sender acceptance is separate.
+
 ## [0.1.0](https://github.com/emilsvennesson/vibecast/releases/tag/v0.1.0) (2026-07-09)
 
 Initial release of **vibecast** — a native Google Cast receiver written in Rust
