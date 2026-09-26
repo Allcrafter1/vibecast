@@ -2,6 +2,13 @@
 
 ## Audio receiver fork — 2026-09-26
 
+- Reuse the current resolved stream for repeat-one EOF, avoiding another
+  YouTube/yt-dlp lookup. Keep the existing next-title preparation intact.
+  Reuse stays session-local and bounded to ten minutes from original resolution;
+  Stop, another selection or a codec change invalidates it. No audio-file cache
+  or additional speculative resolver is introduced. YouTube suite: 51 passed,
+  one explicit live-network test ignored.
+
 - Support YouTube Music's multi-state repeat control (`mlm`), initial playlist
   loop mode, `setLoopMode` and `onLoopModeChanged` feedback. Repeat One restarts
   at natural EOF; All wraps the queue. Manual Next still advances in One mode.

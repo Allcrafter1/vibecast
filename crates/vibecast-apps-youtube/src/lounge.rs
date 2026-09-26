@@ -59,6 +59,8 @@ pub(crate) enum LoungeCommand {
     Seek(f64),
     Next,
     Previous,
+    // Natural EOF in repeat-one mode, distinct from a new sender selection.
+    RepeatCurrent,
 }
 
 pub(crate) struct LoungeConnection {
@@ -101,11 +103,16 @@ struct CurrentMedia {
 }
 
 impl CurrentMedia {
-    // Translate repeats into an ordinary selection so the playback queue and
-    // Lounge feedback share the same index and existing cancellation path.
+    // Distinguish repeat-one EOF from a new selection so playback can reuse
+    // the current stream. Queue wrapping remains an ordinary selection.
     fn next_command(&self, finished: bool) -> LoungeCommand {
+        if finished
+            && self.loop_mode == LoopMode::One
+            && self.video_ids.get(self.current_index).is_some()
+        {
+            return LoungeCommand::RepeatCurrent;
+        }
         let index = match self.loop_mode {
-            LoopMode::One if finished => Some(self.current_index),
             LoopMode::All if self.current_index + 1 >= self.video_ids.len() => Some(0),
             _ => None,
         };
@@ -423,6 +430,17 @@ impl LoungeConnection {
                 Some(Outbound::LoopMode)
             }
             Incoming::GetLoopMode => Some(Outbound::LoopMode),
+            Incoming::Command(LoungeCommand::RepeatCurrent) => {
+                self.current.awaiting_load = true;
+                self.current.next_pending = false;
+                self.current.state = Some(PlaybackState {
+                    player_state: PlayerState::Buffering,
+                    current_time: 0.0,
+                    duration: None,
+                    idle_reason: None,
+                });
+                Some(Outbound::NowPlaying)
+            }
             Incoming::Command(LoungeCommand::SetPlaylist {
                 video_ids,
                 current_index,
@@ -1414,15 +1432,7 @@ mod tests {
             list_id: Some("queue".into()),
             ..Default::default()
         };
-        assert_eq!(
-            current.next_command(true),
-            LoungeCommand::SetPlaylist {
-                video_ids: vec!["a".into(), "b".into()],
-                current_index: 1,
-                current_time: 0.0,
-                list_id: Some("queue".into()),
-            }
-        );
+        assert_eq!(current.next_command(true), LoungeCommand::RepeatCurrent);
         assert_eq!(current.next_command(false), LoungeCommand::Next);
     }
 
@@ -1749,14 +1759,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            command,
-            LoungeCommand::SetPlaylist {
-                current_index: 1,
-                current_time: 0.0,
-                ..
-            }
-        ));
+        assert_eq!(command, LoungeCommand::RepeatCurrent);
         // A duplicate EOF while the repeat is loading must not start it twice.
         playback_tx
             .send(PlaybackState {

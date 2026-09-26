@@ -293,6 +293,34 @@ fn prefetched_is_fresh(completed: std::time::Instant) -> bool {
     completed.elapsed() < std::time::Duration::from_secs(600)
 }
 
+// Keep only the current stream description, not audio bytes. Replaying must not
+// renew its age: signed URLs expire even when the same title keeps repeating.
+struct CurrentResolution {
+    video_id: String,
+    media: PlaybackMedia,
+    completed: std::time::Instant,
+    codec: PreferredVideoCodec,
+}
+
+impl CurrentResolution {
+    fn replay(
+        &self,
+        video_id: Option<&String>,
+        codec: PreferredVideoCodec,
+    ) -> Option<PlaybackMedia> {
+        if video_id != Some(&self.video_id)
+            || codec != self.codec
+            || !prefetched_is_fresh(self.completed)
+        {
+            return None;
+        }
+        let mut media = self.media.clone();
+        media.start_time = 0.0;
+        media.autoplay = true;
+        Some(media)
+    }
+}
+
 async fn run_commands(
     mut commands: mpsc::Receiver<LoungeCommand>,
     resolver: Resolver,
@@ -303,6 +331,7 @@ async fn run_commands(
 ) {
     let mut queue = QueueState::default();
     let mut next_resolution: Option<NextResolution> = None;
+    let mut current_resolution: Option<CurrentResolution> = None;
     let mut playback_active = false;
     let mut deferred = None;
     'commands: loop {
@@ -324,6 +353,19 @@ async fn run_commands(
             }
         };
 
+        let repeating = matches!(command, LoungeCommand::RepeatCurrent);
+        if repeating && playback_active {
+            let codec = PreferredVideoCodec::from_snapshot(&settings.snapshot());
+            if let Some(media) = current_resolution
+                .as_ref()
+                .and_then(|current| current.replay(queue.video_ids.get(queue.current_index), codec))
+            {
+                tracing::info!("reusing current YouTube media for repeat");
+                playback.load(media).await;
+                continue;
+            }
+        }
+
         // New-queue selections keep their established load/coalescing path.
         // Only explicit/automatic Next consumes speculative media.
         let use_prefetch = queue.advances_to_prepared_next(&command);
@@ -344,6 +386,14 @@ async fn run_commands(
             );
         }
         let load = match command {
+            LoungeCommand::RepeatCurrent => {
+                queue.next_pending = false;
+                queue
+                    .video_ids
+                    .get(queue.current_index)
+                    .cloned()
+                    .map(|video_id| (video_id, 0.0))
+            }
             LoungeCommand::SetPlaylist {
                 video_ids,
                 current_index,
@@ -412,6 +462,7 @@ async fn run_commands(
                 None
             }
             LoungeCommand::Stop => {
+                current_resolution = None;
                 queue.next_pending = false;
                 playback_active = false;
                 next_resolution = None;
@@ -421,10 +472,16 @@ async fn run_commands(
         };
 
         if let Some((video_id, start_time)) = load {
+            current_resolution = None;
             tracing::info!(%video_id, start_time, "YouTube queue requests load");
             let snapshot = settings.snapshot();
             let preferred_video_codec = PreferredVideoCodec::from_snapshot(&snapshot);
-            let pending = next_resolution.take();
+            // Repeat must not discard the already prepared manual Next.
+            let pending = if repeating {
+                None
+            } else {
+                next_resolution.take()
+            };
             let resolution = async {
                 let mut prepared = None;
                 if let Some(mut pending) = pending {
@@ -433,7 +490,7 @@ async fn run_commands(
                             if let Ok((Ok(mut media), completed)) = task.await {
                                 if prefetched_is_fresh(completed) {
                                     media.start_time = start_time.max(0.0);
-                                    prepared = Some(media);
+                                    prepared = Some((media, completed));
                                     tracing::info!(%video_id, "using prefetched YouTube media");
                                 }
                             }
@@ -442,11 +499,10 @@ async fn run_commands(
                 }
                 match prepared {
                     Some(media) => Ok(media),
-                    None => {
-                        resolver
-                            .resolve(&video_id, start_time, &capabilities, preferred_video_codec)
-                            .await
-                    }
+                    None => resolver
+                        .resolve(&video_id, start_time, &capabilities, preferred_video_codec)
+                        .await
+                        .map(|media| (media, std::time::Instant::now())),
                 }
             };
             tokio::pin!(resolution);
@@ -491,10 +547,16 @@ async fn run_commands(
                 }
             };
             match result {
-                Ok(mut media) => {
+                Ok((mut media, completed)) => {
                     media.start_time = requested_position;
                     media.autoplay = autoplay;
                     playback_active = true;
+                    current_resolution = Some(CurrentResolution {
+                        video_id: video_id.clone(),
+                        media: media.clone(),
+                        completed,
+                        codec: preferred_video_codec,
+                    });
                     tracing::info!(%video_id, start_time = requested_position,
                         autoplay, "committing resolved YouTube selection");
                     playback.load(media).await;
@@ -784,6 +846,106 @@ mod tests {
         );
         cancel.send(true).unwrap();
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeat_reuses_current_media_and_preserves_prepared_next() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            vibecast_sdk::PlayerCapabilities::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A", "B"], 0)).await.unwrap();
+        let (id, resolved) = requests.recv().await.unwrap();
+        assert_eq!(id, "A");
+        resolved.send(Ok(test_media("A"))).unwrap();
+        wait_loads(&player, 1).await;
+        let (id, next) = requests.recv().await.unwrap();
+        assert_eq!(id, "B");
+        for count in 2..=3 {
+            tx.send(LoungeCommand::RepeatCurrent).await.unwrap();
+            wait_loads(&player, count).await;
+            let loaded = player.loaded.lock().unwrap();
+            let replay = loaded.last().unwrap();
+            assert_eq!(replay.content_id.as_deref(), Some("A"));
+            assert_eq!(replay.start_time, 0.0);
+            assert!(replay.autoplay);
+            assert!(
+                !next.is_closed(),
+                "repeat must preserve next-item preparation"
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "repeat must not resolve again"
+            );
+        }
+        next.send(Ok(test_media("B"))).unwrap();
+        tx.send(LoungeCommand::Next).await.unwrap();
+        wait_loads(&player, 4).await;
+        assert_eq!(
+            player.loaded.lock().unwrap()[3].content_id.as_deref(),
+            Some("B")
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "manual Next must still reuse preparation"
+        );
+        tx.send(LoungeCommand::RepeatCurrent).await.unwrap();
+        wait_loads(&player, 5).await;
+        assert_eq!(
+            player.loaded.lock().unwrap()[4].content_id.as_deref(),
+            Some("B")
+        );
+        assert!(requests.try_recv().is_err());
+        // Stop invalidates reuse even if a late repeat command arrives.
+        tx.send(LoungeCommand::Stop).await.unwrap();
+        tx.send(LoungeCommand::RepeatCurrent).await.unwrap();
+        let (id, pending) = requests.recv().await.unwrap();
+        assert_eq!(id, "B");
+        cancel.send(true).unwrap();
+        worker.await.unwrap();
+        assert!(pending.is_closed());
+    }
+
+    #[test]
+    fn repeat_cache_expires_without_renewal_and_requires_matching_selection_and_codec() {
+        let id = "A".to_string();
+        let mut media = test_media("A");
+        media.start_time = 42.0;
+        media.autoplay = false;
+        let mut current = CurrentResolution {
+            video_id: id.clone(),
+            media,
+            completed: std::time::Instant::now(),
+            codec: PreferredVideoCodec::Auto,
+        };
+        let original_age = current.completed;
+        for _ in 0..2 {
+            let replay = current
+                .replay(Some(&id), PreferredVideoCodec::Auto)
+                .unwrap();
+            assert_eq!(replay.start_time, 0.0);
+            assert!(replay.autoplay);
+            assert_eq!(current.completed, original_age);
+        }
+        assert!(current
+            .replay(Some(&"B".into()), PreferredVideoCodec::Auto)
+            .is_none());
+        assert!(current.replay(None, PreferredVideoCodec::Auto).is_none());
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::H264)
+            .is_none());
+        current.completed = std::time::Instant::now() - std::time::Duration::from_secs(601);
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .is_none());
     }
 
     #[tokio::test]
