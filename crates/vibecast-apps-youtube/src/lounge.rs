@@ -364,6 +364,12 @@ impl LoungeConnection {
             receiver,
         )?;
         let bound = initial_bind(&http, &bind_url).await?;
+        match screen_is_online(&http, &base, &lounge_token).await {
+            Ok(online) => tracing::debug!(online, "YouTube Lounge screen visibility after bind"),
+            Err(error) => {
+                tracing::debug!(%error, "YouTube Lounge screen visibility check failed")
+            }
+        }
 
         Ok(Self {
             volume_rx: None,
@@ -696,6 +702,30 @@ impl LoungeConnection {
             .await?;
         Ok(())
     }
+}
+
+async fn screen_is_online(
+    http: &reqwest::Client,
+    base: &Url,
+    lounge_token: &str,
+) -> Result<bool, LoungeError> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("lounge_token", lounge_token)
+        .finish();
+    let response: ScreenAvailabilityResponse = http
+        .post(join(base, "pairing/get_screen_availability")?)
+        .header("User-Agent", USER_AGENT)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response
+        .screens
+        .iter()
+        .any(|screen| screen.lounge_token == lounge_token && screen.status == "online"))
 }
 
 enum Outbound {
@@ -1495,6 +1525,18 @@ struct LoungeTokenScreen {
     screen_id: String,
     #[serde(rename = "loungeToken")]
     lounge_token: String,
+}
+
+#[derive(Deserialize)]
+struct ScreenAvailabilityResponse {
+    screens: Vec<ScreenAvailability>,
+}
+
+#[derive(Deserialize)]
+struct ScreenAvailability {
+    #[serde(rename = "loungeToken")]
+    lounge_token: String,
+    status: String,
 }
 
 #[cfg(test)]
