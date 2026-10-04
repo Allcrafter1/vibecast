@@ -148,8 +148,7 @@ impl AppSession for YouTubeSession {
         data: &serde_json::Value,
     ) -> MessageDisposition {
         if namespace != MDX_NAMESPACE
-            || data.get("type").and_then(serde_json::Value::as_str)
-                != Some("getMdxSessionStatus")
+            || data.get("type").and_then(serde_json::Value::as_str) != Some("getMdxSessionStatus")
         {
             return MessageDisposition::Unhandled;
         }
