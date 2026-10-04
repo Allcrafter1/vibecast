@@ -58,9 +58,15 @@ impl SenderChannel for HubSender {
     async fn send_custom(&self, namespace: &str, data: Value) {
         match &self.bound {
             Some((handle, sender_id)) => {
-                let _ = handle
+                let delivered = handle
                     .send_json(&self.transport_id, sender_id, namespace, &data)
-                    .await;
+                    .await
+                    .is_ok();
+                tracing::debug!(
+                    namespace,
+                    delivered,
+                    "custom app response sent to requesting sender"
+                );
             }
             None => self.broadcast_custom(namespace, data).await,
         }

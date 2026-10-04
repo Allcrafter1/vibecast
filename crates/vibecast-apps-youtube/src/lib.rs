@@ -152,6 +152,11 @@ impl AppSession for YouTubeSession {
         {
             return MessageDisposition::Unhandled;
         }
+        tracing::debug!(
+            identity_ready = self.identity.borrow().is_some(),
+            request_id_present = data.get("requestId").is_some(),
+            "YouTube MDX session status requested"
+        );
         send_mdx_session_status_when_ready(
             ctx.clone(),
             self.identity.clone(),
@@ -223,9 +228,15 @@ fn send_mdx_session_status_when_ready(
                 if let Some(request_id) = request_id.as_ref() {
                     response["requestId"] = request_id.clone();
                 }
+                tracing::debug!(
+                    request_id_present = request_id.is_some(),
+                    "sending YouTube MDX session status"
+                );
                 ctx.send_custom(MDX_NAMESPACE, response).await;
                 return;
             }
+
+            tracing::debug!("waiting for YouTube Lounge identity before MDX response");
 
             tokio::select! {
                 result = identity.changed() => {
@@ -278,6 +289,7 @@ async fn run_lounge(
         }
     };
 
+    tracing::debug!("YouTube Lounge identity is ready");
     let _ = identity_tx.send(Some(lounge.identity()));
     lounge
         .with_volume(volume_rx)
