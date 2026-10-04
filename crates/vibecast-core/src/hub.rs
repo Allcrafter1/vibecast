@@ -830,12 +830,7 @@ impl DeviceHub {
         )
     }
 
-    async fn reply_and_publish_receiver_status(
-        &self,
-        conn_id: u64,
-        source: &str,
-        request_id: i64,
-    ) {
+    async fn reply_and_publish_receiver_status(&self, conn_id: u64, source: &str, request_id: i64) {
         // Command responses must target the sender that owns the request.
         // Chromium's launch state machine does not treat a wildcard status as
         // the correlated LAUNCH response, even though mobile senders commonly
@@ -846,13 +841,8 @@ impl DeviceHub {
         self.send_to(conn_id, RECEIVER_0, source, ns::RECEIVER, &response)
             .await;
         let update = self.receiver_status(0);
-        self.broadcast_except_connection(
-            RECEIVER_0,
-            ns::RECEIVER,
-            &update,
-            Some(conn_id),
-        )
-        .await;
+        self.broadcast_except_connection(RECEIVER_0, ns::RECEIVER, &update, Some(conn_id))
+            .await;
     }
 
     // -- app session transports --------------------------------------------
