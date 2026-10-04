@@ -192,6 +192,16 @@ impl AppSession for YouTubeSession {
         });
     }
 
+    fn handles_play_requests(&self) -> bool {
+        true
+    }
+
+    fn allows_sender_reconnect_grace(&self) -> bool {
+        // Lounge/cache can bridge a brief control-connection loss, but the
+        // runtime must stop playback if control is not restored within 10s.
+        true
+    }
+
     async fn on_output_control(&self, _ctx: &AppContext, control: OutputControl) {
         let _ = self.output_control_tx.try_send(control);
     }
@@ -308,9 +318,18 @@ impl CurrentResolution {
         video_id: Option<&String>,
         codec: PreferredVideoCodec,
     ) -> Option<PlaybackMedia> {
+        let cache = self
+            .media
+            .streams
+            .first()
+            .and_then(|stream| match &stream.source {
+                vibecast_sdk::StreamSource::CachedUrl { cache, .. } => Some(cache),
+                _ => None,
+            });
         if video_id != Some(&self.video_id)
             || codec != self.codec
-            || !prefetched_is_fresh(self.completed)
+            || cache.is_some_and(|c| c.is_failed())
+            || (!cache.is_some_and(|c| c.is_complete()) && !prefetched_is_fresh(self.completed))
         {
             return None;
         }
@@ -333,6 +352,8 @@ async fn run_commands(
     let mut next_resolution: Option<NextResolution> = None;
     let mut current_resolution: Option<CurrentResolution> = None;
     let mut playback_active = false;
+    let mut stopped = false;
+    let mut failed_resolution: Option<(String, f64)> = None;
     let mut deferred = None;
     'commands: loop {
         let command = if let Some(command) = deferred.take() {
@@ -354,13 +375,20 @@ async fn run_commands(
         };
 
         let repeating = matches!(command, LoungeCommand::RepeatCurrent);
+        let reload_autoplay = match &command {
+            LoungeCommand::ReloadCurrent { autoplay, .. } => Some(*autoplay),
+            _ => None,
+        };
         if repeating && playback_active {
             let codec = PreferredVideoCodec::from_snapshot(&settings.snapshot());
             if let Some(media) = current_resolution
                 .as_ref()
                 .and_then(|current| current.replay(queue.video_ids.get(queue.current_index), codec))
             {
-                tracing::info!("reusing current YouTube media for repeat");
+                let cached_audio = media.streams.iter().any(|stream| matches!(
+                    &stream.source, vibecast_sdk::StreamSource::CachedUrl { cache, .. } if cache.is_complete()
+                ));
+                tracing::info!(cached_audio, "reusing current YouTube media for repeat");
                 playback.load(media).await;
                 continue;
             }
@@ -386,6 +414,16 @@ async fn run_commands(
             );
         }
         let load = match command {
+            LoungeCommand::ReloadCurrent {
+                video_id,
+                current_time,
+                ..
+            } => {
+                if stopped || queue.video_ids.get(queue.current_index) != Some(&video_id) {
+                    continue;
+                }
+                Some((video_id, current_time))
+            }
             LoungeCommand::RepeatCurrent => {
                 queue.next_pending = false;
                 queue
@@ -450,8 +488,16 @@ async fn run_commands(
                     .map(|video_id| (video_id, 0.0))
             }
             LoungeCommand::Play => {
-                playback.play().await;
-                None
+                if let Some((video_id, position)) = failed_resolution.take() {
+                    if !stopped && queue.video_ids.get(queue.current_index) == Some(&video_id) {
+                        Some((video_id, position))
+                    } else {
+                        None
+                    }
+                } else {
+                    playback.play().await;
+                    None
+                }
             }
             LoungeCommand::Pause => {
                 playback.pause().await;
@@ -462,6 +508,8 @@ async fn run_commands(
                 None
             }
             LoungeCommand::Stop => {
+                stopped = true;
+                failed_resolution = None;
                 current_resolution = None;
                 queue.next_pending = false;
                 playback_active = false;
@@ -472,6 +520,8 @@ async fn run_commands(
         };
 
         if let Some((video_id, start_time)) = load {
+            stopped = false;
+            failed_resolution = None;
             current_resolution = None;
             tracing::info!(%video_id, start_time, "YouTube queue requests load");
             let snapshot = settings.snapshot();
@@ -499,15 +549,35 @@ async fn run_commands(
                 }
                 match prepared {
                     Some(media) => Ok(media),
-                    None => resolver
-                        .resolve(&video_id, start_time, &capabilities, preferred_video_codec)
-                        .await
-                        .map(|media| (media, std::time::Instant::now())),
+                    None => {
+                        let mut result = resolver
+                            .resolve(&video_id, start_time, &capabilities, preferred_video_codec)
+                            .await;
+                        // Metadata/extractor requests can fail before a LOAD ever
+                        // reaches the decoder (including repeat cache renewal).
+                        if result
+                            .as_ref()
+                            .err()
+                            .is_some_and(retryable_resolution_error)
+                        {
+                            tracing::warn!("retrying YouTube resolution after request failure");
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            result = resolver
+                                .resolve(
+                                    &video_id,
+                                    start_time,
+                                    &capabilities,
+                                    preferred_video_codec,
+                                )
+                                .await;
+                        }
+                        result.map(|media| (media, std::time::Instant::now()))
+                    }
                 }
             };
             tokio::pin!(resolution);
             let mut requested_position = start_time;
-            let mut autoplay = true;
+            let mut autoplay = reload_autoplay.unwrap_or(true);
             let result = loop {
                 tokio::select! {
                     biased;
@@ -534,6 +604,11 @@ async fn run_commands(
                                     && current_index == queue.current_index && current_time == start_time => {
                                 queue.video_ids = video_ids;
                                 queue.list_id = list_id;
+                            }
+                            Some(LoungeCommand::ReloadCurrent { video_id: retry_id, .. })
+                                if retry_id != video_id => {
+                                // A delayed recovery for the previous item must not
+                                // cancel the user's newer in-flight selection.
                             }
                             Some(command) => {
                                 tracing::info!(%video_id, "superseding pending YouTube load");
@@ -563,6 +638,7 @@ async fn run_commands(
                 }
                 Err(error) => {
                     playback_active = false;
+                    failed_resolution = Some((video_id.clone(), requested_position));
                     tracing::warn!(%video_id, %error, "failed to resolve YouTube video");
                     playback.stop().await;
                 }
@@ -591,6 +667,14 @@ async fn run_commands(
                 });
             }
         }
+    }
+}
+
+fn retryable_resolution_error(error: &ResolveError) -> bool {
+    match error {
+        ResolveError::Http(error) => error.status().map(|s| s.as_u16()) != Some(429),
+        ResolveError::Protocol("external audio resolver failed") => true,
+        _ => false,
     }
 }
 
@@ -799,6 +883,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_repeat_resolution_retries_then_play_resolves_instead_of_unpausing() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            vibecast_sdk::PlayerCapabilities::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A"], 0)).await.unwrap();
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .1
+            .send(Err(ResolveError::Protocol(
+                "external audio resolver failed",
+            )))
+            .unwrap();
+        let (id, retry) = requests.recv().await.unwrap();
+        assert_eq!(id, "A");
+        tx.send(LoungeCommand::Seek(66.0)).await.unwrap();
+        retry
+            .send(Err(ResolveError::Protocol(
+                "external audio resolver failed",
+            )))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !player.operations.lock().unwrap().contains(&"stop".into()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "automatic resolution retry is bounded"
+        );
+        tx.send(LoungeCommand::Play).await.unwrap();
+        let (id, manual) = requests.recv().await.unwrap();
+        assert_eq!(id, "A");
+        manual.send(Ok(test_media("A-fresh"))).unwrap();
+        wait_loads(&player, 1).await;
+        assert_eq!(player.loaded.lock().unwrap()[0].start_time, 66.0);
+        assert_eq!(*player.operations.lock().unwrap(), ["stop", "load:A-fresh"]);
+        cancel.send(true).unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_resolution_retry() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (_cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            vibecast_sdk::PlayerCapabilities::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A"], 0)).await.unwrap();
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .1
+            .send(Err(ResolveError::Protocol(
+                "external audio resolver failed",
+            )))
+            .unwrap();
+        let (_, retry) = requests.recv().await.unwrap();
+        tx.send(LoungeCommand::Stop).await.unwrap();
+        tx.send(LoungeCommand::Play).await.unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert!(retry.is_closed());
+        assert!(requests.try_recv().is_err());
+        assert!(player.loaded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_resolves_fresh_media_and_preserves_position_and_controls() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            vibecast_sdk::PlayerCapabilities::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A", "B"], 0)).await.unwrap();
+        let (_, first) = requests.recv().await.unwrap();
+        first.send(Ok(test_media("A-old"))).unwrap();
+        wait_loads(&player, 1).await;
+        let (id, prepared) = requests.recv().await.unwrap();
+        assert_eq!(id, "B");
+        tx.send(LoungeCommand::ReloadCurrent {
+            video_id: "A".into(),
+            current_time: 66.0,
+            autoplay: false,
+        })
+        .await
+        .unwrap();
+        let (id, retry) = requests.recv().await.unwrap();
+        assert_eq!(id, "A");
+        assert!(prepared.is_closed());
+        retry.send(Ok(test_media("A-fresh"))).unwrap();
+        wait_loads(&player, 2).await;
+        {
+            let loaded = player.loaded.lock().unwrap();
+            assert_eq!(loaded[1].content_id.as_deref(), Some("A-fresh"));
+            assert_eq!(loaded[1].start_time, 66.0);
+            assert!(!loaded[1].autoplay);
+        }
+        let (_, _next) = requests.recv().await.unwrap();
+        tx.send(LoungeCommand::ReloadCurrent {
+            video_id: "A".into(),
+            current_time: 66.0,
+            autoplay: true,
+        })
+        .await
+        .unwrap();
+        let (_, manual) = requests.recv().await.unwrap();
+        tx.send(LoungeCommand::Pause).await.unwrap();
+        tx.send(LoungeCommand::Seek(80.0)).await.unwrap();
+        manual.send(Ok(test_media("A-manual"))).unwrap();
+        wait_loads(&player, 3).await;
+        {
+            let loaded = player.loaded.lock().unwrap();
+            assert_eq!(loaded[2].start_time, 80.0);
+            assert!(!loaded[2].autoplay);
+        }
+        cancel.send(true).unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_cannot_override_stop_or_new_selection() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            vibecast_sdk::PlayerCapabilities::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A"], 0)).await.unwrap();
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .1
+            .send(Ok(test_media("A")))
+            .unwrap();
+        wait_loads(&player, 1).await;
+        let reload = LoungeCommand::ReloadCurrent {
+            video_id: "A".into(),
+            current_time: 66.0,
+            autoplay: true,
+        };
+        tx.send(reload.clone()).await.unwrap();
+        let (_, retry) = requests.recv().await.unwrap();
+        tx.send(LoungeCommand::Stop).await.unwrap();
+        tx.send(reload.clone()).await.unwrap(); // queued obsolete retry
+        tx.send(selection(&["B"], 0)).await.unwrap();
+        let (id, replacement) = requests.recv().await.unwrap();
+        assert_eq!(id, "B");
+        assert!(retry.is_closed());
+        tx.send(reload.clone()).await.unwrap(); // also stale while B is resolving
+        replacement.send(Ok(test_media("B"))).unwrap();
+        wait_loads(&player, 2).await;
+        tx.send(reload).await.unwrap(); // wrong selection must be ignored
+        tx.send(LoungeCommand::Pause).await.unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert!(requests.try_recv().is_err());
+        assert_eq!(player.loaded.lock().unwrap().len(), 2);
+        drop(cancel);
+    }
+
+    #[tokio::test]
     async fn latest_selection_preserves_controls_and_prepared_next() {
         let (resolver, mut requests) = Resolver::controlled();
         let player = Arc::new(RecordingPlayback::default());
@@ -943,6 +1223,44 @@ mod tests {
             .replay(Some(&id), PreferredVideoCodec::H264)
             .is_none());
         current.completed = std::time::Instant::now() - std::time::Duration::from_secs(601);
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .is_none());
+    }
+
+    #[test]
+    fn only_complete_current_audio_replays_after_url_age_limit() {
+        let id = "A".to_string();
+        let mut media = test_media("A");
+        let stream =
+            vibecast_sdk::PlaybackStream::cached_url("https://example.test/audio", "audio/mp4");
+        let vibecast_sdk::StreamSource::CachedUrl { cache, .. } = &stream.source else {
+            unreachable!()
+        };
+        let hint = cache.clone();
+        media.streams = vec![stream];
+        let current = CurrentResolution {
+            video_id: id.clone(),
+            media,
+            completed: std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            codec: PreferredVideoCodec::Auto,
+        };
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .is_none());
+        hint.mark_complete();
+        let replay = current
+            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .unwrap();
+        assert_eq!(replay.start_time, 0.0);
+        assert!(replay.autoplay);
+        assert!(current
+            .replay(Some(&"B".into()), PreferredVideoCodec::Auto)
+            .is_none());
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::H264)
+            .is_none());
+        hint.invalidate();
         assert!(current
             .replay(Some(&id), PreferredVideoCodec::Auto)
             .is_none());

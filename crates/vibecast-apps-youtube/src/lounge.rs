@@ -61,6 +61,12 @@ pub(crate) enum LoungeCommand {
     Previous,
     // Natural EOF in repeat-one mode, distinct from a new sender selection.
     RepeatCurrent,
+    // Retry the same selection with fresh media, never repeat/prefetch reuse.
+    ReloadCurrent {
+        video_id: String,
+        current_time: f64,
+        autoplay: bool,
+    },
 }
 
 pub(crate) struct LoungeConnection {
@@ -91,6 +97,7 @@ struct BoundSession {
 
 #[derive(Default)]
 struct CurrentMedia {
+    recovery: LoadRecovery,
     loop_mode: LoopMode,
     volume: Option<(f64, bool)>,
     awaiting_load: bool,
@@ -102,7 +109,86 @@ struct CurrentMedia {
     state: Option<PlaybackState>,
 }
 
+#[derive(Default)]
+struct LoadRecovery {
+    enabled: bool,
+    retry_used: bool,
+    reloading: bool,
+    failed: bool,
+    started: bool,
+    paused: bool,
+}
+
 impl CurrentMedia {
+    fn reload_command(&self, autoplay: bool) -> Option<LoungeCommand> {
+        Some(LoungeCommand::ReloadCurrent {
+            video_id: self.video_id.clone()?,
+            current_time: self.state.as_ref().map_or(0.0, |s| s.current_time),
+            autoplay,
+        })
+    }
+
+    fn accept_state(
+        &mut self,
+        mut state: PlaybackState,
+    ) -> Option<(PlaybackState, Option<LoungeCommand>)> {
+        // The adapter keeps reporting the failed old load while resolution runs.
+        // Only a new BUFFERING acknowledgement (or resolver STOP) ends this gate.
+        if self.recovery.reloading {
+            if state.player_state == PlayerState::Buffering {
+                self.recovery.reloading = false;
+            } else if state.idle_reason == Some(IdleReason::Cancelled) {
+                self.recovery.reloading = false;
+                // The resolver exhausted (or declined) its retry already.
+                self.recovery.retry_used = true;
+                self.awaiting_load = false;
+                state = self.state.clone()?;
+                state.player_state = PlayerState::Idle;
+                state.idle_reason = Some(IdleReason::Error);
+            } else {
+                return None;
+            }
+        }
+        if self.awaiting_load {
+            if state.player_state != PlayerState::Buffering
+                && state.idle_reason != Some(IdleReason::Cancelled)
+            {
+                return None;
+            }
+            self.awaiting_load = false;
+            if state.idle_reason == Some(IdleReason::Cancelled) && self.recovery.enabled {
+                // The command worker already retried resolution, then stopped
+                // the old decoder. Preserve this failed selection for Play.
+                self.recovery.retry_used = true;
+                state = self.state.clone()?;
+                state.player_state = PlayerState::Idle;
+                state.idle_reason = Some(IdleReason::Error);
+            }
+        }
+        if state.idle_reason == Some(IdleReason::Error) && self.recovery.enabled {
+            self.recovery.failed = true;
+            if !self.recovery.started && !self.recovery.retry_used {
+                self.state = Some(state.clone());
+                if let Some(command) = self.reload_command(!self.recovery.paused) {
+                    self.recovery.retry_used = true;
+                    self.recovery.reloading = true;
+                    self.awaiting_load = true;
+                    state.player_state = PlayerState::Buffering;
+                    state.idle_reason = None;
+                    tracing::info!("retrying failed YouTube start with fresh media");
+                    return Some((state, Some(command)));
+                }
+            }
+        } else if matches!(
+            state.player_state,
+            PlayerState::Playing | PlayerState::Paused
+        ) {
+            self.recovery.started = true;
+            self.recovery.failed = false;
+        }
+        Some((state, None))
+    }
+
     // Distinguish repeat-one EOF from a new selection so playback can reuse
     // the current stream. Queue wrapping remains an ordinary selection.
     fn next_command(&self, finished: bool) -> LoungeCommand {
@@ -129,6 +215,19 @@ impl CurrentMedia {
     }
 
     fn coalesce_pending_selection(&self, incoming: Incoming) -> Incoming {
+        if matches!(incoming, Incoming::Command(LoungeCommand::Play))
+            && self.recovery.enabled
+            && self.recovery.failed
+            && !self.recovery.reloading
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|s| s.player_state == PlayerState::Idle)
+        {
+            if let Some(command) = self.reload_command(true) {
+                return Incoming::Command(command);
+            }
+        }
         if matches!(incoming, Incoming::Command(LoungeCommand::Next)) {
             return Incoming::Command(self.next_command(false));
         }
@@ -354,13 +453,16 @@ impl LoungeConnection {
                     control = output_control_rx.recv() => {
                         let Some(control) = control else { return Ok(()); };
                         let command = match control {
+                            OutputControl::Play => LoungeCommand::Play,
                             OutputControl::Next => self.current.next_command(false),
                             OutputControl::Previous => LoungeCommand::Previous,
                         };
-                        let incoming = Incoming::Command(command.clone());
+                        let incoming = self.current.coalesce_pending_selection(Incoming::Command(command));
                         let outbound = self.handle_internal(&incoming);
-                        if command_tx.send(command).await.is_err() {
-                            return Ok(());
+                        if let Incoming::Command(command) = incoming {
+                            if command_tx.send(command).await.is_err() {
+                                return Ok(());
+                            }
                         }
                         if let Some(outbound) = outbound {
                             self.post(outbound).await?;
@@ -373,17 +475,14 @@ impl LoungeConnection {
                     }
                     state = playback_rx.recv() => {
                         let Some(state) = state else { return Ok(()); };
-                        if self.current.awaiting_load {
-                            if state.player_state != PlayerState::Buffering
-                                && !matches!(state.idle_reason, Some(IdleReason::Error | IdleReason::Cancelled)) {
-                                continue;
-                            }
-                            self.current.awaiting_load = false;
-                        }
+                        let Some((state, reload)) = self.current.accept_state(state) else { continue; };
                         let ended = state.idle_reason == Some(IdleReason::Finished)
                             && self.current.state.as_ref().and_then(|s| s.idle_reason)
                                 != Some(IdleReason::Finished);
                         self.current.state = Some(state.clone());
+                        if let Some(command) = reload {
+                            if command_tx.send(command).await.is_err() { return Ok(()); }
+                        }
                         self.post(Outbound::State(state)).await?;
                         if ended {
                             let command = self.current.next_command(true);
@@ -424,6 +523,46 @@ impl LoungeConnection {
 
     fn handle_internal(&mut self, incoming: &Incoming) -> Option<Outbound> {
         match incoming {
+            Incoming::Command(
+                LoungeCommand::SetPlaylist { .. }
+                | LoungeCommand::Next
+                | LoungeCommand::Previous
+                | LoungeCommand::RepeatCurrent,
+            ) => {
+                self.current.recovery = LoadRecovery {
+                    enabled: true,
+                    ..Default::default()
+                };
+            }
+            Incoming::Command(LoungeCommand::Pause) => self.current.recovery.paused = true,
+            Incoming::Command(LoungeCommand::Play) => self.current.recovery.paused = false,
+            Incoming::Command(LoungeCommand::Stop) => {
+                self.current.recovery = LoadRecovery::default();
+                self.current.awaiting_load = false;
+            }
+            _ => {}
+        }
+        match incoming {
+            Incoming::Command(LoungeCommand::ReloadCurrent {
+                current_time,
+                autoplay,
+                ..
+            }) => {
+                // Explicit Play after a terminal failure gets a new bounded attempt.
+                self.current.recovery.retry_used = false;
+                self.current.recovery.started = false;
+                self.current.recovery.reloading = true;
+                self.current.recovery.paused = !autoplay;
+                self.current.awaiting_load = true;
+                let duration = self.current.state.as_ref().and_then(|s| s.duration);
+                self.current.state = Some(PlaybackState {
+                    player_state: PlayerState::Buffering,
+                    current_time: *current_time,
+                    duration,
+                    idle_reason: None,
+                });
+                Some(Outbound::NowPlaying)
+            }
             Incoming::SetLoopMode(mode) => {
                 self.current.loop_mode = *mode;
                 tracing::info!(loop_mode = mode.as_str(), "YouTube repeat mode changed");
@@ -609,7 +748,14 @@ impl Outbound {
             Self::State(state) => {
                 form.append_pair("req0__sc", "onStateChange");
                 append_state_fields(&mut form, "req0_", state);
-                form.append_pair("req0_playabilityStatus", "OK");
+                form.append_pair(
+                    "req0_playabilityStatus",
+                    if state.idle_reason == Some(IdleReason::Error) {
+                        "ERROR"
+                    } else {
+                        "OK"
+                    },
+                );
             }
             Self::PlaybackSpeed => {
                 form.append_pair("req0__sc", "onPlaybackSpeedChanged")
@@ -644,6 +790,7 @@ fn append_state_fields(
         PlayerState::Playing => "1",
         PlayerState::Paused => "2",
         PlayerState::Buffering => "3",
+        PlayerState::Idle if state.idle_reason == Some(IdleReason::Error) => "-1",
         PlayerState::Idle => "0",
     };
     form.append_pair(&format!("{prefix}state"), lounge_state)
@@ -1354,6 +1501,177 @@ struct LoungeTokenScreen {
 mod tests {
     use super::*;
 
+    fn failed_start() -> PlaybackState {
+        PlaybackState {
+            player_state: PlayerState::Idle,
+            current_time: 66.0,
+            duration: Some(230.0),
+            idle_reason: Some(IdleReason::Error),
+        }
+    }
+
+    fn retryable_media() -> CurrentMedia {
+        CurrentMedia {
+            video_id: Some("A".into()),
+            recovery: LoadRecovery {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_start_retries_once_and_play_requests_fresh_media() {
+        let mut current = retryable_media();
+        let (buffering, command) = current.accept_state(failed_start()).unwrap();
+        assert_eq!(
+            command,
+            Some(LoungeCommand::ReloadCurrent {
+                video_id: "A".into(),
+                current_time: 66.0,
+                autoplay: true
+            })
+        );
+        assert_eq!(buffering.player_state, PlayerState::Buffering);
+        assert_eq!(buffering.idle_reason, None);
+        current.state = Some(buffering.clone());
+        // Periodic old ERRORs cannot consume retries or report a false end.
+        assert!(current.accept_state(failed_start()).is_none());
+        assert!(current.accept_state(failed_start()).is_none());
+        current.accept_state(buffering).unwrap();
+        let (failure, command) = current.accept_state(failed_start()).unwrap();
+        assert!(command.is_none());
+        current.state = Some(failure);
+        assert!(current.accept_state(failed_start()).unwrap().1.is_none());
+        assert!(matches!(
+            current.coalesce_pending_selection(Incoming::Command(LoungeCommand::Play)),
+            Incoming::Command(LoungeCommand::ReloadCurrent {
+                current_time: 66.0,
+                autoplay: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn retry_preserves_pause_and_resolver_failure_remains_retryable() {
+        let mut current = retryable_media();
+        current.recovery.paused = true;
+        let (buffering, command) = current.accept_state(failed_start()).unwrap();
+        assert!(matches!(
+            command,
+            Some(LoungeCommand::ReloadCurrent {
+                autoplay: false,
+                ..
+            })
+        ));
+        current.state = Some(buffering);
+        let (state, command) = current
+            .accept_state(PlaybackState {
+                player_state: PlayerState::Idle,
+                current_time: 0.0,
+                duration: None,
+                idle_reason: Some(IdleReason::Cancelled),
+            })
+            .unwrap();
+        assert!(command.is_none());
+        assert_eq!(state.idle_reason, Some(IdleReason::Error));
+        assert_eq!(state.current_time, 66.0);
+        current.state = Some(state);
+        assert!(matches!(
+            current.coalesce_pending_selection(Incoming::Command(LoungeCommand::Play)),
+            Incoming::Command(LoungeCommand::ReloadCurrent { .. })
+        ));
+    }
+
+    #[test]
+    fn no_automatic_retry_after_playback_started_or_stop() {
+        let mut current = retryable_media();
+        current
+            .accept_state(PlaybackState {
+                player_state: PlayerState::Playing,
+                current_time: 70.0,
+                duration: Some(230.0),
+                idle_reason: None,
+            })
+            .unwrap();
+        let (state, command) = current.accept_state(failed_start()).unwrap();
+        assert!(command.is_none());
+        current.state = Some(state);
+        assert!(matches!(
+            current.coalesce_pending_selection(Incoming::Command(LoungeCommand::Play)),
+            Incoming::Command(LoungeCommand::ReloadCurrent { .. })
+        ));
+        current.recovery = LoadRecovery::default();
+        assert!(current.accept_state(failed_start()).unwrap().1.is_none());
+        assert!(matches!(
+            current.coalesce_pending_selection(Incoming::Command(LoungeCommand::Play)),
+            Incoming::Command(LoungeCommand::Play)
+        ));
+    }
+
+    #[test]
+    fn old_failure_cannot_retry_new_selection_before_load_acknowledgement() {
+        let mut current = retryable_media();
+        current.awaiting_load = true;
+        assert!(current.accept_state(failed_start()).is_none());
+        assert!(!current.recovery.retry_used);
+    }
+
+    #[test]
+    fn resolution_failure_stop_is_error_and_play_reloads_same_repeat_position() {
+        let mut current = retryable_media();
+        current.awaiting_load = true;
+        current.state = Some(PlaybackState {
+            player_state: PlayerState::Buffering,
+            current_time: 0.0,
+            duration: None,
+            idle_reason: None,
+        });
+        let (state, command) = current
+            .accept_state(PlaybackState {
+                player_state: PlayerState::Idle,
+                current_time: 230.0,
+                duration: Some(230.0),
+                idle_reason: Some(IdleReason::Cancelled),
+            })
+            .unwrap();
+        assert!(
+            command.is_none(),
+            "resolution retry budget was already consumed"
+        );
+        assert_eq!(state.idle_reason, Some(IdleReason::Error));
+        assert_eq!(
+            state.current_time, 0.0,
+            "repeat starts at zero, not old EOF"
+        );
+        current.state = Some(state);
+        assert!(matches!(
+            current.coalesce_pending_selection(Incoming::Command(LoungeCommand::Play)),
+            Incoming::Command(LoungeCommand::ReloadCurrent {
+                current_time: 0.0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn load_error_is_not_encoded_as_finished_or_playable() {
+        let body = Outbound::State(failed_start()).form_body(
+            0,
+            &CurrentMedia::default(),
+            "device",
+            "lounge",
+        );
+        let values: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(values["req0_state"], "-1");
+        assert_eq!(values["req0_playabilityStatus"], "ERROR");
+        assert_eq!(values["req0_currentTime"], "66");
+    }
+
     #[test]
     fn repeat_capability_and_sender_modes_round_trip() {
         let receiver = ReceiverContext::new("Test", "Model", "device", PathBuf::new());
@@ -1676,6 +1994,130 @@ mod tests {
         connection.bound.aid = 4;
         connection.post(Outbound::NowPlaying).await.unwrap();
         assert_eq!(connection.bound.aid, 4, "forward ACK must not advance AID");
+    }
+
+    #[tokio::test]
+    async fn load_recovery_round_trips_feedback_and_manual_play() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let mut connection = LoungeConnection {
+            volume_rx: None,
+            http: reqwest::Client::new(),
+            bind_url: Url::parse(&format!("{}/bind", server.uri())).unwrap(),
+            bound: BoundSession {
+                sid: "SID".into(),
+                gsession_id: "GSID".into(),
+                aid: 0,
+                rid: 1,
+                ofs: 0,
+            },
+            screen_id: "screen".into(),
+            device_id: "device".into(),
+            discovery_device_id: "cast".into(),
+            current: retryable_media(),
+        };
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        let (playback_tx, mut playback_rx) = mpsc::channel(8);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            connection
+                .run_bound(
+                    &command_tx,
+                    &mut playback_rx,
+                    &mut control_rx,
+                    &mut cancel_rx,
+                )
+                .await
+                .unwrap();
+            connection
+        });
+        playback_tx.send(failed_start()).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            LoungeCommand::ReloadCurrent {
+                current_time: 66.0,
+                ..
+            }
+        ));
+        playback_tx.send(failed_start()).await.unwrap();
+        playback_tx
+            .send(PlaybackState {
+                player_state: PlayerState::Buffering,
+                current_time: 66.0,
+                duration: Some(230.0),
+                idle_reason: None,
+            })
+            .await
+            .unwrap();
+        playback_tx.send(failed_start()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains("playabilityStatus=ERROR"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // A direct Cast/output Play must use the same fresh-load recovery as
+        // Lounge Play, even while the long poll is still outstanding.
+        control_tx.send(OutputControl::Play).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            LoungeCommand::ReloadCurrent {
+                current_time: 66.0,
+                autoplay: true,
+                ..
+            }
+        ));
+        cancel_tx.send(true).unwrap();
+        let mut connection = task.await.unwrap();
+        assert!(command_rx.try_recv().is_err());
+        for request in server.received_requests().await.unwrap() {
+            assert!(!String::from_utf8_lossy(&request.body).contains("req0_state=0"));
+        }
+        let mut stopped = failed_start();
+        stopped.idle_reason = Some(IdleReason::Cancelled);
+        let (state, retry) = connection.current.accept_state(stopped).unwrap();
+        assert!(retry.is_none());
+        connection.current.state = Some(state);
+        let play = connection
+            .current
+            .coalesce_pending_selection(Incoming::Command(LoungeCommand::Play));
+        assert!(matches!(
+            play,
+            Incoming::Command(LoungeCommand::ReloadCurrent { autoplay: true, .. })
+        ));
+        assert!(matches!(
+            connection.handle_internal(&play),
+            Some(Outbound::NowPlaying)
+        ));
+        assert!(connection.current.recovery.reloading);
+        assert!(!connection.current.recovery.retry_used);
+        connection.handle_internal(&Incoming::Command(LoungeCommand::Stop));
+        assert!(!connection.current.recovery.enabled);
+        assert!(!connection.current.recovery.reloading);
     }
 
     #[tokio::test]

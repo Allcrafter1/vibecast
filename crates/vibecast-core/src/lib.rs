@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audio_cache;
 mod coordinator;
 mod hub;
 mod identity;

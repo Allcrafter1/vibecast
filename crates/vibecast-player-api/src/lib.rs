@@ -33,7 +33,7 @@ pub use protocol::{
     SettingsUpdateResultMessage, SettingsUpdateStatus, PLAYER_PROTOCOL_VERSION,
 };
 pub use proxy::{
-    LicenseHandler, LicenseRequest, LicenseResponse, ManifestHandler, ManifestProxyRequest,
-    ManifestProxyResponse, ProxyError, ProxyRegistrar, ProxyResult, RouteId, RouteIdParseError,
-    RouteKind,
+    CachedMediaBody, CachedMediaResponse, LicenseHandler, LicenseRequest, LicenseResponse,
+    ManifestHandler, ManifestProxyRequest, ManifestProxyResponse, ProxyError, ProxyRegistrar,
+    ProxyResult, RouteId, RouteIdParseError, RouteKind,
 };

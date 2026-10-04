@@ -42,6 +42,7 @@ use crate::registry::AppRegistry;
 use vibecast_player_api::ProxyRegistrar;
 
 const RECEIVER_0: &str = "receiver-0";
+const SENDER_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A per-callback [`SenderChannel`] that writes custom-namespace app messages
 /// directly to the relevant connection(s), never through the hub mailbox (which
@@ -270,6 +271,7 @@ async fn run_app_session(app: Arc<dyn AppSession>, mut jobs: mpsc::Receiver<AppJ
 
 /// A running app session registered as a Cast transport (id == transport id).
 struct Session {
+    audio_cache: Option<Arc<crate::audio_cache::AudioCache>>,
     app_id: String,
     app_key: String,
     display_name: String,
@@ -330,6 +332,7 @@ pub struct DeviceHub {
     /// session id (== transport id) -> session.
     sessions: HashMap<String, Session>,
     session_owners: HashMap<String, u64>,
+    sender_disconnect_deadlines: HashMap<String, tokio::time::Instant>,
     self_tx: mpsc::Sender<HubEvent>,
     events: Option<mpsc::Receiver<HubEvent>>,
 }
@@ -374,6 +377,7 @@ impl DeviceHub {
             platform_subscriptions: HashSet::new(),
             sessions: HashMap::new(),
             session_owners: HashMap::new(),
+            sender_disconnect_deadlines: HashMap::new(),
             self_tx: tx,
             events: Some(rx),
         }
@@ -393,11 +397,36 @@ impl DeviceHub {
     /// the loop, so the task completes and can be awaited during shutdown.
     pub async fn run(mut self) {
         let mut events = self.events.take().expect("run called once");
-        while let Some(event) = events.recv().await {
-            let stop = matches!(event, HubEvent::Shutdown(_));
-            self.dispatch(event).await;
-            if stop {
-                break;
+        loop {
+            let deadline = self.sender_disconnect_deadlines.values().copied().min();
+            tokio::select! {
+                // A queued status request/late CONNECT must not starve an
+                // already expired deadline. No detached timers can outlive us.
+                biased;
+                _ = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    let now = tokio::time::Instant::now();
+                    let expired: Vec<_> = self.sender_disconnect_deadlines.iter()
+                        .filter(|(_, deadline)| **deadline <= now)
+                        .map(|(session, _)| session.clone()).collect();
+                    for session_id in expired {
+                        tracing::info!(%session_id, "sender reconnect grace expired; stopping app");
+                        self.stop_session(&session_id).await;
+                    }
+                    let response = self.receiver_status(0);
+                    self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+                }
+                event = events.recv() => {
+                    let Some(event) = event else { break; };
+                    let stop = matches!(event, HubEvent::Shutdown(_));
+                    self.dispatch(event).await;
+                    if stop { break; }
+                }
             }
         }
     }
@@ -408,25 +437,20 @@ impl DeviceHub {
                 self.connections.insert(handle.id(), handle);
             }
             HubEvent::Server(ServerEvent::Disconnected { id, .. }) => {
-                let owned: Vec<String> = self
+                let owned: HashSet<String> = self
                     .session_owners
                     .iter()
                     .filter(|(_, owner)| **owner == id)
                     .map(|(session, _)| session.clone())
                     .collect();
-                for session in owned {
-                    self.stop_session(&session).await;
-                }
-                // A sender can leave without sending an explicit Cast STOP.
-                // Keep sessions that still have another subscribed sender, but
-                // tear down sessions whose last sender connection disappeared;
-                // otherwise receiver status advertises a stale app forever.
-                let affected_sessions: Vec<String> = self
+                let mut affected_sessions: HashSet<String> = self
                     .subscriptions
                     .iter()
                     .filter(|((conn, _), _)| *conn == id)
                     .map(|(_, transport)| transport.clone())
                     .collect();
+                affected_sessions.extend(owned.iter().cloned());
+                self.session_owners.retain(|_, owner| *owner != id);
                 self.subscriptions.retain(|(conn, _), _| *conn != id);
                 self.platform_subscriptions.retain(|(conn, _)| *conn != id);
                 self.connections.remove(&id);
@@ -435,9 +459,26 @@ impl DeviceHub {
                         .subscriptions
                         .values()
                         .any(|transport| transport == &session_id);
-                    if !still_subscribed {
-                        self.stop_session(&session_id).await;
+                    if !owned.contains(&session_id) && still_subscribed {
+                        continue;
                     }
+                    if self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.app.allows_sender_reconnect_grace())
+                    {
+                        // Additional disappearing sockets must not extend an
+                        // existing deadline. Platform discovery is not control.
+                        self.sender_disconnect_deadlines
+                            .entry(session_id.clone())
+                            .or_insert_with(|| {
+                                tokio::time::Instant::now() + SENDER_RECONNECT_GRACE
+                            });
+                        tracing::info!(%session_id, grace_seconds = 10, "waiting for sender reconnect");
+                        continue;
+                    }
+                    tracing::info!(%session_id, "stopping app after sender transport disconnect");
+                    self.stop_session(&session_id).await;
                 }
                 let response = self.receiver_status(0);
                 self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
@@ -548,6 +589,7 @@ impl DeviceHub {
             }
             ReceiverRequest::Launch(r) => self.handle_launch(conn_id, source, r).await,
             ReceiverRequest::Stop(r) => {
+                tracing::info!(session_id = %r.session_id, "explicit receiver STOP");
                 self.stop_session(&r.session_id).await;
                 let response = self.receiver_status(r.request_id);
                 self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
@@ -695,6 +737,7 @@ impl DeviceHub {
         tokio::spawn(run_app_session(app.clone(), jobs_rx));
 
         let session = Session {
+            audio_cache: None,
             app_id: request.app_id.clone(),
             app_key: app_key.to_string(),
             display_name: manifest.display_name.to_string(),
@@ -714,10 +757,14 @@ impl DeviceHub {
     }
 
     async fn stop_session(&mut self, session_id: &str) {
+        self.sender_disconnect_deadlines.remove(session_id);
         self.session_owners.remove(session_id);
         let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
+        if let Some(cache) = session.audio_cache.take() {
+            cache.cancel();
+        }
         tracing::info!(session_id = %session_id, app_key = %session.app_key, "stopping session");
         // Observers (e.g. Home Assistant) retain their last MEDIA_STATUS even
         // after the application disappears. Publish the terminal state while
@@ -798,6 +845,14 @@ impl DeviceHub {
                 Ok(ConnectionMessage::Connect(_)) => {
                     self.subscriptions
                         .insert((conn_id, source.clone()), transport.clone());
+                    if self
+                        .sender_disconnect_deadlines
+                        .remove(&transport)
+                        .is_some()
+                    {
+                        self.session_owners.insert(transport.clone(), conn_id);
+                        tracing::info!(session_id = %transport, "sender reattached within reconnect grace");
+                    }
                     let (ctx, response, jobs) = match self.sessions.get(&transport) {
                         Some(session) => (
                             self.callback_context(session, Some((conn_id, source.clone()))),
@@ -821,7 +876,13 @@ impl DeviceHub {
                         .subscriptions
                         .values()
                         .any(|target| target == &transport);
-                    if !still_subscribed {
+                    let grace_owner_left = self.session_owners.get(&transport) == Some(&conn_id)
+                        && self
+                            .sessions
+                            .get(&transport)
+                            .is_some_and(|s| s.app.allows_sender_reconnect_grace());
+                    if !still_subscribed || grace_owner_left {
+                        tracing::info!(session_id = %transport, "explicit owner or last-sender app CLOSE");
                         self.stop_session(&transport).await;
                     }
                     // CLOSE only leaves the app channel. The platform socket
@@ -893,7 +954,7 @@ impl DeviceHub {
             }
             MediaRequest::Play(r) => {
                 tracing::debug!(session_id = %transport, request_id = r.request_id, "PLAY");
-                self.play(transport, r.request_id).await;
+                self.request_play(transport, r.request_id).await;
             }
             MediaRequest::Pause(r) => {
                 tracing::debug!(session_id = %transport, request_id = r.request_id, "PAUSE");
@@ -1016,6 +1077,27 @@ impl DeviceHub {
         self.broadcast(transport, ns::MEDIA, &response).await;
     }
 
+    async fn request_play(&mut self, session_id: &str, request_id: i64) {
+        if let Some(session) = self.sessions.get(session_id) {
+            if session.app.handles_play_requests() {
+                let jobs = session.jobs.clone();
+                let ctx = session.ctx.clone();
+                // Acknowledge the actual state, not optimistic PLAYING for an
+                // empty decoder. The app will load fresh media when necessary.
+                let response = session.coordinator.status_response(request_id);
+                self.broadcast(session_id, ns::MEDIA, &response).await;
+                let _ = jobs
+                    .send(AppJob::OutputControl {
+                        ctx,
+                        control: OutputControl::Play,
+                    })
+                    .await;
+                return;
+            }
+        }
+        self.play(session_id, request_id).await;
+    }
+
     async fn play(&mut self, session_id: &str, request_id: i64) {
         self.transition(session_id, request_id, |coordinator| {
             coordinator.player_state = PlayerState::Playing;
@@ -1060,6 +1142,7 @@ impl DeviceHub {
     }
 
     async fn stop_playback(&mut self, session_id: &str, request_id: i64) {
+        self.clear_audio_cache(session_id);
         self.transition(session_id, request_id, |coordinator| {
             coordinator.set_idle(Some(IdleReason::Cancelled));
         })
@@ -1241,13 +1324,48 @@ impl DeviceHub {
     }
 
     fn attach_proxies(
-        &self,
+        &mut self,
         session_id: &str,
         media_session_id: i64,
         mut media: PlaybackMedia,
     ) -> PlaybackMedia {
+        // Exactly one current progressive object per output; speculative queue
+        // resolution never reaches this point. A repeat carries the same hint.
+        let requested = media
+            .streams
+            .first()
+            .filter(|s| s.drm.is_none())
+            .and_then(|s| {
+                if let vibecast_sdk::StreamSource::CachedUrl { url, cache } = &s.source {
+                    Some((url.clone(), cache.clone()))
+                } else {
+                    None
+                }
+            });
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            let same = match (&session.audio_cache, &requested) {
+                (Some(current), Some((_, hint))) => current.hint == *hint && !hint.is_failed(),
+                _ => false,
+            };
+            if !same {
+                if let Some(old) = session.audio_cache.take() {
+                    old.cancel();
+                }
+                session.audio_cache = requested.map(|(url, hint)| {
+                    Arc::new(crate::audio_cache::AudioCache::new(
+                        self.http.clone(),
+                        url,
+                        hint,
+                    ))
+                });
+            }
+        }
         let (manifest_routes, license_routes) = collect_routes(&media);
-        let has_manifest = !manifest_routes.is_empty();
+        let audio_cache = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.audio_cache.clone());
+        let has_manifest = !manifest_routes.is_empty() || audio_cache.is_some();
         let has_license = !license_routes.is_empty();
         if !has_manifest && !has_license {
             return media;
@@ -1255,12 +1373,14 @@ impl DeviceHub {
         let Some(session) = self.sessions.get(session_id) else {
             return media;
         };
-        let proxy = Arc::new(SessionProxy::new(
+        let mut proxy = SessionProxy::new(
             session.app.clone(),
             self.callback_context(session, None),
             manifest_routes,
             license_routes,
-        ));
+        );
+        proxy.audio_cache = audio_cache.clone();
+        let proxy = Arc::new(proxy);
         let manifest_base =
             has_manifest.then(|| self.proxy.register_manifest(session_id, proxy.clone()));
         let license_base =
@@ -1271,7 +1391,21 @@ impl DeviceHub {
             license_base.as_deref(),
             media_session_id,
         );
+        if let (Some(cache), Some(base)) = (audio_cache, manifest_base) {
+            media.streams[0].source =
+                vibecast_sdk::StreamSource::Url(format!("{base}/{}", cache.token));
+        }
         media
+    }
+
+    fn clear_audio_cache(&mut self, session_id: &str) {
+        if let Some(cache) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.audio_cache.take())
+        {
+            cache.cancel();
+        }
     }
 
     async fn fail_load(
@@ -1302,6 +1436,7 @@ impl DeviceHub {
             None => return,
         };
         self.unregister_proxies(session_id);
+        self.clear_audio_cache(session_id);
         self.send_to(conn_id, session_id, sender_id, ns::MEDIA, &failed)
             .await;
         self.broadcast(session_id, ns::MEDIA, &status).await;
@@ -1421,7 +1556,7 @@ impl DeviceHub {
 
     async fn on_output_control(&mut self, session_id: &str, control: PlayerControlRequest) {
         match control {
-            PlayerControlRequest::Play => self.play(session_id, 0).await,
+            PlayerControlRequest::Play => self.request_play(session_id, 0).await,
             PlayerControlRequest::Pause => self.pause(session_id, 0).await,
             PlayerControlRequest::Stop => self.stop_playback(session_id, 0).await,
             PlayerControlRequest::Seek { position } if position.is_finite() => {
@@ -1480,6 +1615,11 @@ impl DeviceHub {
             None => return,
         };
         if player_state == PlayerState::Idle {
+            // EOF is not eviction: repeat-one reopens the same bytes. Errors,
+            // user Stop, a new title and session teardown release them.
+            if idle_reason != Some(IdleReason::Finished) {
+                self.clear_audio_cache(session_id);
+            }
             self.unregister_proxies(session_id);
         }
         self.broadcast(session_id, ns::MEDIA, &response).await;

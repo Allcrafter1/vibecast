@@ -154,7 +154,13 @@ impl Resolver {
         } else {
             "application/octet-stream"
         };
-        media.streams = vec![PlaybackStream::url(url, content_type)];
+        media.streams = vec![if capabilities.local_audio_cache
+            && content_type == "application/octet-stream"
+        {
+            PlaybackStream::cached_url(url, content_type)
+        } else {
+            PlaybackStream::url(url, content_type)
+        }];
         Ok(media)
     }
 
@@ -168,14 +174,17 @@ impl Resolver {
         let mut watch_url = Url::parse(&self.endpoints.watch)
             .map_err(|_| ResolveError::Protocol("invalid watch endpoint"))?;
         watch_url.query_pairs_mut().append_pair("v", video_id);
-        let html = self
-            .http
-            .get(watch_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        let html = async {
+            self.http
+                .get(watch_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        }
+        .await
+        .map_err(|error| diagnose_http("watch_metadata", error))?;
 
         let api_key = extract_config_string(&html, "INNERTUBE_API_KEY").ok_or(
             ResolveError::Protocol("watch page omitted InnerTube API key"),
@@ -186,16 +195,19 @@ impl Resolver {
         let mut player_url = Url::parse(&self.endpoints.player)
             .map_err(|_| ResolveError::Protocol("invalid player endpoint"))?;
         player_url.query_pairs_mut().append_pair("key", &api_key);
-        let response: PlayerResponse = self
-            .http
-            .post(player_url)
-            .header("User-Agent", CLIENT_USER_AGENT)
-            .json(&PlayerRequest::new(video_id, visitor_data.as_deref()))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response: PlayerResponse = async {
+            self.http
+                .post(player_url)
+                .header("User-Agent", CLIENT_USER_AGENT)
+                .json(&PlayerRequest::new(video_id, visitor_data.as_deref()))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        }
+        .await
+        .map_err(|error| diagnose_http("player_metadata", error))?;
 
         if response.playability_status.status != "OK" {
             return Err(ResolveError::Unplayable(
@@ -372,6 +384,20 @@ async fn checked_process_output(
         }
         _ => None, // guard terminates the process group and wakes the reaper
     }
+}
+
+// Never format reqwest errors here: their URL can contain API keys or tokens.
+fn diagnose_http(stage: &'static str, error: reqwest::Error) -> reqwest::Error {
+    tracing::warn!(
+        stage,
+        status = error.status().map(|s| s.as_u16()),
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        decode = error.is_decode(),
+        body = error.is_body(),
+        "YouTube metadata request failed"
+    );
+    error
 }
 
 #[derive(Debug, Error)]
@@ -1863,6 +1889,31 @@ mod tests {
         .0;
 
         assert!(!mpd.contains("contentType=\"text\""));
+    }
+
+    #[tokio::test]
+    async fn metadata_http_status_survives_diagnostics_and_rate_limit_is_not_retried() {
+        for status in [429, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let resolver = Resolver::with_endpoints(reqwest::Client::new(), &server.uri());
+            let error = resolver
+                .resolve_metadata(
+                    "example",
+                    0.0,
+                    &PlayerCapabilities::default(),
+                    PreferredVideoCodec::Auto,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ResolveError::Http(e) if e.status().unwrap().as_u16() == status)
+            );
+            assert_eq!(crate::retryable_resolution_error(&error), status != 429);
+        }
     }
 
     #[tokio::test]

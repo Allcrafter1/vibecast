@@ -154,23 +154,23 @@ pub async fn run_connection<S>(
         return;
     }
 
-    loop {
+    let close_reason = loop {
         match reader.next().await {
             Some(Ok(message)) => {
                 if !dispatch(message, &auth, &handle, &events).await {
-                    break;
+                    break "dispatch_closed";
                 }
             }
-            Some(Err(FramingError::Io(_))) => break, // transport disconnect
+            Some(Err(FramingError::Io(_))) => break "transport_io", // no raw network error/URL
             Some(Err(err)) => {
                 tracing::warn!(peer = %peer, error = %err, "framing error, closing");
-                break;
+                break "framing_error";
             }
-            None => break, // clean EOF
+            None => break "peer_eof",
         }
-    }
+    };
 
-    tracing::info!(peer = %peer, "connection closed");
+    tracing::info!(peer = %peer, close_reason, "connection closed");
     let _ = events.send(ServerEvent::Disconnected { id, peer }).await;
 }
 

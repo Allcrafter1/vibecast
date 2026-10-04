@@ -44,6 +44,27 @@ use vibecast_settings::{
 #[cfg(feature = "browser-player")]
 use crate::web::{PLAYER_HTML, PLAYER_HTML_CONTENT_TYPE, PLAYER_JS, PLAYER_JS_CONTENT_TYPE};
 
+async fn bind_player_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    // The local audio proxy relies on socket backpressure. Default multi-MiB
+    // send queues otherwise eagerly consume an entire song even with mpv paused.
+    // Leave externally exposed/browser bridge listeners unchanged.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            let socket = if ip.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            #[cfg(unix)]
+            socket.set_reuseaddr(true)?;
+            socket.set_send_buffer_size(64 * 1024)?;
+            socket.bind(std::net::SocketAddr::new(ip, port))?;
+            return socket.listen(1024);
+        }
+    }
+    tokio::net::TcpListener::bind((host, port)).await
+}
+
 /// Lifecycle events emitted by the bridge as players connect and disconnect.
 ///
 /// Both variants carry an `epoch`: a per-connection token, unique across the
@@ -190,8 +211,7 @@ impl PlayerBridge {
         }
 
         let listener =
-            tokio::net::TcpListener::bind((self.bind_host.as_ref(), self.state.configured_port))
-                .await?;
+            bind_player_listener(self.bind_host.as_ref(), self.state.configured_port).await?;
         let port = listener.local_addr()?.port();
         self.state.port.store(port, Ordering::SeqCst);
 
@@ -781,6 +801,47 @@ async fn manifest_handler(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    if route_path.starts_with("cache-") {
+        let Some(response) = handler
+            .handle_cached_media(
+                &route_path,
+                method.clone(),
+                filter_upstream_headers(&request_headers),
+            )
+            .await
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let mut builder = Response::builder().status(response.status);
+        for name in [
+            "content-type",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "cache-control",
+            "location",
+        ] {
+            if let Some(value) = response.headers.get(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        let body = match response.body.filter(|_| method != Method::HEAD) {
+            Some(body) => {
+                Body::from_stream(futures_util::stream::unfold(Some(body), |body| async {
+                    let mut body = body?;
+                    match body.next_chunk().await {
+                        Ok(Some(bytes)) => Some((Ok::<_, std::io::Error>(bytes), Some(body))),
+                        Ok(None) => None,
+                        Err(error) => Some((Err(error), None)),
+                    }
+                }))
+            }
+            None => Body::empty(),
+        };
+        return builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
     let route_segment = route_path.split('.').next().unwrap_or("");
     let Ok(route_id) = route_segment.parse::<RouteId>() else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1576,6 +1637,93 @@ mod tests {
     }
 
     struct StaticManifest;
+
+    struct TestChunks(Vec<Vec<u8>>);
+    #[async_trait]
+    impl vibecast_player_api::CachedMediaBody for TestChunks {
+        async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.0.pop())
+        }
+    }
+
+    struct CachedManifest;
+    #[async_trait]
+    impl ManifestHandler for CachedManifest {
+        async fn handle_manifest(
+            &self,
+            request: ManifestProxyRequest,
+        ) -> ProxyResult<ManifestProxyResponse> {
+            StaticManifest.handle_manifest(request).await
+        }
+        async fn handle_cached_media(
+            &self,
+            token: &str,
+            method: Method,
+            headers: HeaderMap,
+        ) -> Option<vibecast_player_api::CachedMediaResponse> {
+            if token != "cache-current" {
+                return None;
+            }
+            assert_eq!(headers["range"], "bytes=3-5");
+            let mut response_headers = HeaderMap::new();
+            for (name, value) in [
+                ("content-length", "3"),
+                ("content-type", "audio/mp4"),
+                ("content-range", "bytes 3-5/10"),
+                ("accept-ranges", "bytes"),
+            ] {
+                response_headers.insert(
+                    http::HeaderName::from_static(name),
+                    http::HeaderValue::from_static(value),
+                );
+            }
+            Some(vibecast_player_api::CachedMediaResponse {
+                status: 206,
+                headers: response_headers,
+                body: if method == Method::HEAD {
+                    None
+                } else {
+                    Some(Box::new(TestChunks(vec![b"ef".to_vec(), b"d".to_vec()])))
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_route_streams_ranges_preserves_length_and_rejects_old_tokens() {
+        let (bridge, _events) = bridge().await;
+        bridge.register_manifest_handler("sess", Arc::new(CachedManifest));
+        for method in [Method::GET, Method::HEAD] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("/manifest/sess/cache-current")
+                .header("Range", "bytes=3-5")
+                .body(Body::empty())
+                .unwrap();
+            let (status, headers, body) = drive(&bridge, request).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+            assert_eq!(headers["content-length"], "3");
+            assert_eq!(headers["content-type"], "audio/mp4");
+            assert_eq!(headers["content-range"], "bytes 3-5/10");
+            assert_eq!(
+                body,
+                if method == Method::HEAD {
+                    b"".as_slice()
+                } else {
+                    b"def".as_slice()
+                }
+            );
+        }
+        assert_eq!(
+            http_get(&bridge, "/manifest/sess/cache-old").await.0,
+            StatusCode::NOT_FOUND
+        );
+        bridge.unregister_manifest_handler("sess");
+        assert_eq!(
+            http_get(&bridge, "/manifest/sess/cache-current").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
 
     #[async_trait]
     impl ManifestHandler for StaticManifest {

@@ -290,6 +290,7 @@ pub struct PlayerRegistration {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PlayerCapabilitiesPayload {
+    pub local_audio_cache: bool,
     pub platform: Option<String>,
     pub drm: Vec<DrmCapabilityPayload>,
     pub video_codecs: Vec<String>,

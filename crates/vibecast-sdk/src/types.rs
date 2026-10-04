@@ -52,6 +52,8 @@ impl DrmInfo {
 pub enum StreamSource {
     /// Fetch (and normalize, for DASH/HLS) the manifest/media from this URL.
     Url(String),
+    /// Progressive clear media eligible for a bounded, current-title RAM cache.
+    CachedUrl { url: String, cache: MediaCacheHint },
     /// Serve this app-generated manifest body directly. The `content_type`
     /// on the owning [`PlaybackStream`] selects the manifest kind.
     InlineManifest(String),
@@ -62,9 +64,38 @@ impl StreamSource {
     #[must_use]
     pub fn as_url(&self) -> Option<&str> {
         match self {
-            StreamSource::Url(url) => Some(url),
+            StreamSource::Url(url) | StreamSource::CachedUrl { url, .. } => Some(url),
             StreamSource::InlineManifest(_) => None,
         }
+    }
+}
+
+/// Shared cache identity/status; contains no media bytes or transport objects.
+/// Only a fully downloaded entry is safe to replay after its source URL expires.
+#[derive(Debug, Clone, Default)]
+pub struct MediaCacheHint(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl PartialEq for MediaCacheHint {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for MediaCacheHint {}
+
+impl MediaCacheHint {
+    pub fn is_complete(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 1
+    }
+    pub fn is_failed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 2
+    }
+    /// Receiver-side completion notification.
+    pub fn mark_complete(&self) {
+        self.0.store(1, std::sync::atomic::Ordering::Release);
+    }
+    /// Receiver-side failure/cancellation notification.
+    pub fn invalidate(&self) {
+        self.0.store(2, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -80,6 +111,17 @@ pub struct PlaybackStream {
 }
 
 impl PlaybackStream {
+    /// Cache only the current progressive title, never a playlist/archive.
+    pub fn cached_url(url: impl Into<String>, content_type: impl Into<String>) -> Self {
+        Self {
+            source: StreamSource::CachedUrl {
+                url: url.into(),
+                cache: MediaCacheHint::default(),
+            },
+            content_type: content_type.into(),
+            drm: None,
+        }
+    }
     /// A clear stream the proxy fetches from `url`.
     #[must_use]
     pub fn url(url: impl Into<String>, content_type: impl Into<String>) -> Self {
@@ -176,9 +218,10 @@ pub struct PlaybackState {
     pub idle_reason: Option<IdleReason>,
 }
 
-/// Queue navigation requested by a user at the physical output device.
+/// User control forwarded to an app from Cast or a physical output device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputControl {
+    Play,
     Next,
     Previous,
 }

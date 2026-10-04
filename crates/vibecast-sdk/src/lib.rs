@@ -92,8 +92,8 @@ pub use context::{
 pub use error::{LaunchError, MediaResolveCode, MediaResolveError};
 pub use license::{LicenseForwarder, LicenseRequest, LicenseResponse, LicenseRoute};
 pub use types::{
-    DrmInfo, DrmSystem, LaunchCredentials, OutputControl, PlaybackMedia, PlaybackState,
-    PlaybackStream, StreamSource,
+    DrmInfo, DrmSystem, LaunchCredentials, MediaCacheHint, OutputControl, PlaybackMedia,
+    PlaybackState, PlaybackStream, StreamSource,
 };
 
 // Re-export the Cast protocol types apps need so they depend on this crate only.
@@ -253,7 +253,20 @@ pub trait AppSession: Send + Sync {
     /// Output volume, including changes made directly at the player.
     async fn on_volume_update(&self, _ctx: &AppContext, _level: f64, _muted: bool) {}
 
-    /// Queue navigation initiated at the physical output device.
+    /// Whether sender/output Play must go through app-owned recovery instead of
+    /// directly unpausing the decoder. App-originated Play is never intercepted.
+    fn handles_play_requests(&self) -> bool {
+        false
+    }
+
+    /// Allow the runtime's bounded (10-second) reconnect grace after a lost
+    /// physical Cast connection. The app is stopped if no sender reattaches to
+    /// its transport. Explicit STOP/CLOSE and replacement remain immediate.
+    fn allows_sender_reconnect_grace(&self) -> bool {
+        false
+    }
+
+    /// User control forwarded to the app (including opted-in Play requests).
     async fn on_output_control(&self, _ctx: &AppContext, _control: OutputControl) {}
 
     /// Called before the session is torn down.

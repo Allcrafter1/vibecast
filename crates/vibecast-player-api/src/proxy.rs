@@ -186,11 +186,34 @@ pub trait LicenseHandler: Send + Sync {
 /// Session-scoped manifest resolver.
 #[async_trait]
 pub trait ManifestHandler: Send + Sync {
+    /// Optional progressive media route, served without buffering the response.
+    async fn handle_cached_media(
+        &self,
+        _token: &str,
+        _method: http::Method,
+        _headers: HeaderMap,
+    ) -> Option<CachedMediaResponse> {
+        None
+    }
+
     /// Resolve one proxied manifest request.
     async fn handle_manifest(
         &self,
         request: ManifestProxyRequest,
     ) -> ProxyResult<ManifestProxyResponse>;
+}
+
+/// Pull-based body: client backpressure bounds transient response buffers.
+#[async_trait]
+pub trait CachedMediaBody: Send {
+    async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+/// Response for a current-title progressive media cache.
+pub struct CachedMediaResponse {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub body: Option<Box<dyn CachedMediaBody>>,
 }
 
 /// Registration seam for a player's session-scoped proxy routes.

@@ -308,6 +308,7 @@ impl PlayerManager {
 fn player_capabilities(payload: PlayerCapabilitiesPayload) -> PlayerCapabilities {
     let default = PlayerCapabilities::default();
     PlayerCapabilities {
+        local_audio_cache: payload.local_audio_cache,
         platform: payload.platform.map_or(default.platform, parse_platform),
         drm: payload
             .drm

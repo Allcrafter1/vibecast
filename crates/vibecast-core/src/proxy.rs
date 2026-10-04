@@ -53,6 +53,7 @@ pub(crate) struct ManifestRoute {
 
 /// Session-scoped proxy handler backing the bridge's license/manifest routes.
 pub(crate) struct SessionProxy {
+    pub(crate) audio_cache: Option<Arc<crate::audio_cache::AudioCache>>,
     app: Arc<dyn AppSession>,
     ctx: AppContext,
     license_routes: HashMap<RouteId, LicenseRoute>,
@@ -67,6 +68,7 @@ impl SessionProxy {
         license_routes: HashMap<RouteId, LicenseRoute>,
     ) -> Self {
         Self {
+            audio_cache: None,
             app,
             ctx,
             license_routes,
@@ -149,6 +151,19 @@ impl LicenseHandler for SessionProxy {
 
 #[async_trait]
 impl ManifestHandler for SessionProxy {
+    async fn handle_cached_media(
+        &self,
+        token: &str,
+        method: http::Method,
+        headers: HeaderMap,
+    ) -> Option<vibecast_player_api::CachedMediaResponse> {
+        let cache = self.audio_cache.as_ref()?;
+        if cache.token != token {
+            return None;
+        }
+        Some(cache.response(method, headers).await)
+    }
+
     async fn handle_manifest(
         &self,
         request: ManifestProxyRequest,
@@ -350,6 +365,7 @@ fn drm_headers(map: &HashMap<String, String>) -> HeaderMap {
 /// routes and the rewritten URLs line up.
 fn manifest_kind_for(stream: &PlaybackStream) -> Option<ManifestKind> {
     match &stream.source {
+        StreamSource::CachedUrl { .. } => None,
         StreamSource::Url(url) => {
             let kind = infer_manifest_kind(Some(&stream.content_type), url);
             (kind != ManifestKind::Unknown).then_some(kind)
@@ -372,7 +388,9 @@ pub(crate) fn collect_routes(
     for (index, stream) in media.streams.iter().enumerate() {
         if let Some(kind) = manifest_kind_for(stream) {
             let source = match &stream.source {
-                StreamSource::Url(url) => ManifestSource::Upstream(url.clone()),
+                StreamSource::Url(url) | StreamSource::CachedUrl { url, .. } => {
+                    ManifestSource::Upstream(url.clone())
+                }
                 StreamSource::InlineManifest(body) => {
                     ManifestSource::Inline(body.clone().into_bytes())
                 }
@@ -442,7 +460,7 @@ pub(crate) fn to_payload(media: &PlaybackMedia) -> PlaybackMediaPayload {
                 // inline manifest that reached here unrewritten (no proxy base)
                 // has no player-facing URL, so it is dropped to an empty string.
                 url: match &stream.source {
-                    StreamSource::Url(url) => url.clone(),
+                    StreamSource::Url(url) | StreamSource::CachedUrl { url, .. } => url.clone(),
                     StreamSource::InlineManifest(_) => String::new(),
                 },
                 content_type: stream.content_type.clone(),

@@ -110,6 +110,8 @@ impl Resolution {
 /// translate these into their backend's own vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerCapabilities {
+    /// Decoder can fetch the receiver's local current-title audio cache.
+    pub local_audio_cache: bool,
     /// The player's runtime platform.
     pub platform: Platform,
     /// DRM systems the player supports, with security levels.
@@ -166,6 +168,7 @@ impl Default for PlayerCapabilities {
     fn default() -> Self {
         Self {
             platform: Platform::Other("unknown".to_string()),
+            local_audio_cache: false,
             drm: Vec::new(),
             video_codecs: vec!["h264".to_string(), "hevc".to_string()],
             audio_codecs: vec!["aac".to_string()],
