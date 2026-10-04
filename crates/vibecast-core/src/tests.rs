@@ -412,7 +412,11 @@ async fn launch_id(client: &mut Framed<DuplexStream, CastCodec>, app_id: &str) -
         &serde_json::json!({"type":"LAUNCH","requestId":1,"appId":app_id}).to_string(),
     )
     .await;
-    let status = next_json(client).await;
+    let message = client.next().await.unwrap().unwrap();
+    assert_eq!(message.source_id, "receiver-0");
+    assert_eq!(message.destination_id, "sender-1");
+    let status: Value =
+        serde_json::from_str(message.payload_utf8.as_deref().unwrap()).unwrap();
     assert_eq!(status["type"], "RECEIVER_STATUS");
     let app = &status["status"]["applications"][0];
     assert_eq!(app["appId"], app_id);

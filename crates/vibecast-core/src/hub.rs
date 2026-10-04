@@ -591,8 +591,8 @@ impl DeviceHub {
             ReceiverRequest::Stop(r) => {
                 tracing::info!(session_id = %r.session_id, "explicit receiver STOP");
                 self.stop_session(&r.session_id).await;
-                let response = self.receiver_status(r.request_id);
-                self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+                self.reply_and_publish_receiver_status(conn_id, source, r.request_id)
+                    .await;
             }
             ReceiverRequest::SetVolume(r) => {
                 self.volume.apply_update(&r.volume);
@@ -607,8 +607,8 @@ impl DeviceHub {
                         .await;
                 }
                 self.publish_volume().await;
-                let response = self.receiver_status(r.request_id);
-                self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+                self.reply_and_publish_receiver_status(conn_id, source, r.request_id)
+                    .await;
             }
         }
     }
@@ -752,8 +752,8 @@ impl DeviceHub {
         self.sessions.insert(session_id, session);
         self.publish_volume().await;
 
-        let response = self.receiver_status(request.request_id);
-        self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+        self.reply_and_publish_receiver_status(conn_id, source, request.request_id)
+            .await;
     }
 
     async fn stop_session(&mut self, session_id: &str) {
@@ -828,6 +828,31 @@ impl DeviceHub {
                 is_stand_by: Some(false),
             },
         )
+    }
+
+    async fn reply_and_publish_receiver_status(
+        &self,
+        conn_id: u64,
+        source: &str,
+        request_id: i64,
+    ) {
+        // Command responses must target the sender that owns the request.
+        // Chromium's launch state machine does not treat a wildcard status as
+        // the correlated LAUNCH response, even though mobile senders commonly
+        // accept it. Other platform observers still need an unsolicited status
+        // update, but it must not leave a duplicate response queued for the
+        // requesting connection.
+        let response = self.receiver_status(request_id);
+        self.send_to(conn_id, RECEIVER_0, source, ns::RECEIVER, &response)
+            .await;
+        let update = self.receiver_status(0);
+        self.broadcast_except_connection(
+            RECEIVER_0,
+            ns::RECEIVER,
+            &update,
+            Some(conn_id),
+        )
+        .await;
     }
 
     // -- app session transports --------------------------------------------
@@ -1713,6 +1738,17 @@ impl DeviceHub {
     }
 
     async fn broadcast<T: Serialize>(&self, transport: &str, namespace: &str, message: &T) {
+        self.broadcast_except_connection(transport, namespace, message, None)
+            .await;
+    }
+
+    async fn broadcast_except_connection<T: Serialize>(
+        &self,
+        transport: &str,
+        namespace: &str,
+        message: &T,
+        excluded_conn_id: Option<u64>,
+    ) {
         let Ok(value) = serde_json::to_value(message) else {
             return;
         };
@@ -1729,6 +1765,9 @@ impl DeviceHub {
                 .collect()
         };
         for conn_id in connection_ids {
+            if Some(conn_id) == excluded_conn_id {
+                continue;
+            }
             if let Some(handle) = self.connections.get(&conn_id) {
                 let _ = handle.send_json(transport, "*", namespace, &value).await;
             }
