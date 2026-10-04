@@ -156,6 +156,7 @@ impl AppSession for YouTubeSession {
             ctx.clone(),
             self.identity.clone(),
             self.cancel.subscribe(),
+            data.get("requestId").cloned(),
         );
         MessageDisposition::Handled
     }
@@ -165,6 +166,7 @@ impl AppSession for YouTubeSession {
             ctx.clone(),
             self.identity.clone(),
             self.cancel.subscribe(),
+            None,
         );
     }
 
@@ -205,22 +207,23 @@ fn send_mdx_session_status_when_ready(
     ctx: AppContext,
     mut identity: watch::Receiver<Option<LoungeIdentity>>,
     mut cancel: watch::Receiver<bool>,
+    request_id: Option<serde_json::Value>,
 ) {
     tokio::spawn(async move {
         loop {
             let current_identity = { identity.borrow().clone() };
             if let Some(identity) = current_identity {
-                ctx.send_custom(
-                    MDX_NAMESPACE,
-                    serde_json::json!({
-                        "type": "mdxSessionStatus",
-                        "data": {
-                            "screenId": identity.screen_id,
-                            "deviceId": identity.device_id,
-                        }
-                    }),
-                )
-                .await;
+                let mut response = serde_json::json!({
+                    "type": "mdxSessionStatus",
+                    "data": {
+                        "screenId": identity.screen_id,
+                        "deviceId": identity.device_id,
+                    }
+                });
+                if let Some(request_id) = request_id.as_ref() {
+                    response["requestId"] = request_id.clone();
+                }
+                ctx.send_custom(MDX_NAMESPACE, response).await;
                 return;
             }
 
@@ -857,7 +860,7 @@ mod tests {
             .on_message(
                 &ctx,
                 MDX_NAMESPACE,
-                &serde_json::json!({"type": "getMdxSessionStatus"}),
+                &serde_json::json!({"type": "getMdxSessionStatus", "requestId": 73}),
             )
             .await;
         assert_eq!(disposition, MessageDisposition::Handled);
@@ -875,6 +878,7 @@ mod tests {
         assert_eq!(sent[0].1["type"], "mdxSessionStatus");
         assert_eq!(sent[0].1["data"]["screenId"], "screen-123");
         assert_eq!(sent[0].1["data"]["deviceId"], "device-456");
+        assert_eq!(sent[0].1["requestId"], 73);
     }
 
     #[test]
