@@ -147,21 +147,29 @@ impl Resolver {
         tracing::info!(%video_id, metadata_ms = metadata_ms as u64,
             audio_ms = audio_ms as u64, total_ms = started.elapsed().as_millis() as u64,
             "YouTube parallel resolution completed");
-        let mut media = media?;
-        let url = audio.ok_or(ResolveError::Protocol("external audio resolver failed"))?;
-        let content_type = if url.contains("/manifest/") {
-            "application/vnd.apple.mpegurl"
-        } else {
-            "application/octet-stream"
-        };
-        media.streams = vec![if capabilities.local_audio_cache
-            && content_type == "application/octet-stream"
-        {
-            PlaybackStream::cached_url(url, content_type)
-        } else {
-            PlaybackStream::url(url, content_type)
-        }];
-        Ok(media)
+        match (media, audio) {
+            (Ok(mut media), Some(audio)) => {
+                media.streams = vec![audio.playback_stream(capabilities.local_audio_cache)];
+                Ok(media)
+            }
+            // InnerTube often already supplied a directly playable adaptive
+            // audio URL. Do not turn that success into a hard failure merely
+            // because the optional yt-dlp cross-check was rate-limited.
+            (Ok(mut media), None) => {
+                tracing::warn!(%video_id, "using InnerTube audio after external resolver failure");
+                make_first_stream_cacheable(&mut media, capabilities.local_audio_cache);
+                Ok(media)
+            }
+            // YouTube can rate-limit the ordinary watch page while its mobile
+            // web player still resolves the same public title. The fallback
+            // result carries enough metadata to construct a complete LOAD and
+            // prevents a successful Cast selection from being stopped.
+            (Err(error), Some(audio)) => {
+                tracing::warn!(%video_id, %error, "using external YouTube fallback metadata");
+                Ok(audio.into_media(video_id, start_time, capabilities.local_audio_cache))
+            }
+            (Err(error), None) => Err(error),
+        }
     }
 
     async fn resolve_metadata(
@@ -222,9 +230,86 @@ impl Resolver {
     }
 }
 
-async fn external_audio_url(video_id: &str) -> Option<String> {
+#[derive(Debug)]
+struct ExternalMedia {
+    url: String,
+    content_type: String,
+    title: Option<String>,
+    subtitle: Option<String>,
+    thumbnail: Option<String>,
+    duration: Option<f64>,
+}
+
+impl ExternalMedia {
+    fn playback_stream(&self, local_audio_cache: bool) -> PlaybackStream {
+        if local_audio_cache && cacheable_audio_type(&self.content_type) {
+            PlaybackStream::cached_url(&self.url, &self.content_type)
+        } else {
+            PlaybackStream::url(&self.url, &self.content_type)
+        }
+    }
+
+    fn into_media(self, video_id: &str, start_time: f64, local_audio_cache: bool) -> PlaybackMedia {
+        let stream = self.playback_stream(local_audio_cache);
+        let images = self
+            .thumbnail
+            .map(|url| {
+                vec![MediaImage {
+                    url,
+                    width: None,
+                    height: None,
+                }]
+            })
+            .unwrap_or_default();
+        PlaybackMedia {
+            session_id: String::new(),
+            streams: vec![stream],
+            stream_type: StreamType::Buffered,
+            content_id: Some(video_id.to_owned()),
+            title: self.title,
+            subtitle: self.subtitle,
+            metadata: None,
+            images,
+            duration: self.duration,
+            autoplay: true,
+            start_time: start_time.max(0.0),
+            custom_data: None,
+        }
+    }
+}
+
+fn cacheable_audio_type(content_type: &str) -> bool {
+    content_type.starts_with("audio/") || content_type == "application/octet-stream"
+}
+
+fn make_first_stream_cacheable(media: &mut PlaybackMedia, local_audio_cache: bool) {
+    if !local_audio_cache {
+        return;
+    }
+    let Some(stream) = media.streams.first_mut() else {
+        return;
+    };
+    if !cacheable_audio_type(&stream.content_type) {
+        return;
+    }
+    if let vibecast_sdk::StreamSource::Url(url) = &stream.source {
+        stream.source = vibecast_sdk::StreamSource::CachedUrl {
+            url: url.clone(),
+            cache: Default::default(),
+        };
+    }
+}
+
+async fn external_audio_url(video_id: &str) -> Option<ExternalMedia> {
+    external_audio_url_with_program(video_id, std::ffi::OsStr::new("yt-dlp")).await
+}
+
+async fn external_audio_url_with_program(
+    video_id: &str,
+    program: &std::ffi::OsStr,
+) -> Option<ExternalMedia> {
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
-    let mut command = tokio::process::Command::new("yt-dlp");
+    let mut command = tokio::process::Command::new(program);
     command.args([
         "--no-warnings",
         "--no-playlist",
@@ -237,14 +322,81 @@ async fn external_audio_url(video_id: &str) -> Option<String> {
         &watch_url,
     ]);
     let output = checked_process_output(command, std::time::Duration::from_secs(35)).await?;
+    if output.status.success() {
+        if let Some(url) = String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .find(|line| line.starts_with("https://"))
+        {
+            return Some(ExternalMedia {
+                content_type: if url.contains("/manifest/") {
+                    "application/vnd.apple.mpegurl".to_owned()
+                } else {
+                    "application/octet-stream".to_owned()
+                },
+                url: url.to_owned(),
+                title: None,
+                subtitle: None,
+                thumbnail: None,
+                duration: None,
+            });
+        }
+    }
+
+    // Under guest-session/watch-page throttling the MWEB player can still
+    // return its progressive MP4. This is intentionally a fallback: normal
+    // operation keeps the much smaller audio-only rendition and its RAM cache.
+    tracing::warn!(%video_id, "trying YouTube mobile-web playback fallback");
+    let mut command = tokio::process::Command::new(program);
+    command.args([
+        "--no-warnings",
+        "--no-playlist",
+        // The fallback can list URLs that immediately return HTTP 403 too.
+        // Preserve extraction failure instead of triggering a player/reload loop.
+        "--check-formats",
+        "--extractor-args",
+        "youtube:player_client=mweb",
+        "-f",
+        "ba/b",
+        "--print",
+        "%(url)j",
+        "--print",
+        "%(title)j",
+        "--print",
+        "%(duration)j",
+        "--print",
+        "%(channel)j",
+        "--print",
+        "%(thumbnail)j",
+        &watch_url,
+    ]);
+    let output = checked_process_output(command, std::time::Duration::from_secs(35)).await?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .find(|line| line.starts_with("https://"))
-        .map(str::to_owned)
+    let output = String::from_utf8(output.stdout).ok()?;
+    let mut lines = output.lines();
+    let url: String = serde_json::from_str(lines.next()?).ok()?;
+    let title = serde_json::from_str(lines.next()?).ok();
+    let duration = serde_json::from_str(lines.next()?).ok();
+    let subtitle = serde_json::from_str(lines.next()?).ok();
+    let thumbnail = serde_json::from_str(lines.next()?).ok();
+    let content_type = Url::parse(&url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(name, _)| name == "mime")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| "video/mp4".to_owned());
+    Some(ExternalMedia {
+        url,
+        content_type,
+        title,
+        subtitle,
+        thumbnail,
+        duration,
+    })
 }
 
 // A cancelled resolver must terminate the owned process group before the next
@@ -276,6 +428,34 @@ impl Drop for ProcessCancellation {
 #[cfg(all(test, target_os = "linux"))]
 mod process_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mobile_fallback_rejects_unplayable_candidates_but_keeps_checked_media() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("vibecast-extractor-{}", uuid::Uuid::new_v4()));
+        // Model an extractor that lists a signed URL even when its media GET
+        // fails, but rejects that candidate when format checking is requested.
+        std::fs::write(&path, r#"#!/bin/sh
+case " $* " in *player_client=mweb*) ;; *) exit 1 ;; esac
+case " $* " in
+  *broken*) case " $* " in *--check-formats*) exit 1 ;; esac ;;
+esac
+printf '%s\n' '"https://media.example/audio?mime=audio%2Fmp4"' '"Title"' '180' '"Artist"' '"https://img.example/cover.jpg"'
+"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rejected = external_audio_url_with_program("broken", path.as_os_str()).await;
+        let accepted = external_audio_url_with_program("working", path.as_os_str()).await;
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            rejected.is_none(),
+            "an unchecked failing URL must not reach the player"
+        );
+        let accepted = accepted.expect("checked playable candidate must remain available");
+        assert_eq!(accepted.content_type, "audio/mp4");
+        assert_eq!(accepted.title.as_deref(), Some("Title"));
+        assert_eq!(accepted.duration, Some(180.0));
+    }
 
     async fn process_tree_case(cancel: bool) {
         let path = std::env::temp_dir().join(format!("vibecast-child-{}", uuid::Uuid::new_v4()));
@@ -1434,6 +1614,61 @@ mod tests {
     }
 
     use vibecast_sdk::{Resolution, StreamSource};
+
+    #[test]
+    fn mobile_web_fallback_preserves_metadata_without_caching_video_bytes() {
+        let media = ExternalMedia {
+            url: "https://media.example/fallback.mp4".into(),
+            content_type: "video/mp4".into(),
+            title: Some("Fallback title".into()),
+            subtitle: Some("Fallback artist".into()),
+            thumbnail: Some("https://img.example/fallback.jpg".into()),
+            duration: Some(161.0),
+        }
+        .into_media("p7EIUR3cZDo", 12.5, true);
+
+        assert_eq!(media.content_id.as_deref(), Some("p7EIUR3cZDo"));
+        assert_eq!(media.title.as_deref(), Some("Fallback title"));
+        assert_eq!(media.subtitle.as_deref(), Some("Fallback artist"));
+        assert_eq!(media.duration, Some(161.0));
+        assert_eq!(media.start_time, 12.5);
+        assert_eq!(media.images[0].url, "https://img.example/fallback.jpg");
+        assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
+    }
+
+    #[test]
+    fn playlist_fallback_stays_direct_instead_of_caching_manifest_as_audio() {
+        let mut media = ExternalMedia {
+            url: "https://media.example/playlist.m3u8".into(),
+            content_type: "application/vnd.apple.mpegurl".into(),
+            title: None,
+            subtitle: None,
+            thumbnail: None,
+            duration: None,
+        }
+        .into_media("dQw4w9WgXcQ", 0.0, true);
+        assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
+        make_first_stream_cacheable(&mut media, true);
+        assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
+    }
+
+    #[test]
+    fn direct_audio_fallback_remains_eligible_for_current_title_cache() {
+        let media = ExternalMedia {
+            url: "https://media.example/audio.webm".into(),
+            content_type: "audio/webm".into(),
+            title: None,
+            subtitle: None,
+            thumbnail: None,
+            duration: None,
+        }
+        .into_media("dQw4w9WgXcQ", 0.0, true);
+
+        assert!(matches!(
+            media.streams[0].source,
+            StreamSource::CachedUrl { .. }
+        ));
+    }
 
     /// A representative `adaptiveFormats` array: AV1/VP9/H.264 SDR ladders, a
     /// VP9 HDR (BT.2020/PQ) rendition, plus Opus and AAC audio.

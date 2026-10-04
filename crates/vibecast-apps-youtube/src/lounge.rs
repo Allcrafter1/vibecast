@@ -1,8 +1,13 @@
 //! YouTube Lounge pairing and BrowserChannel command transport.
 
-use std::time::Duration;
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    time::Duration,
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
@@ -10,9 +15,12 @@ use url::Url;
 use vibecast_sdk::{IdleReason, OutputControl, PlaybackState, PlayerState, ReceiverContext};
 
 const LOUNGE_BASE: &str = "https://www.youtube.com/api/lounge";
+const MUSIC_LOUNGE_BASE: &str = "https://music.youtube.com/api/lounge";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/120 Safari/537.36 CrKey/1.56";
 const MAX_FRAME_LENGTH: usize = 1024 * 1024;
+const LOUNGE_IDENTITY_FILE: &str = "lounge-identity.json";
+const MUSIC_LOUNGE_IDENTITY_FILE: &str = "lounge-identity-music.json";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum LoopMode {
@@ -84,6 +92,18 @@ pub(crate) struct LoungeConnection {
 pub(crate) struct LoungeIdentity {
     pub(crate) screen_id: String,
     pub(crate) device_id: String,
+}
+
+pub(crate) enum LoungeRunExit {
+    Stopped,
+    Takeover(tokio::sync::oneshot::Sender<()>),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct StoredLoungeIdentity {
+    screen_id: String,
+    screen_id_secret: String,
+    device_id: String,
 }
 
 #[derive(Clone)]
@@ -313,55 +333,70 @@ impl LoungeConnection {
     pub(crate) async fn establish(
         http: reqwest::Client,
         receiver: &ReceiverContext,
+        youtube_music: bool,
     ) -> Result<Self, LoungeError> {
-        Self::establish_at(http, receiver, LOUNGE_BASE).await
+        let (base, identity_file, theme) = if youtube_music {
+            (MUSIC_LOUNGE_BASE, MUSIC_LOUNGE_IDENTITY_FILE, "m")
+        } else {
+            (LOUNGE_BASE, LOUNGE_IDENTITY_FILE, "cl")
+        };
+        tracing::debug!(youtube_music, theme, "selecting YouTube Lounge service");
+        Self::establish_fresh_at(http, receiver, base, identity_file, theme).await
     }
 
+    #[cfg(test)]
     async fn establish_at(
         http: reqwest::Client,
         receiver: &ReceiverContext,
         base: &str,
     ) -> Result<Self, LoungeError> {
         let base = Url::parse(base).map_err(|_| LoungeError::Protocol("invalid base URL"))?;
-        let screen: ScreenIdResponse = http
-            .get(join(&base, "pairing/generate_screen_id")?)
-            .query(&[("enable_screen_id_secret_generation", "true")])
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let identity = generate_lounge_identity(&http, &base).await?;
+        Self::establish_identity_at(http, receiver, base, identity, "cl").await
+    }
 
-        let token_body = {
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            serializer.append_pair("screen_ids", &screen.screen_id);
-            serializer.finish()
-        };
-        let token_response: LoungeTokenResponse = http
-            .post(join(&base, "pairing/get_lounge_token_batch")?)
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(token_body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let lounge_token = token_response
-            .screens
-            .into_iter()
-            .find(|item| item.screen_id == screen.screen_id)
-            .ok_or(LoungeError::Protocol("token response omitted screen"))?
-            .lounge_token;
+    async fn establish_fresh_at(
+        http: reqwest::Client,
+        receiver: &ReceiverContext,
+        base: &str,
+        identity_file: &str,
+        theme: &str,
+    ) -> Result<Self, LoungeError> {
+        let base = Url::parse(base).map_err(|_| LoungeError::Protocol("invalid base URL"))?;
+        let path = receiver.data_dir.join(identity_file);
 
-        let device_id = uuid::Uuid::new_v4().to_string();
+        // Keep the receiver's Lounge device id stable, but rotate the screen
+        // id/secret for every app ownership generation. Reusing the whole
+        // screen identity lets an older phone or browser keep controlling a
+        // newly launched virtual receiver session.
+        let stable_device_id = load_lounge_identity(&path).map(|identity| identity.device_id);
+        let mut identity = generate_lounge_identity(&http, &base).await?;
+        if let Some(device_id) = stable_device_id {
+            identity.device_id = device_id;
+        }
+        let connection =
+            Self::establish_identity_at(http, receiver, base, identity.clone(), theme).await?;
+        if let Err(error) = save_lounge_identity(&path, &identity) {
+            tracing::warn!(%error, "could not persist YouTube Lounge screen identity");
+        }
+        Ok(connection)
+    }
+
+    async fn establish_identity_at(
+        http: reqwest::Client,
+        receiver: &ReceiverContext,
+        base: Url,
+        identity: StoredLoungeIdentity,
+        theme: &str,
+    ) -> Result<Self, LoungeError> {
+        let lounge_token = fetch_lounge_token(&http, &base, &identity.screen_id).await?;
         let bind_url = build_bind_url(
             &base,
-            &screen.screen_id_secret,
+            &identity.screen_id_secret,
             &lounge_token,
-            &device_id,
+            &identity.device_id,
             receiver,
+            theme,
         )?;
         let bound = initial_bind(&http, &bind_url).await?;
         match screen_is_online(&http, &base, &lounge_token).await {
@@ -376,8 +411,8 @@ impl LoungeConnection {
             http,
             bind_url,
             bound,
-            screen_id: screen.screen_id,
-            device_id,
+            screen_id: identity.screen_id,
+            device_id: identity.device_id,
             discovery_device_id: cast_cloud_device_id(&receiver.device_id),
             current: CurrentMedia::default(),
         })
@@ -392,39 +427,49 @@ impl LoungeConnection {
 
     pub(crate) async fn run(
         mut self,
-        command_tx: mpsc::Sender<LoungeCommand>,
-        mut playback_rx: mpsc::Receiver<PlaybackState>,
-        mut output_control_rx: mpsc::Receiver<OutputControl>,
-        mut cancel: watch::Receiver<bool>,
-    ) {
+        command_tx: &mpsc::Sender<LoungeCommand>,
+        playback_rx: &mut mpsc::Receiver<PlaybackState>,
+        output_control_rx: &mut mpsc::Receiver<OutputControl>,
+        cancel: &mut watch::Receiver<bool>,
+        takeover_rx: &mut mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    ) -> LoungeRunExit {
         loop {
             if *cancel.borrow() {
-                return;
+                return LoungeRunExit::Stopped;
             }
 
-            match self
-                .run_bound(
-                    &command_tx,
-                    &mut playback_rx,
-                    &mut output_control_rx,
-                    &mut cancel,
-                )
-                .await
-            {
-                Ok(()) => return,
+            let bound = self.run_bound(command_tx, playback_rx, output_control_rx, cancel);
+            let result = tokio::select! {
+                result = bound => result,
+                request = takeover_rx.recv() => {
+                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
+                }
+            };
+            match result {
+                Ok(()) => return LoungeRunExit::Stopped,
                 Err(error) => tracing::warn!(%error, "YouTube Lounge session interrupted"),
             }
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                request = takeover_rx.recv() => {
+                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
+                }
                 result = cancel.changed() => {
                     if result.is_err() || *cancel.borrow() {
-                        return;
+                        return LoungeRunExit::Stopped;
                     }
                 }
             }
 
-            match initial_bind(&self.http, &self.bind_url).await {
+            let rebind = initial_bind(&self.http, &self.bind_url);
+            let result = tokio::select! {
+                result = rebind => result,
+                request = takeover_rx.recv() => {
+                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
+                }
+            };
+            match result {
                 Ok(bound) => self.bound = bound,
                 Err(error) => {
                     tracing::warn!(%error, "YouTube Lounge rebind failed");
@@ -702,6 +747,105 @@ impl LoungeConnection {
             .await?;
         Ok(())
     }
+}
+
+async fn generate_lounge_identity(
+    http: &reqwest::Client,
+    base: &Url,
+) -> Result<StoredLoungeIdentity, LoungeError> {
+    let screen: ScreenIdResponse = http
+        .get(join(base, "pairing/generate_screen_id")?)
+        .query(&[("enable_screen_id_secret_generation", "true")])
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(StoredLoungeIdentity {
+        screen_id: screen.screen_id,
+        screen_id_secret: screen.screen_id_secret,
+        device_id: uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+async fn fetch_lounge_token(
+    http: &reqwest::Client,
+    base: &Url,
+    screen_id: &str,
+) -> Result<String, LoungeError> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("screen_ids", screen_id)
+        .finish();
+    let response: LoungeTokenResponse = http
+        .post(join(base, "pairing/get_lounge_token_batch")?)
+        .header("User-Agent", USER_AGENT)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    response
+        .screens
+        .into_iter()
+        .find(|item| item.screen_id == screen_id)
+        .map(|item| item.lounge_token)
+        .ok_or(LoungeError::Protocol("token response omitted screen"))
+}
+
+fn load_lounge_identity(path: &Path) -> Option<StoredLoungeIdentity> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(%error, "could not read stored YouTube Lounge identity");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<StoredLoungeIdentity>(&bytes) {
+        Ok(identity)
+            if !identity.screen_id.is_empty()
+                && !identity.screen_id_secret.is_empty()
+                && !identity.device_id.is_empty() =>
+        {
+            Some(identity)
+        }
+        Ok(_) => {
+            tracing::warn!("stored YouTube Lounge identity is incomplete; replacing it");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "stored YouTube Lounge identity is invalid; replacing it");
+            None
+        }
+    }
+}
+
+fn save_lounge_identity(path: &Path, identity: &StoredLoungeIdentity) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(identity)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn screen_is_online(
@@ -1032,6 +1176,9 @@ fn selection_diagnostics(message: &[Value], incoming: &Incoming) -> Value {
     };
     serde_json::json!({
         "videoId": params.get("videoId").and_then(Value::as_str),
+        // Presence only: credential transfer tokens are secrets and must never
+        // be written to logs, even at debug level.
+        "hasCtt": params.get("ctt").and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
         "eventVideoId": event_id,
         "eventType": event_type,
         "eventVideoCount": event.as_ref().and_then(|v| v.get("videoIds"))
@@ -1245,7 +1392,7 @@ mod selection_diagnostic_tests {
             serde_json::json!("setPlaylist"),
             serde_json::json!({
                 "videoId":"explicit", "videoIds":"first,indexed", "currentIndex":"1",
-                "currentTime":"0", "token":"secret-do-not-log",
+                "currentTime":"0", "token":"secret-do-not-log", "ctt":"ctt-do-not-log",
                 "eventDetails":"{\"videoId\":\"event\",\"credential\":\"hidden\"}"
             }),
         ];
@@ -1255,7 +1402,9 @@ mod selection_diagnostic_tests {
         assert_eq!(details["eventVideoId"], "event");
         assert_eq!(details["selectedVideoId"], "indexed");
         assert_eq!(details["parsedIndex"], 1);
+        assert_eq!(details["hasCtt"], true);
         assert!(!details.to_string().contains("secret-do-not-log"));
+        assert!(!details.to_string().contains("ctt-do-not-log"));
         assert!(!details.to_string().contains("hidden"));
     }
 
@@ -1294,6 +1443,7 @@ fn parse_message(message: &[Value]) -> Incoming {
         "pause" => Some(LoungeCommand::Pause),
         "stopVideo" | "stop" => Some(LoungeCommand::Stop),
         "next" => Some(LoungeCommand::Next),
+        "previous" => Some(LoungeCommand::Previous),
         "seekTo" => params
             .and_then(|value| value.get("newTime"))
             .and_then(value_as_f64)
@@ -1461,6 +1611,7 @@ fn build_bind_url(
     lounge_token: &str,
     device_id: &str,
     receiver: &ReceiverContext,
+    theme: &str,
 ) -> Result<Url, LoungeError> {
     let mut url = join(base, "bc/bind")?;
     let device_info = serde_json::json!({
@@ -1479,10 +1630,10 @@ fn build_bind_url(
         .append_pair("id", device_id)
         .append_pair("name", "YouTube on TV")
         .append_pair("app", "lb-v4")
-        .append_pair("theme", "cl")
+        .append_pair("theme", theme)
         .append_pair(
             "capabilities",
-            "dsp,dpa,mic,ntb,vsp,ads,pas,dcn,dcp,drq,sads,mlm",
+            "dsp,dpa,mic,ntb,vsp,ads,pas,dcn,dcp,drq,sads,que,mlm",
         )
         .append_pair("cst", "m")
         .append_pair("mdxVersion", "2")
@@ -1542,6 +1693,35 @@ struct ScreenAvailability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_lounge_identity_round_trips_without_token() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibecast-youtube-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = directory.join(LOUNGE_IDENTITY_FILE);
+        let identity = StoredLoungeIdentity {
+            screen_id: "stable-screen".into(),
+            screen_id_secret: "secret".into(),
+            device_id: "stable-device".into(),
+        };
+
+        save_lounge_identity(&path, &identity).unwrap();
+        assert_eq!(load_lounge_identity(&path), Some(identity));
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("lounge_token"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn failed_start() -> PlaybackState {
         PlaybackState {
@@ -1723,14 +1903,23 @@ mod tests {
             "token",
             "device",
             &receiver,
+            "m",
         )
         .unwrap();
+        let theme = url
+            .query_pairs()
+            .find(|(key, _)| key == "theme")
+            .unwrap()
+            .1
+            .into_owned();
         let capabilities = url
             .query_pairs()
             .find(|(key, _)| key == "capabilities")
             .unwrap()
             .1
             .into_owned();
+        assert_eq!(theme, "m");
+        assert!(capabilities.split(',').any(|value| value == "que"));
         assert!(capabilities.split(',').any(|value| value == "mlm"));
         for mode in [LoopMode::Off, LoopMode::One, LoopMode::All] {
             let incoming = parse_message(&[
@@ -1780,6 +1969,14 @@ mod tests {
         assert!(matches!(
             batch.messages[1],
             Incoming::Command(LoungeCommand::SetPlaylist { .. })
+        ));
+    }
+
+    #[test]
+    fn previous_command_is_forwarded_to_queue_navigation() {
+        assert!(matches!(
+            parse_message(&[Value::from("previous"), serde_json::json!({})]),
+            Incoming::Command(LoungeCommand::Previous)
         ));
     }
 

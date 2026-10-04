@@ -115,6 +115,7 @@ pub struct AppContext {
     pub receiver: ReceiverContext,
     /// Live effective settings for this app and player.
     pub settings: AppSettingsReader,
+    sender_connection_id: Option<u64>,
     sender: Arc<dyn SenderChannel>,
     playback: Arc<dyn PlaybackController>,
 }
@@ -138,9 +139,24 @@ impl AppContext {
             app_id,
             http,
             receiver,
+            sender_connection_id: None,
             sender,
             playback: Arc::new(NoopPlaybackController),
         }
+    }
+
+    /// Bind this context to the physical Cast connection that triggered the
+    /// callback. Logical sender ids on one connection intentionally share it.
+    #[must_use]
+    pub fn with_sender_connection_id(mut self, connection_id: Option<u64>) -> Self {
+        self.sender_connection_id = connection_id;
+        self
+    }
+
+    /// Physical Cast connection associated with this callback, if any.
+    #[must_use]
+    pub fn sender_connection_id(&self) -> Option<u64> {
+        self.sender_connection_id
     }
 
     /// Bind this context to the app's live effective settings.

@@ -595,6 +595,11 @@ impl DeviceHub {
             }
             ReceiverRequest::Launch(r) => self.handle_launch(conn_id, source, r).await,
             ReceiverRequest::Stop(r) => {
+                if !self.sender_may_control(&r.session_id, conn_id) {
+                    tracing::debug!(session_id = %r.session_id, conn_id,
+                        "ignoring receiver STOP from superseded sender");
+                    return;
+                }
                 tracing::info!(session_id = %r.session_id, "explicit receiver STOP");
                 self.stop_session(&r.session_id).await;
                 self.reply_and_publish_receiver_status(conn_id, source, r.request_id)
@@ -653,8 +658,16 @@ impl DeviceHub {
         };
 
         // LAUNCH replaces the current app: stop existing sessions first.
+        let replacing_session = !self.sessions.is_empty();
         for session_id in self.sessions.keys().cloned().collect::<Vec<_>>() {
             self.stop_session(&session_id).await;
+        }
+        if replacing_session {
+            // Chrome retains an observed route while launching its replacement.
+            // Publish removal before the correlated launch response so it can
+            // dispose the old route without confusing it with the new one.
+            let ended = self.receiver_status(0);
+            self.broadcast(RECEIVER_0, ns::RECEIVER, &ended).await;
         }
 
         let session_id = Uuid::new_v4().to_string();
@@ -682,6 +695,7 @@ impl DeviceHub {
             },
             Arc::new(NoopSenderChannel),
         )
+        .with_sender_connection_id(Some(conn_id))
         .with_settings(settings)
         .with_playback_controller(Arc::new(HubPlaybackController {
             tx: self.self_tx.clone(),
@@ -864,12 +878,17 @@ impl DeviceHub {
         match message.namespace.as_str() {
             ns::CONNECTION => match serde_json::from_value::<ConnectionMessage>(payload) {
                 Ok(ConnectionMessage::Connect(_)) => {
+                    let exclusive = self
+                        .sessions
+                        .get(&transport)
+                        .is_some_and(|session| session.app.exclusive_sender_takeover());
                     self.subscriptions
                         .insert((conn_id, source.clone()), transport.clone());
-                    if self
-                        .sender_disconnect_deadlines
-                        .remove(&transport)
-                        .is_some()
+                    if !exclusive
+                        && self
+                            .sender_disconnect_deadlines
+                            .remove(&transport)
+                            .is_some()
                     {
                         self.session_owners.insert(transport.clone(), conn_id);
                         tracing::info!(session_id = %transport, "sender reattached within reconnect grace");
@@ -884,6 +903,9 @@ impl DeviceHub {
                     };
                     self.send_to(conn_id, &transport, &source, ns::MEDIA, &response)
                         .await;
+                    if !self.sender_may_control(&transport, conn_id) {
+                        return;
+                    }
                     let _ = jobs
                         .send(AppJob::SenderConnected {
                             ctx,
@@ -893,6 +915,9 @@ impl DeviceHub {
                 }
                 Ok(ConnectionMessage::Close(_)) => {
                     self.subscriptions.remove(&(conn_id, source));
+                    if !self.sender_may_control(&transport, conn_id) {
+                        return;
+                    }
                     let still_subscribed = self
                         .subscriptions
                         .values()
@@ -916,10 +941,28 @@ impl DeviceHub {
                 }
             },
             ns::MEDIA => {
+                if payload["type"] != "GET_STATUS" && !self.sender_may_control(&transport, conn_id)
+                {
+                    tracing::debug!(session_id = %transport, conn_id,
+                        "ignoring media command from superseded sender");
+                    return;
+                }
                 self.handle_media(conn_id, &transport, &source, payload)
                     .await
             }
             other => {
+                let claims = self.sessions.get(&transport).is_some_and(|session| {
+                    session.app.exclusive_sender_takeover()
+                        && session.app.claims_sender_ownership(other, &payload)
+                });
+                if claims && !self.sender_may_control(&transport, conn_id) {
+                    self.claim_sender(&transport, conn_id, &source).await;
+                }
+                if !self.sender_may_control(&transport, conn_id) {
+                    tracing::debug!(session_id = %transport, conn_id, namespace = other,
+                        "ignoring app command from superseded sender");
+                    return;
+                }
                 let (ctx, jobs) = match self.sessions.get(&transport) {
                     Some(session) => (
                         self.callback_context(session, Some((conn_id, source.clone()))),
@@ -1649,6 +1692,81 @@ impl DeviceHub {
 
     // -- helpers ------------------------------------------------------------
 
+    async fn claim_sender(&mut self, transport: &str, conn_id: u64, source: &str) {
+        let previous_owner = self.session_owners.insert(transport.to_owned(), conn_id);
+        self.sender_disconnect_deadlines.remove(transport);
+        // Only close the previous controller; status observers remain subscribed.
+        let stale: Vec<_> = self
+            .subscriptions
+            .iter()
+            .filter(|((other, _), target)| {
+                target.as_str() == transport && Some(*other) == previous_owner
+            })
+            .map(|((other, sender), _)| (*other, sender.clone()))
+            .collect();
+        self.subscriptions.retain(|(other, _), target| {
+            target.as_str() != transport || Some(*other) != previous_owner
+        });
+        self.subscriptions
+            .insert((conn_id, source.to_owned()), transport.to_owned());
+        // Chrome tracks the Cast route through receiver-0, separately from
+        // app virtual channels. CLOSE alone leaves that route alive. Tell
+        // each platform sender on the displaced controller that its app
+        // session ended before closing its app channels. Other subscribers
+        // (including the incoming controller) keep the real receiver status.
+        if let Some(previous) = previous_owner {
+            let mut ended = self.receiver_status(0);
+            ended
+                .status
+                .applications
+                .retain(|app| app.transport_id != transport);
+            let platform_senders: Vec<_> = self
+                .platform_subscriptions
+                .iter()
+                .filter(|(connection, _)| *connection == previous)
+                .map(|(_, sender)| sender.clone())
+                .collect();
+            for sender in platform_senders {
+                self.send_to(previous, RECEIVER_0, &sender, ns::RECEIVER, &ended)
+                    .await;
+            }
+        }
+        for (other, sender) in stale {
+            self.send_to(
+                other,
+                transport,
+                &sender,
+                ns::CONNECTION,
+                &serde_json::json!({"type":"CLOSE","reasonCode":0}),
+            )
+            .await;
+        }
+        tracing::info!(
+            session_id = transport,
+            ?previous_owner,
+            new_owner = conn_id,
+            "active sender handshake claimed session"
+        );
+        if let Some(session) = self.sessions.get(transport) {
+            let ctx = self.callback_context(session, Some((conn_id, source.to_owned())));
+            let _ = session
+                .jobs
+                .send(AppJob::SenderConnected {
+                    ctx,
+                    sender_id: source.to_owned(),
+                })
+                .await;
+        }
+    }
+
+    fn sender_may_control(&self, transport: &str, conn_id: u64) -> bool {
+        !self
+            .sessions
+            .get(transport)
+            .is_some_and(|session| session.app.exclusive_sender_takeover())
+            || self.session_owners.get(transport) == Some(&conn_id)
+    }
+
     /// Current connection handles subscribed to a transport (for broadcasts).
     fn subscriber_handles(&self, transport: &str) -> Vec<ConnectionHandle> {
         let connection_ids: HashSet<u64> = self
@@ -1668,6 +1786,7 @@ impl DeviceHub {
     fn callback_context(&self, session: &Session, bound: Option<(u64, String)>) -> AppContext {
         let transport_id = session.ctx.transport_id.clone();
         let subscribers = self.subscriber_handles(&transport_id);
+        let sender_connection_id = bound.as_ref().map(|(conn_id, _)| *conn_id);
         let bound = bound.and_then(|(conn_id, sender_id)| {
             self.connections
                 .get(&conn_id)
@@ -1686,6 +1805,7 @@ impl DeviceHub {
             session.ctx.receiver.clone(),
             sender,
         )
+        .with_sender_connection_id(sender_connection_id)
         .with_settings(session.ctx.settings.clone())
         .with_playback_controller(session.ctx.playback_controller())
     }

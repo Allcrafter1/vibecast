@@ -69,6 +69,53 @@ GPT/Astra, and iterated through automated and user-operated playback tests.
 Independent reviews, fixes and contributions are welcome. Please do not include
 private keys, account tokens, pairing data or signed media URLs in issues.
 
+## YouTube sender takeover and resolver validation
+
+An ordinary Cast `CONNECT` is also used by status observers; it must not
+transfer ownership or rotate the Lounge screen. The failed 2026-10-04 test
+build treated those subscriptions as takeovers, causing two observers to
+repeatedly eject each other and preventing playback.
+
+The corrected implementation claims ownership on the app-specific
+`getMdxSessionStatus` handshake (or a new `LAUNCH`). Observer status requests
+remain available; observer reconnects and closes cannot take over or stop
+the owner. On takeover, the old controller is closed, its Lounge connection
+is replaced and pending playback resolution is stopped. The new controller
+receives a fresh screen identity. The desktop `previous` command is now parsed.
+The displaced sender also receives a targeted `receiver-0` status with its
+application removed before its app channels close, so the browser can end its
+Cast route. This notification is not broadcast to the incoming controller.
+
+When a new `LAUNCH` replaces a running application, receiver status now also
+announces the old application's removal before the correlated new launch
+response. Previously that intermediate state was skipped. Chromium keeps a
+pending old-route removal during launch; leaving it unreported can interfere
+with establishing the replacement route. This lifecycle correction is covered
+by a protocol-order regression test. The observed mobile-to-desktop first-try
+hang (no MDX request and an offline cached Lounge screen) still requires live
+validation with this correction; cache mismatch alone does not prove its cause.
+
+Device feedback subsequently confirmed switching in both directions. A separate
+slow-start investigation found HTTP 429 watch metadata responses and approximately
+seven-second external extraction attempts. The mobile-web fallback could report
+success with a media URL returning HTTP 403, causing an immediate player failure
+and another full resolution attempt. It now uses `--check-formats`, like the
+primary extractor. A process-level regression test covers rejection of an
+unplayable fallback and preservation of a playable one. This prevents false
+success/retry cycles; it does not remove YouTube's external throttling or promise
+instant resolution. Subsequent device acceptance confirmed playback and fast
+resolution (about 2.0–2.3 seconds), with no rate-limit or fallback events in those
+attempts. This reflects the primary path recovering, not a guaranteed speedup
+from fallback validation. HLS playlists remain direct manifest URLs, never
+progressive audio-cache entries; regression coverage preserves that boundary.
+
+Regression tests cover repeated observer subscriptions/status queries,
+old-controller reconnects, ownership transfer, old-controller STOP rejection,
+and multiple logical senders on one connection. Desktop/mobile playback and
+takeover in both directions have now passed device acceptance. Previous and
+owner-stop semantics have regression coverage; automated tests alone do not
+establish every sender interaction.
+
 ## Origin and licence
 
 The audio work starts from upstream commit

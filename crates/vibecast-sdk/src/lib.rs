@@ -235,6 +235,19 @@ pub trait AppSession: Send + Sync {
     /// Called when a sender connects to this app transport.
     async fn on_sender_connected(&self, _ctx: &AppContext, _sender_id: &str) {}
 
+    /// Whether a physical sender connection takes exclusive ownership from
+    /// the previous connection. Multiple logical sender ids on that same
+    /// connection remain part of one controller.
+    fn exclusive_sender_takeover(&self) -> bool {
+        false
+    }
+
+    /// Whether this app message starts an active sender handshake. Merely
+    /// subscribing to a transport (e.g. a status observer) never claims it.
+    fn claims_sender_ownership(&self, _namespace: &str, _data: &Value) -> bool {
+        false
+    }
+
     /// Resolve a proxied DRM license request. The default forwards it unchanged;
     /// override to transform the challenge/response (e.g. Prime Video).
     async fn resolve_license(

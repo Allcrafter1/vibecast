@@ -5,7 +5,10 @@
 mod lounge;
 mod resolver;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
@@ -16,10 +19,11 @@ use vibecast_sdk::{
     SettingDescriptor, SettingScope,
 };
 
-use lounge::{LoungeCommand, LoungeConnection, LoungeIdentity};
+use lounge::{LoungeCommand, LoungeConnection, LoungeIdentity, LoungeRunExit};
 use resolver::{PreferredVideoCodec, ResolveError, Resolver, PREFERRED_VIDEO_CODEC_KEY};
 
 const APP_IDS: &[&str] = &["233637DE", "2DB7CC49"];
+const YOUTUBE_MUSIC_APP_ID: &str = "2DB7CC49";
 const MDX_NAMESPACE: &str = "urn:x-cast:com.google.youtube.mdx";
 const CUSTOM_DATA_NAMESPACE: &str = "urn:x-cast:com.google.cast.customdata";
 const ICON_URL: &str = "https://www.gstatic.com/youtube/img/branding/favicon/favicon_144x144.png";
@@ -77,6 +81,10 @@ impl AppProvider for YouTube {
         let (playback_tx, playback_rx) = mpsc::channel(32);
         let (volume_tx, volume_rx) = watch::channel((1.0, false));
         let (identity_tx, identity) = watch::channel(None);
+        let (takeover_tx, takeover_rx) = mpsc::channel(2);
+        let (ownership_generation_tx, _) = watch::channel(0_u64);
+        let mdx_requested = Arc::new(AtomicBool::new(false));
+        let legacy_status_scheduled = Arc::new(AtomicBool::new(false));
         let (cancel, _) = watch::channel(false);
         tokio::spawn(run_commands(
             command_rx,
@@ -89,18 +97,25 @@ impl AppProvider for YouTube {
         tokio::spawn(run_lounge(
             ctx.http.clone(),
             ctx.receiver.clone(),
+            ctx.app_id == YOUTUBE_MUSIC_APP_ID,
             command_tx,
             playback_rx,
             output_control_rx,
             identity_tx,
             volume_rx,
             cancel.subscribe(),
+            takeover_rx,
         ));
 
         Ok(Arc::new(YouTubeSession {
             resolver: Resolver::new(ctx.http.clone()),
             capabilities: ctx.receiver.capabilities.clone(),
             identity,
+            mdx_requested,
+            legacy_status_scheduled,
+            owner_connection: Mutex::new(ctx.sender_connection_id()),
+            ownership_generation_tx,
+            takeover_tx,
             playback_tx,
             output_control_tx,
             volume_tx,
@@ -113,6 +128,11 @@ struct YouTubeSession {
     resolver: Resolver,
     capabilities: vibecast_sdk::PlayerCapabilities,
     identity: watch::Receiver<Option<LoungeIdentity>>,
+    mdx_requested: Arc<AtomicBool>,
+    legacy_status_scheduled: Arc<AtomicBool>,
+    owner_connection: Mutex<Option<u64>>,
+    ownership_generation_tx: watch::Sender<u64>,
+    takeover_tx: mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     playback_tx: mpsc::Sender<PlaybackState>,
     output_control_tx: mpsc::Sender<OutputControl>,
     volume_tx: watch::Sender<(f64, bool)>,
@@ -147,9 +167,11 @@ impl AppSession for YouTubeSession {
         namespace: &str,
         data: &serde_json::Value,
     ) -> MessageDisposition {
-        if namespace != MDX_NAMESPACE
-            || data.get("type").and_then(serde_json::Value::as_str) != Some("getMdxSessionStatus")
-        {
+        if namespace != MDX_NAMESPACE {
+            return MessageDisposition::Unhandled;
+        }
+        let message_type = data.get("type").and_then(serde_json::Value::as_str);
+        if message_type != Some("getMdxSessionStatus") {
             return MessageDisposition::Unhandled;
         }
         tracing::debug!(
@@ -157,22 +179,88 @@ impl AppSession for YouTubeSession {
             request_id_present = data.get("requestId").is_some(),
             "YouTube MDX session status requested"
         );
+        self.mdx_requested.store(true, Ordering::Release);
         send_mdx_session_status_when_ready(
             ctx.clone(),
             self.identity.clone(),
             self.cancel.subscribe(),
+            self.ownership_generation_tx.subscribe(),
+            *self.ownership_generation_tx.borrow(),
             data.get("requestId").cloned(),
         );
         MessageDisposition::Handled
     }
 
     async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
-        send_mdx_session_status_when_ready(
-            ctx.clone(),
-            self.identity.clone(),
-            self.cancel.subscribe(),
-            None,
-        );
+        let takeover = ctx.sender_connection_id().is_some_and(|connection_id| {
+            let mut owner = self
+                .owner_connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match *owner {
+                Some(current) if current == connection_id => false,
+                Some(_) => {
+                    *owner = Some(connection_id);
+                    true
+                }
+                None => {
+                    *owner = Some(connection_id);
+                    false
+                }
+            }
+        });
+        if takeover {
+            self.ownership_generation_tx
+                .send_modify(|value| *value += 1);
+            self.mdx_requested.store(false, Ordering::Release);
+            self.legacy_status_scheduled.store(false, Ordering::Release);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            match self.takeover_tx.send(ready_tx).await {
+                Err(_) => tracing::warn!("could not rotate YouTube Lounge ownership"),
+                Ok(()) => match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx)
+                    .await
+                {
+                    Ok(Ok(())) => tracing::info!(connection_id = ?ctx.sender_connection_id(),
+                        "YouTube Lounge ownership transferred"),
+                    Ok(Err(_)) => tracing::warn!("YouTube Lounge ownership rotation was cancelled"),
+                    Err(_) => tracing::warn!("timed out rotating YouTube Lounge ownership"),
+                },
+            }
+        }
+        // Older/mobile senders can wait for an unsolicited status, while the
+        // current desktop sender asks explicitly. Send at most one delayed
+        // compatibility status so an explicit request cannot be raced by a
+        // burst from every logical Cast sender connection.
+        if self.legacy_status_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = ctx.clone();
+        let identity = self.identity.clone();
+        let cancel = self.cancel.subscribe();
+        let ownership_generation = self.ownership_generation_tx.subscribe();
+        let expected_generation = *ownership_generation.borrow();
+        let mdx_requested = self.mdx_requested.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !mdx_requested.load(Ordering::Acquire) {
+                send_mdx_session_status_when_ready(
+                    ctx,
+                    identity,
+                    cancel,
+                    ownership_generation,
+                    expected_generation,
+                    None,
+                );
+            }
+        });
+    }
+
+    fn exclusive_sender_takeover(&self) -> bool {
+        true
+    }
+
+    fn claims_sender_ownership(&self, namespace: &str, data: &serde_json::Value) -> bool {
+        namespace == MDX_NAMESPACE && data["type"] == "getMdxSessionStatus"
     }
 
     async fn on_playback_update(&self, _ctx: &AppContext, state: PlaybackState) {
@@ -212,10 +300,15 @@ fn send_mdx_session_status_when_ready(
     ctx: AppContext,
     mut identity: watch::Receiver<Option<LoungeIdentity>>,
     mut cancel: watch::Receiver<bool>,
+    mut ownership_generation: watch::Receiver<u64>,
+    expected_generation: u64,
     request_id: Option<serde_json::Value>,
 ) {
     tokio::spawn(async move {
         loop {
+            if *ownership_generation.borrow() != expected_generation {
+                return;
+            }
             let current_identity = { identity.borrow().clone() };
             if let Some(identity) = current_identity {
                 let mut response = serde_json::json!({
@@ -232,6 +325,9 @@ fn send_mdx_session_status_when_ready(
                     request_id_present = request_id.is_some(),
                     "sending YouTube MDX session status"
                 );
+                if *ownership_generation.borrow() != expected_generation {
+                    return;
+                }
                 ctx.send_custom(MDX_NAMESPACE, response).await;
                 return;
             }
@@ -249,6 +345,11 @@ fn send_mdx_session_status_when_ready(
                         return;
                     }
                 }
+                result = ownership_generation.changed() => {
+                    if result.is_err() || *ownership_generation.borrow() != expected_generation {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -257,44 +358,89 @@ fn send_mdx_session_status_when_ready(
 async fn run_lounge(
     http: reqwest::Client,
     receiver: vibecast_sdk::ReceiverContext,
+    youtube_music: bool,
     command_tx: mpsc::Sender<LoungeCommand>,
     playback_rx: mpsc::Receiver<PlaybackState>,
     output_control_rx: mpsc::Receiver<OutputControl>,
     identity_tx: watch::Sender<Option<LoungeIdentity>>,
     volume_rx: watch::Receiver<(f64, bool)>,
     mut cancel: watch::Receiver<bool>,
+    mut takeover_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) {
-    let lounge = loop {
-        let establish = LoungeConnection::establish(http.clone(), &receiver);
-        let result = tokio::select! {
-            result = establish => result,
-            result = cancel.changed() => {
-                if result.is_err() || *cancel.borrow() {
-                    return;
+    let mut playback_rx = playback_rx;
+    let mut output_control_rx = output_control_rx;
+    let mut pending_ready = Vec::new();
+
+    loop {
+        let lounge = loop {
+            let establish = LoungeConnection::establish(http.clone(), &receiver, youtube_music);
+            let result = tokio::select! {
+                result = establish => Some(result),
+                request = takeover_rx.recv() => {
+                    let Some(request) = request else { return; };
+                    let _ = identity_tx.send(None);
+                    pending_ready.push(request);
+                    None
                 }
-                continue;
+                result = cancel.changed() => {
+                    if result.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                    None
+                }
+            };
+            match result {
+                Some(Ok(lounge)) => break lounge,
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "YouTube Lounge pairing failed; retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                        request = takeover_rx.recv() => {
+                            let Some(request) = request else { return; };
+                            let _ = identity_tx.send(None);
+                            pending_ready.push(request);
+                        }
+                        result = cancel.changed() => {
+                            if result.is_err() || *cancel.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                None => {}
             }
         };
-        match result {
-            Ok(lounge) => break lounge,
-            Err(error) => tracing::warn!(%error, "YouTube Lounge pairing failed; retrying"),
+
+        tracing::debug!("YouTube Lounge identity is ready");
+        let _ = identity_tx.send(Some(lounge.identity()));
+        for ready in pending_ready.drain(..) {
+            let _ = ready.send(());
         }
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-            result = cancel.changed() => {
-                if result.is_err() || *cancel.borrow() {
+        match lounge
+            .with_volume(volume_rx.clone())
+            .run(
+                &command_tx,
+                &mut playback_rx,
+                &mut output_control_rx,
+                &mut cancel,
+                &mut takeover_rx,
+            )
+            .await
+        {
+            LoungeRunExit::Stopped => return,
+            LoungeRunExit::Takeover(ready) => {
+                let _ = identity_tx.send(None);
+                // End the old queue and cancel any resolver/prefetch before
+                // advertising the new screen to the incoming controller.
+                if command_tx.send(LoungeCommand::Stop).await.is_err() {
                     return;
                 }
+                while playback_rx.try_recv().is_ok() {}
+                while output_control_rx.try_recv().is_ok() {}
+                pending_ready.push(ready);
             }
         }
-    };
-
-    tracing::debug!("YouTube Lounge identity is ready");
-    let _ = identity_tx.send(Some(lounge.identity()));
-    lounge
-        .with_volume(volume_rx)
-        .run(command_tx, playback_rx, output_control_rx, cancel)
-        .await;
+    }
 }
 
 #[derive(Default)]
@@ -834,8 +980,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn explicit_mdx_status_request_receives_lounge_identity() {
+    fn mdx_test_session() -> (YouTubeSession, AppContext, Arc<RecordingSender>) {
         let sender = Arc::new(RecordingSender::default());
         let ctx = AppContext::new(
             "session",
@@ -857,16 +1002,34 @@ mod tests {
         let (playback_tx, _playback_rx) = mpsc::channel(1);
         let (output_control_tx, _output_control_rx) = mpsc::channel(1);
         let (volume_tx, _volume_rx) = watch::channel((1.0, false));
+        let (ownership_generation_tx, _) = watch::channel(0_u64);
+        let (takeover_tx, _takeover_rx) = mpsc::channel(1);
         let (cancel, _cancelled) = watch::channel(false);
-        let session = YouTubeSession {
-            resolver: Resolver::new(reqwest::Client::new()),
-            capabilities: vibecast_sdk::PlayerCapabilities::default(),
-            identity,
-            playback_tx,
-            output_control_tx,
-            volume_tx,
-            cancel,
-        };
+        (
+            YouTubeSession {
+                resolver: Resolver::new(reqwest::Client::new()),
+                capabilities: vibecast_sdk::PlayerCapabilities::default(),
+                identity,
+                mdx_requested: Arc::new(AtomicBool::new(false)),
+                legacy_status_scheduled: Arc::new(AtomicBool::new(false)),
+                owner_connection: Mutex::new(None),
+                ownership_generation_tx,
+                takeover_tx,
+                playback_tx,
+                output_control_tx,
+                volume_tx,
+                cancel,
+            },
+            ctx,
+            sender,
+        )
+    }
+
+    #[tokio::test]
+    async fn explicit_mdx_status_request_receives_one_lounge_identity() {
+        let (session, ctx, sender) = mdx_test_session();
+        session.on_sender_connected(&ctx, "sender-one").await;
+        session.on_sender_connected(&ctx, "sender-two").await;
 
         let disposition = session
             .on_message(
@@ -883,6 +1046,7 @@ mod tests {
         })
         .await
         .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
         let sent = sender.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -891,6 +1055,46 @@ mod tests {
         assert_eq!(sent[0].1["data"]["screenId"], "screen-123");
         assert_eq!(sent[0].1["data"]["deviceId"], "device-456");
         assert_eq!(sent[0].1["requestId"], 73);
+    }
+
+    #[tokio::test]
+    async fn legacy_mobile_sender_receives_one_fallback_status() {
+        let (session, ctx, sender) = mdx_test_session();
+        session.on_sender_connected(&ctx, "sender-one").await;
+        session.on_sender_connected(&ctx, "sender-two").await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sender.sent.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1["type"], "mdxSessionStatus");
+        assert!(sent[0].1.get("requestId").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_owner_never_receives_the_rotated_lounge_identity() {
+        let (_session, ctx, sender) = mdx_test_session();
+        let (identity_tx, identity) = watch::channel(None);
+        let (generation_tx, generation) = watch::channel(0_u64);
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        send_mdx_session_status_when_ready(ctx, identity, cancel, generation, 0, None);
+        generation_tx.send(1).unwrap();
+        identity_tx
+            .send(Some(LoungeIdentity {
+                screen_id: "new-owner-screen".into(),
+                device_id: "device-456".into(),
+            }))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert!(sender.sent.lock().unwrap().is_empty());
     }
 
     #[test]

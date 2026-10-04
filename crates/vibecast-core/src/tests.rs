@@ -90,6 +90,7 @@ const FAKE_SETTING: SettingKey<String> = SettingKey::new("playerValue");
 
 struct FakeApp {
     launched_setting: Arc<Mutex<Option<String>>>,
+    exclusive_sender_takeover: bool,
 }
 
 fn fake_manifest() -> AppManifest {
@@ -132,6 +133,7 @@ impl AppProvider for FakeApp {
             std::sync::atomic::AtomicBool::new(false),
             Mutex::new(None),
             std::sync::atomic::AtomicBool::new(false),
+            self.exclusive_sender_takeover,
         )))
     }
 }
@@ -142,10 +144,19 @@ struct FakeSession(
     std::sync::atomic::AtomicBool,
     Mutex<Option<PlaybackStream>>,
     std::sync::atomic::AtomicBool,
+    bool,
 );
 
 #[async_trait]
 impl AppSession for FakeSession {
+    fn exclusive_sender_takeover(&self) -> bool {
+        self.3
+    }
+
+    fn claims_sender_ownership(&self, namespace: &str, data: &Value) -> bool {
+        namespace == FAKE_NS && data["type"] == "CLAIM"
+    }
+
     fn allows_sender_reconnect_grace(&self) -> bool {
         self.2.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -320,6 +331,25 @@ async fn setup() -> Harness {
 }
 
 async fn setup_with_player_settings(player_settings: PlayerSettings) -> Harness {
+    setup_with_options(player_settings, false).await
+}
+
+async fn setup_exclusive() -> Harness {
+    let catalog = SettingsCatalog::new(vec![fake_manifest().settings]).expect("settings catalog");
+    let service = SettingsService::new(catalog, Arc::new(MemorySettingsPersistence::default()))
+        .await
+        .expect("settings service");
+    setup_with_options(
+        service.player("player-exclusive").expect("player settings"),
+        true,
+    )
+    .await
+}
+
+async fn setup_with_options(
+    player_settings: PlayerSettings,
+    exclusive_sender_takeover: bool,
+) -> Harness {
     let (server_end, client_end) = tokio::io::duplex(64 * 1024);
     let (events_tx, mut events_rx) = mpsc::channel::<ServerEvent>(32);
     tokio::spawn(run_connection(
@@ -337,6 +367,7 @@ async fn setup_with_player_settings(player_settings: PlayerSettings) -> Harness 
         identity: DeviceIdentity::new("Living Room".into(), "Chromecast".into(), "dev-1".into()),
         registry: AppRegistry::new(vec![Arc::new(FakeApp {
             launched_setting: launched_setting.clone(),
+            exclusive_sender_takeover,
         })])
         .expect("registry"),
         player: player.clone(),
@@ -377,9 +408,19 @@ async fn send(
     dest: &str,
     json: &str,
 ) {
+    send_as(client, "sender-1", namespace, dest, json).await;
+}
+
+async fn send_as(
+    client: &mut Framed<DuplexStream, CastCodec>,
+    source: &str,
+    namespace: &str,
+    dest: &str,
+    json: &str,
+) {
     client
         .send(message::build_string(
-            "sender-1",
+            source,
             dest,
             namespace,
             json.to_string(),
@@ -1311,7 +1352,7 @@ async fn retained_session_disconnect(drop_owner: bool, action: DisconnectAction)
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let status = next_json(&mut survivor).await;
-                if status["type"] == "RECEIVER_STATUS" {
+                if status["type"] == "RECEIVER_STATUS" && status["requestId"] == 81 {
                     break status["status"]["applications"][0]["transportId"]
                         .as_str()
                         .unwrap()
@@ -1496,6 +1537,257 @@ async fn owner_disconnect_notifies_a_separate_observer_and_allows_takeover() {
         .commands()
         .iter()
         .any(|c| matches!(c, PlayerCommand::Stop { .. })));
+}
+
+#[tokio::test]
+async fn replacing_running_app_announces_removal_before_launch_response() {
+    let mut harness = setup_exclusive().await;
+    let previous = launch(&mut harness.client).await;
+    // Chrome may already observe a mobile-owned app when it starts its own
+    // route. It needs a removal event before the replacement launch response.
+    send(
+        &mut harness.client,
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"LAUNCH","requestId":42,"appId":"APP1"}"#,
+    )
+    .await;
+    let ended = next_json(&mut harness.client).await;
+    assert_eq!(ended["type"], "RECEIVER_STATUS");
+    assert_eq!(ended["requestId"], 0);
+    assert!(ended["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let response = harness.client.next().await.unwrap().unwrap();
+    assert_eq!(response.destination_id, "sender-1");
+    let response: Value = serde_json::from_str(response.payload_utf8.as_deref().unwrap()).unwrap();
+    assert_eq!(response["requestId"], 42);
+    let replacement = response["status"]["applications"][0]["transportId"]
+        .as_str()
+        .unwrap();
+    assert_ne!(replacement, previous);
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        replacement,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        replacement,
+        r#"{"type":"CLAIM"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+}
+
+#[tokio::test]
+async fn exclusive_app_transfers_control_to_the_new_physical_sender() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+    let (events_tx, mut events_rx) = mpsc::channel::<ServerEvent>(32);
+    tokio::spawn(run_connection(
+        server_end,
+        2,
+        Arc::from("new-owner"),
+        Arc::new(dummy_auth()),
+        events_tx,
+    ));
+    let hub = harness.hub.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if hub.send_server_event(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut new_owner = Framed::new(client_end, CastCodec);
+    send(
+        &mut new_owner,
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send(
+        &mut new_owner,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+
+    assert_eq!(next_json(&mut new_owner).await["type"], "MEDIA_STATUS");
+    // Reproduce automatic observer CONNECT/GET_STATUS retries. They must
+    // neither kick the owner nor consume the app handshake.
+    for _ in 0..3 {
+        send(
+            &mut new_owner,
+            ns::CONNECTION,
+            &transport,
+            r#"{"type":"CONNECT"}"#,
+        )
+        .await;
+        assert_eq!(next_json(&mut new_owner).await["type"], "MEDIA_STATUS");
+        send(
+            &mut new_owner,
+            ns::MEDIA,
+            &transport,
+            r#"{"type":"GET_STATUS","requestId":4}"#,
+        )
+        .await;
+        assert_eq!(next_json(&mut new_owner).await["type"], "MEDIA_STATUS");
+        send(
+            &mut harness.client,
+            FAKE_NS,
+            &transport,
+            r#"{"type":"PING"}"#,
+        )
+        .await;
+        assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+    }
+    send(&mut new_owner, FAKE_NS, &transport, r#"{"type":"CLAIM"}"#).await;
+    let ended = next_json(&mut harness.client).await;
+    assert_eq!(ended["type"], "RECEIVER_STATUS");
+    assert!(ended["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let close = harness.client.next().await.unwrap().unwrap();
+    assert_eq!(close.namespace, ns::CONNECTION);
+    assert_eq!(close.destination_id, "sender-1");
+    let close: Value = serde_json::from_str(close.payload_utf8.as_deref().unwrap()).unwrap();
+    assert_eq!(close["type"], "CLOSE");
+    assert_eq!(next_json(&mut new_owner).await["type"], "PONG");
+
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"OLD_OWNER_COMMAND"}"#,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.client.next())
+            .await
+            .is_err(),
+        "superseded owner must not receive an app response"
+    );
+    // An automatic reconnect after CLOSE must not claim the session back.
+    for _ in 0..3 {
+        send(
+            &mut harness.client,
+            ns::CONNECTION,
+            &transport,
+            r#"{"type":"CONNECT"}"#,
+        )
+        .await;
+        assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    }
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CLOSE"}"#,
+    )
+    .await;
+    send(
+        &mut harness.client,
+        ns::RECEIVER,
+        "receiver-0",
+        &serde_json::json!({
+            "type": "STOP",
+            "requestId": 91,
+            "sessionId": transport,
+        })
+        .to_string(),
+    )
+    .await;
+
+    send(
+        &mut new_owner,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"NEW_OWNER_COMMAND"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut new_owner).await["type"], "PONG");
+
+    drop(harness.client);
+    assert_eq!(next_json(&mut new_owner).await["type"], "RECEIVER_STATUS");
+    assert!(!harness
+        .player
+        .commands()
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
+
+    send(
+        &mut new_owner,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CLOSE"}"#,
+    )
+    .await;
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = next_json(&mut new_owner).await;
+            if status["type"] == "RECEIVER_STATUS" {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("closing the current owner must stop the session");
+    assert!(stopped["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn exclusive_app_keeps_multiple_logical_senders_on_one_connection() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    send_as(
+        &mut harness.client,
+        "sender-2",
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"STILL_OWNER"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
 }
 
 /// An app session whose `resolve_license` reverses the challenge instead of
