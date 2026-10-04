@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
 use vibecast_sdk::{
     AppContext, AppManifest, AppProvider, AppSession, AppSettingsReader, AppSettingsSchema,
-    ChoiceOption, LaunchCredentials, LaunchError, LoadRequest, MediaResolveError, OutputControl,
-    PlaybackController, PlaybackMedia, PlaybackState, SettingDescriptor, SettingScope,
+    ChoiceOption, LaunchCredentials, LaunchError, LoadRequest, MediaResolveError,
+    MessageDisposition, OutputControl, PlaybackController, PlaybackMedia, PlaybackState,
+    SettingDescriptor, SettingScope,
 };
 
 use lounge::{LoungeCommand, LoungeConnection, LoungeIdentity};
@@ -140,42 +141,32 @@ impl AppSession for YouTubeSession {
             .map_err(map_resolve_error)
     }
 
-    async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
-        let ctx = ctx.clone();
-        let mut identity = self.identity.clone();
-        let mut cancel = self.cancel.subscribe();
-        tokio::spawn(async move {
-            loop {
-                let current_identity = { identity.borrow().clone() };
-                if let Some(identity) = current_identity {
-                    ctx.send_custom(
-                        MDX_NAMESPACE,
-                        serde_json::json!({
-                            "type": "mdxSessionStatus",
-                            "data": {
-                                "screenId": identity.screen_id,
-                                "deviceId": identity.device_id,
-                            }
-                        }),
-                    )
-                    .await;
-                    return;
-                }
+    async fn on_message(
+        &self,
+        ctx: &AppContext,
+        namespace: &str,
+        data: &serde_json::Value,
+    ) -> MessageDisposition {
+        if namespace != MDX_NAMESPACE
+            || data.get("type").and_then(serde_json::Value::as_str)
+                != Some("getMdxSessionStatus")
+        {
+            return MessageDisposition::Unhandled;
+        }
+        send_mdx_session_status_when_ready(
+            ctx.clone(),
+            self.identity.clone(),
+            self.cancel.subscribe(),
+        );
+        MessageDisposition::Handled
+    }
 
-                tokio::select! {
-                    result = identity.changed() => {
-                        if result.is_err() {
-                            return;
-                        }
-                    }
-                    result = cancel.changed() => {
-                        if result.is_err() || *cancel.borrow() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
+    async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
+        send_mdx_session_status_when_ready(
+            ctx.clone(),
+            self.identity.clone(),
+            self.cancel.subscribe(),
+        );
     }
 
     async fn on_playback_update(&self, _ctx: &AppContext, state: PlaybackState) {
@@ -209,6 +200,45 @@ impl AppSession for YouTubeSession {
     async fn on_stop(&self, _ctx: &AppContext) {
         let _ = self.cancel.send(true);
     }
+}
+
+fn send_mdx_session_status_when_ready(
+    ctx: AppContext,
+    mut identity: watch::Receiver<Option<LoungeIdentity>>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let current_identity = { identity.borrow().clone() };
+            if let Some(identity) = current_identity {
+                ctx.send_custom(
+                    MDX_NAMESPACE,
+                    serde_json::json!({
+                        "type": "mdxSessionStatus",
+                        "data": {
+                            "screenId": identity.screen_id,
+                            "deviceId": identity.device_id,
+                        }
+                    }),
+                )
+                .await;
+                return;
+            }
+
+            tokio::select! {
+                result = identity.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+                result = cancel.changed() => {
+                    if result.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 async fn run_lounge(
@@ -745,6 +775,20 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
+    struct RecordingSender {
+        sent: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    #[async_trait]
+    impl vibecast_sdk::SenderChannel for RecordingSender {
+        async fn send_custom(&self, namespace: &str, data: serde_json::Value) {
+            self.sent.lock().unwrap().push((namespace.to_owned(), data));
+        }
+
+        async fn broadcast_custom(&self, _namespace: &str, _data: serde_json::Value) {}
+    }
+
+    #[derive(Default)]
     struct RecordingPlayback {
         operations: Mutex<Vec<String>>,
         loaded: Mutex<Vec<PlaybackMedia>>,
@@ -774,6 +818,64 @@ mod tests {
         async fn stop(&self) {
             self.operations.lock().unwrap().push("stop".into());
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_mdx_status_request_receives_lounge_identity() {
+        let sender = Arc::new(RecordingSender::default());
+        let ctx = AppContext::new(
+            "session",
+            "transport",
+            APP_IDS[1],
+            reqwest::Client::new(),
+            vibecast_sdk::ReceiverContext::new(
+                "YouTube test",
+                "Test",
+                "test-device",
+                std::path::PathBuf::new(),
+            ),
+            sender.clone(),
+        );
+        let (_identity_tx, identity) = watch::channel(Some(LoungeIdentity {
+            screen_id: "screen-123".into(),
+            device_id: "device-456".into(),
+        }));
+        let (playback_tx, _playback_rx) = mpsc::channel(1);
+        let (output_control_tx, _output_control_rx) = mpsc::channel(1);
+        let (volume_tx, _volume_rx) = watch::channel((1.0, false));
+        let (cancel, _cancelled) = watch::channel(false);
+        let session = YouTubeSession {
+            resolver: Resolver::new(reqwest::Client::new()),
+            capabilities: vibecast_sdk::PlayerCapabilities::default(),
+            identity,
+            playback_tx,
+            output_control_tx,
+            volume_tx,
+            cancel,
+        };
+
+        let disposition = session
+            .on_message(
+                &ctx,
+                MDX_NAMESPACE,
+                &serde_json::json!({"type": "getMdxSessionStatus"}),
+            )
+            .await;
+        assert_eq!(disposition, MessageDisposition::Handled);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sender.sent.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, MDX_NAMESPACE);
+        assert_eq!(sent[0].1["type"], "mdxSessionStatus");
+        assert_eq!(sent[0].1["data"]["screenId"], "screen-123");
+        assert_eq!(sent[0].1["data"]["deviceId"], "device-456");
     }
 
     #[test]
