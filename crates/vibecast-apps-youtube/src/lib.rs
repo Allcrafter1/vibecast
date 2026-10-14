@@ -114,6 +114,7 @@ impl AppProvider for YouTube {
             mdx_requested,
             legacy_status_scheduled,
             owner_connection: Mutex::new(ctx.sender_connection_id()),
+            owner_senders: Mutex::new(std::collections::HashSet::new()),
             ownership_generation_tx,
             takeover_tx,
             playback_tx,
@@ -131,6 +132,7 @@ struct YouTubeSession {
     mdx_requested: Arc<AtomicBool>,
     legacy_status_scheduled: Arc<AtomicBool>,
     owner_connection: Mutex<Option<u64>>,
+    owner_senders: Mutex<std::collections::HashSet<String>>,
     ownership_generation_tx: watch::Sender<u64>,
     takeover_tx: mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     playback_tx: mpsc::Sender<PlaybackState>,
@@ -191,20 +193,40 @@ impl AppSession for YouTubeSession {
         MessageDisposition::Handled
     }
 
-    async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
+    async fn on_sender_connected(&self, ctx: &AppContext, sender_id: &str) {
         let takeover = ctx.sender_connection_id().is_some_and(|connection_id| {
             let mut owner = self
                 .owner_connection
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let mut senders = self.owner_senders.lock().unwrap_or_else(|e| e.into_inner());
             match *owner {
-                Some(current) if current == connection_id => false,
+                Some(current) if current == connection_id => {
+                    senders.insert(sender_id.to_owned());
+                    false
+                }
+                // A Cast sender id already seen on the owning connection,
+                // arriving on a new connection, is the same device coming
+                // back (iOS drops the socket on every screen lock). Keep the
+                // Lounge screen and queue instead of treating it as a
+                // takeover by a different controller.
+                Some(_) if senders.contains(sender_id) => {
+                    *owner = Some(connection_id);
+                    tracing::info!(
+                        connection_id,
+                        "YouTube owner reattached on a new connection; keeping Lounge session"
+                    );
+                    false
+                }
                 Some(_) => {
                     *owner = Some(connection_id);
+                    senders.clear();
+                    senders.insert(sender_id.to_owned());
                     true
                 }
                 None => {
                     *owner = Some(connection_id);
+                    senders.insert(sender_id.to_owned());
                     false
                 }
             }
@@ -1013,6 +1035,7 @@ mod tests {
                 mdx_requested: Arc::new(AtomicBool::new(false)),
                 legacy_status_scheduled: Arc::new(AtomicBool::new(false)),
                 owner_connection: Mutex::new(None),
+                owner_senders: Mutex::new(std::collections::HashSet::new()),
                 ownership_generation_tx,
                 takeover_tx,
                 playback_tx,
@@ -1075,6 +1098,24 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1["type"], "mdxSessionStatus");
         assert!(sent[0].1.get("requestId").is_none());
+    }
+
+    #[tokio::test]
+    async fn returning_owner_on_a_new_connection_keeps_lounge_ownership() {
+        let (session, ctx, _sender) = mdx_test_session();
+        let generation = session.ownership_generation_tx.subscribe();
+
+        let launching = ctx.clone().with_sender_connection_id(Some(1));
+        session.on_sender_connected(&launching, "phone").await;
+        // iOS closes the Cast socket on screen lock; the same sender id
+        // then reconnects on a new connection.
+        let returning = ctx.clone().with_sender_connection_id(Some(2));
+        session.on_sender_connected(&returning, "phone").await;
+        assert_eq!(*generation.borrow(), 0);
+
+        let other = ctx.with_sender_connection_id(Some(3));
+        session.on_sender_connected(&other, "browser").await;
+        assert_eq!(*generation.borrow(), 1);
     }
 
     #[tokio::test]
