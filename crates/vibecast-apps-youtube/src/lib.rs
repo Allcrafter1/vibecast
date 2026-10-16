@@ -28,6 +28,35 @@ const MDX_NAMESPACE: &str = "urn:x-cast:com.google.youtube.mdx";
 const CUSTOM_DATA_NAMESPACE: &str = "urn:x-cast:com.google.cast.customdata";
 const ICON_URL: &str = "https://www.gstatic.com/youtube/img/branding/favicon/favicon_144x144.png";
 
+#[derive(Clone, PartialEq, Eq)]
+struct CredentialTransferToken {
+    video_id: String,
+    token: String,
+}
+
+impl CredentialTransferToken {
+    fn new(video_id: String, token: String) -> Self {
+        Self { video_id, token }
+    }
+
+    fn applies_to(&self, video_id: &str) -> bool {
+        self.video_id == video_id
+    }
+
+    fn value(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for CredentialTransferToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialTransferToken")
+            .field("video_id", &self.video_id)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// YouTube app provider.
 #[derive(Debug, Default)]
 pub struct YouTube;
@@ -150,15 +179,27 @@ impl AppSession for YouTubeSession {
         let preferred_video_codec = PreferredVideoCodec::from_snapshot(&settings);
         let video_id = resolver::extract_video_id(&request.media.content_id)
             .ok_or_else(|| MediaResolveError::invalid_request("INVALID_YOUTUBE_VIDEO_ID"))?;
-        self.resolver
+        let media = self
+            .resolver
             .resolve(
                 &video_id,
                 request.current_time,
                 &self.capabilities,
                 preferred_video_codec,
+                None,
             )
             .await
-            .map_err(map_resolve_error)
+            .map_err(map_resolve_error)?;
+        prepare_audio_refresh(
+            &media,
+            &self.resolver,
+            &video_id,
+            &self.capabilities,
+            preferred_video_codec,
+            0,
+            None,
+        );
+        Ok(media)
     }
 
     async fn on_message(
@@ -306,7 +347,10 @@ fn send_mdx_session_status_when_ready(
 ) {
     tokio::spawn(async move {
         loop {
-            if *ownership_generation.borrow() != expected_generation {
+            if *cancel.borrow()
+                || cancel.has_changed().is_err()
+                || *ownership_generation.borrow() != expected_generation
+            {
                 return;
             }
             let current_identity = { identity.borrow().clone() };
@@ -325,7 +369,10 @@ fn send_mdx_session_status_when_ready(
                     request_id_present = request_id.is_some(),
                     "sending YouTube MDX session status"
                 );
-                if *ownership_generation.borrow() != expected_generation {
+                if *cancel.borrow()
+                    || cancel.has_changed().is_err()
+                    || *ownership_generation.borrow() != expected_generation
+                {
                     return;
                 }
                 ctx.send_custom(MDX_NAMESPACE, response).await;
@@ -448,10 +495,19 @@ struct QueueState {
     video_ids: Vec<String>,
     current_index: usize,
     list_id: Option<String>,
+    credential: Option<CredentialTransferToken>,
     next_pending: bool,
 }
 
 impl QueueState {
+    fn updated_index(&self, video_ids: &[String]) -> usize {
+        retained_selection_index(
+            self.video_ids.get(self.current_index).map(String::as_str),
+            self.current_index,
+            video_ids,
+        )
+    }
+
     fn advances_to_prepared_next(&self, command: &LoungeCommand) -> bool {
         match command {
             LoungeCommand::Next => true,
@@ -460,9 +516,11 @@ impl QueueState {
                 current_index,
                 current_time,
                 list_id,
+                credential,
             } => {
                 self.list_id.is_some()
                     && self.list_id == *list_id
+                    && credential.is_none()
                     && *current_time == 0.0
                     && *current_index == self.current_index + 1
                     && video_ids.get(*current_index).is_some()
@@ -470,6 +528,26 @@ impl QueueState {
             }
             _ => false,
         }
+    }
+}
+
+// Queue edits do not select another title. Keep the active slot if unchanged
+// (including duplicate entries), otherwise follow that title to its new slot.
+fn retained_selection_index(
+    current_id: Option<&str>,
+    current_index: usize,
+    video_ids: &[String],
+) -> usize {
+    let Some(current_id) = current_id else {
+        return current_index;
+    };
+    if video_ids.get(current_index).map(String::as_str) == Some(current_id) {
+        current_index
+    } else {
+        video_ids
+            .iter()
+            .position(|id| id == current_id)
+            .unwrap_or(current_index)
     }
 }
 
@@ -497,6 +575,7 @@ fn prefetched_is_fresh(completed: std::time::Instant) -> bool {
 // renew its age: signed URLs expire even when the same title keeps repeating.
 struct CurrentResolution {
     video_id: String,
+    credential: Option<CredentialTransferToken>,
     media: PlaybackMedia,
     completed: std::time::Instant,
     codec: PreferredVideoCodec,
@@ -507,6 +586,7 @@ impl CurrentResolution {
         &self,
         video_id: Option<&String>,
         codec: PreferredVideoCodec,
+        credential: Option<&CredentialTransferToken>,
     ) -> Option<PlaybackMedia> {
         let cache = self
             .media
@@ -518,6 +598,7 @@ impl CurrentResolution {
             });
         if video_id != Some(&self.video_id)
             || codec != self.codec
+            || credential != self.credential.as_ref()
             || cache.is_some_and(|c| c.is_failed())
             || (!cache.is_some_and(|c| c.is_complete()) && !prefetched_is_fresh(self.completed))
         {
@@ -527,6 +608,128 @@ impl CurrentResolution {
         media.start_time = 0.0;
         media.autoplay = true;
         Some(media)
+    }
+}
+
+// Refresh only the signed location of the exact same encoded object. A changed
+// format/revision must never be appended to bytes already held by the decoder.
+struct CurrentAudioRefresh {
+    resolver: Resolver,
+    video_id: String,
+    credential: Option<CredentialTransferToken>,
+    capabilities: vibecast_sdk::PlayerCapabilities,
+    codec: PreferredVideoCodec,
+    identity: AudioObjectIdentity,
+}
+
+impl std::fmt::Debug for CurrentAudioRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CurrentAudioRefresh")
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct AudioObjectIdentity {
+    itag: String,
+    modified: String,
+    length: String,
+    content_type: String,
+}
+
+impl AudioObjectIdentity {
+    fn from_stream(stream: &vibecast_sdk::PlaybackStream) -> Option<Self> {
+        let url = url::Url::parse(stream.source.as_url()?).ok()?;
+        let field = |name: &str| {
+            let mut values = url.query_pairs().filter(|(key, _)| key == name);
+            let value = values.next()?.1.into_owned();
+            (values.next().is_none()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u64>().is_ok_and(|number| number > 0))
+            .then_some(value)
+        };
+        if stream.content_type.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            // googlevideo's `id` can change between resolutions of the same
+            // bytes. The resolver is bound to video_id; these fields identify
+            // its encoded representation, independently of signed URL routing.
+            itag: field("itag")?,
+            modified: field("lmt")?,
+            length: field("clen")?,
+            content_type: stream.content_type.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl vibecast_sdk::MediaSourceRefresh for CurrentAudioRefresh {
+    async fn refresh(&self) -> Option<String> {
+        let media = self
+            .resolver
+            .resolve(
+                &self.video_id,
+                0.0,
+                &self.capabilities,
+                self.codec,
+                self.credential.as_ref(),
+            )
+            .await
+            .ok()?;
+        if media
+            .content_id
+            .as_ref()
+            .is_some_and(|id| id != &self.video_id)
+        {
+            tracing::warn!(video_mismatch = true, "refreshed audio identity rejected");
+            return None;
+        }
+        media.streams.iter().find_map(|stream| {
+            let Some(identity) = AudioObjectIdentity::from_stream(stream) else {
+                tracing::warn!(
+                    malformed_identity = true,
+                    "refreshed audio identity rejected"
+                );
+                return None;
+            };
+            if identity != self.identity {
+                tracing::warn!(
+                    format_mismatch = identity.itag != self.identity.itag,
+                    revision_mismatch = identity.modified != self.identity.modified,
+                    length_mismatch = identity.length != self.identity.length,
+                    mime_mismatch = identity.content_type != self.identity.content_type,
+                    "refreshed audio identity rejected"
+                );
+                return None;
+            }
+            stream.source.as_url().map(str::to_owned)
+        })
+    }
+}
+
+fn prepare_audio_refresh(
+    media: &PlaybackMedia,
+    resolver: &Resolver,
+    video_id: &str,
+    capabilities: &vibecast_sdk::PlayerCapabilities,
+    codec: PreferredVideoCodec,
+    retries_used: u8,
+    credential: Option<&CredentialTransferToken>,
+) {
+    for stream in &media.streams {
+        if let vibecast_sdk::StreamSource::CachedUrl { cache, .. } = &stream.source {
+            cache.set_recovery_attempts(retries_used);
+            if let Some(identity) = AudioObjectIdentity::from_stream(stream) {
+                cache.set_refresh(Arc::new(CurrentAudioRefresh {
+                    resolver: resolver.clone(),
+                    video_id: video_id.to_owned(),
+                    credential: credential.cloned(),
+                    capabilities: capabilities.clone(),
+                    codec,
+                    identity,
+                }));
+            }
+        }
     }
 }
 
@@ -569,12 +772,19 @@ async fn run_commands(
             LoungeCommand::ReloadCurrent { autoplay, .. } => Some(*autoplay),
             _ => None,
         };
+        let retries_used = match &command {
+            LoungeCommand::ReloadCurrent { retries_used, .. } => *retries_used,
+            _ => 0,
+        };
         if repeating && playback_active {
             let codec = PreferredVideoCodec::from_snapshot(&settings.snapshot());
-            if let Some(media) = current_resolution
-                .as_ref()
-                .and_then(|current| current.replay(queue.video_ids.get(queue.current_index), codec))
-            {
+            if let Some(media) = current_resolution.as_ref().and_then(|current| {
+                current.replay(
+                    queue.video_ids.get(queue.current_index),
+                    codec,
+                    queue.credential.as_ref(),
+                )
+            }) {
                 let cached_audio = media.streams.iter().any(|stream| matches!(
                     &stream.source, vibecast_sdk::StreamSource::CachedUrl { cache, .. } if cache.is_complete()
                 ));
@@ -592,6 +802,7 @@ async fn run_commands(
             video_ids,
             current_time,
             list_id,
+            credential,
         } = &command
         {
             tracing::info!(
@@ -599,6 +810,7 @@ async fn run_commands(
                 queue_len = video_ids.len(),
                 start = *current_time,
                 same_queue = queue.list_id.is_some() && queue.list_id == *list_id,
+                has_ctt = credential.is_some(),
                 use_prefetch,
                 "YouTube playlist selection"
             );
@@ -607,12 +819,13 @@ async fn run_commands(
             LoungeCommand::ReloadCurrent {
                 video_id,
                 current_time,
+                credential,
                 ..
             } => {
                 if stopped || queue.video_ids.get(queue.current_index) != Some(&video_id) {
                     continue;
                 }
-                Some((video_id, current_time))
+                Some((video_id, current_time, credential))
             }
             LoungeCommand::RepeatCurrent => {
                 queue.next_pending = false;
@@ -620,35 +833,39 @@ async fn run_commands(
                     .video_ids
                     .get(queue.current_index)
                     .cloned()
-                    .map(|video_id| (video_id, 0.0))
+                    .map(|video_id| (video_id, 0.0, queue.credential.clone()))
             }
             LoungeCommand::SetPlaylist {
                 video_ids,
                 current_index,
                 current_time,
                 list_id,
+                credential,
             } => {
                 queue.video_ids = video_ids;
                 queue.current_index = current_index.min(queue.video_ids.len().saturating_sub(1));
                 queue.list_id = list_id;
+                queue.credential = credential;
                 queue.next_pending = false;
                 queue
                     .video_ids
                     .get(queue.current_index)
                     .cloned()
-                    .map(|video_id| (video_id, current_time))
+                    .map(|video_id| (video_id, current_time, queue.credential.clone()))
             }
             LoungeCommand::UpdatePlaylist { video_ids, list_id } => {
+                queue.current_index = queue.updated_index(&video_ids);
                 queue.video_ids = video_ids;
                 queue.list_id = list_id;
                 if queue.next_pending && queue.current_index + 1 < queue.video_ids.len() {
                     queue.current_index += 1;
+                    queue.credential = None;
                     queue.next_pending = false;
                     queue
                         .video_ids
                         .get(queue.current_index)
                         .cloned()
-                        .map(|video_id| (video_id, 0.0))
+                        .map(|video_id| (video_id, 0.0, None))
                 } else {
                     None
                 }
@@ -656,11 +873,12 @@ async fn run_commands(
             LoungeCommand::Next => {
                 if queue.current_index + 1 < queue.video_ids.len() {
                     queue.current_index += 1;
+                    queue.credential = None;
                     queue
                         .video_ids
                         .get(queue.current_index)
                         .cloned()
-                        .map(|video_id| (video_id, 0.0))
+                        .map(|video_id| (video_id, 0.0, None))
                 } else {
                     queue.next_pending = true;
                     None
@@ -670,17 +888,18 @@ async fn run_commands(
                 if queue.current_index > 0 {
                     queue.current_index -= 1;
                 }
+                queue.credential = None;
                 queue.next_pending = false;
                 queue
                     .video_ids
                     .get(queue.current_index)
                     .cloned()
-                    .map(|video_id| (video_id, 0.0))
+                    .map(|video_id| (video_id, 0.0, None))
             }
             LoungeCommand::Play => {
                 if let Some((video_id, position)) = failed_resolution.take() {
                     if !stopped && queue.video_ids.get(queue.current_index) == Some(&video_id) {
-                        Some((video_id, position))
+                        Some((video_id, position, queue.credential.clone()))
                     } else {
                         None
                     }
@@ -701,6 +920,7 @@ async fn run_commands(
                 stopped = true;
                 failed_resolution = None;
                 current_resolution = None;
+                queue.credential = None;
                 queue.next_pending = false;
                 playback_active = false;
                 next_resolution = None;
@@ -709,7 +929,7 @@ async fn run_commands(
             }
         };
 
-        if let Some((video_id, start_time)) = load {
+        if let Some((video_id, start_time, credential)) = load {
             stopped = false;
             failed_resolution = None;
             current_resolution = None;
@@ -725,7 +945,7 @@ async fn run_commands(
             let resolution = async {
                 let mut prepared = None;
                 if let Some(mut pending) = pending {
-                    if use_prefetch && pending.video_id == video_id {
+                    if use_prefetch && credential.is_none() && pending.video_id == video_id {
                         if let Some(task) = pending.task.as_mut() {
                             if let Ok((Ok(mut media), completed)) = task.await {
                                 if prefetched_is_fresh(completed) {
@@ -741,7 +961,13 @@ async fn run_commands(
                     Some(media) => Ok(media),
                     None => {
                         let mut result = resolver
-                            .resolve(&video_id, start_time, &capabilities, preferred_video_codec)
+                            .resolve(
+                                &video_id,
+                                start_time,
+                                &capabilities,
+                                preferred_video_codec,
+                                credential.as_ref(),
+                            )
                             .await;
                         // Metadata/extractor requests can fail before a LOAD ever
                         // reaches the decoder (including repeat cache renewal).
@@ -758,6 +984,7 @@ async fn run_commands(
                                     start_time,
                                     &capabilities,
                                     preferred_video_codec,
+                                    credential.as_ref(),
                                 )
                                 .await;
                         }
@@ -785,15 +1012,27 @@ async fn run_commands(
                             Some(LoungeCommand::Seek(position)) => {
                                 requested_position = position.max(0.0);
                             }
+                            Some(LoungeCommand::Next)
+                                if queue.current_index + 1 >= queue.video_ids.len() => {
+                                queue.next_pending = true;
+                            }
+                            Some(LoungeCommand::UpdatePlaylist { video_ids, list_id })
+                                if queue.next_pending && queue.updated_index(&video_ids) + 1 < video_ids.len() => {
+                                deferred = Some(LoungeCommand::UpdatePlaylist { video_ids, list_id });
+                                continue 'commands;
+                            }
                             Some(LoungeCommand::UpdatePlaylist { video_ids, list_id }) => {
+                                queue.current_index = queue.updated_index(&video_ids);
                                 queue.video_ids = video_ids;
                                 queue.list_id = list_id;
                             }
-                            Some(LoungeCommand::SetPlaylist { video_ids, current_index, current_time, list_id })
+                            Some(LoungeCommand::SetPlaylist { video_ids, current_index, current_time, list_id, credential: incoming_credential })
                                 if video_ids.get(current_index) == Some(&video_id)
-                                    && current_index == queue.current_index && current_time == start_time => {
+                                    && current_index == queue.current_index && current_time == start_time
+                                    && incoming_credential == credential => {
                                 queue.video_ids = video_ids;
                                 queue.list_id = list_id;
+                                queue.credential = incoming_credential;
                             }
                             Some(LoungeCommand::ReloadCurrent { video_id: retry_id, .. })
                                 if retry_id != video_id => {
@@ -815,9 +1054,19 @@ async fn run_commands(
                 Ok((mut media, completed)) => {
                     media.start_time = requested_position;
                     media.autoplay = autoplay;
+                    prepare_audio_refresh(
+                        &media,
+                        &resolver,
+                        &video_id,
+                        &capabilities,
+                        preferred_video_codec,
+                        retries_used,
+                        credential.as_ref(),
+                    );
                     playback_active = true;
                     current_resolution = Some(CurrentResolution {
                         video_id: video_id.clone(),
+                        credential: credential.clone(),
                         media: media.clone(),
                         completed,
                         codec: preferred_video_codec,
@@ -851,7 +1100,7 @@ async fn run_commands(
                 next_resolution = Some(NextResolution {
                     video_id,
                     task: Some(tokio::spawn(async move {
-                        let result = resolver.resolve(&id, 0.0, &capabilities, codec).await;
+                        let result = resolver.resolve(&id, 0.0, &capabilities, codec, None).await;
                         (result, std::time::Instant::now())
                     })),
                 });
@@ -886,12 +1135,214 @@ fn map_resolve_error(error: ResolveError) -> MediaResolveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cache_refresh_accepts_only_the_same_encoded_object() {
+        use vibecast_sdk::MediaSourceRefresh;
+        let original = vibecast_sdk::PlaybackStream::cached_url(
+            "https://media.test/audio?id=object-A&itag=251&lmt=123&clen=12345&sig=old",
+            "audio/webm",
+        );
+        for (query, mime, accepted) in [
+            (
+                "id=object-B&itag=251&lmt=123&clen=12345",
+                "audio/webm",
+                true,
+            ),
+            ("itag=251&lmt=123&clen=12345", "audio/webm", true),
+            (
+                "id=object-A&id=object-B&itag=251&lmt=123&clen=12345",
+                "audio/webm",
+                true,
+            ),
+            (
+                "id=object-A&itag=251&lmt=123&clen=12345&sig=new",
+                "audio/webm",
+                true,
+            ),
+            (
+                "id=object-A&itag=140&lmt=123&clen=12345",
+                "audio/webm",
+                false,
+            ),
+            (
+                "id=object-A&itag=251&lmt=456&clen=12345",
+                "audio/webm",
+                false,
+            ),
+            (
+                "id=object-A&itag=251&lmt=123&clen=99999",
+                "audio/webm",
+                false,
+            ),
+            (
+                "id=object-A&itag=251&lmt=123&clen=12345",
+                "audio/mp4",
+                false,
+            ),
+            ("id=object-A&itag=251&clen=12345", "audio/webm", false),
+            ("itag=251&lmt=123&clen=12345&clen=999", "audio/webm", false),
+            ("itag=251&lmt=123&lmt=456&clen=12345", "audio/webm", false),
+            ("itag=251&lmt=invalid&clen=12345", "audio/webm", false),
+            ("itag=251&lmt=123&clen=0", "audio/webm", false),
+            ("itag=251&lmt=123&clen=-1", "audio/webm", false),
+            (
+                "itag=251&lmt=123&clen=18446744073709551616",
+                "audio/webm",
+                false,
+            ),
+            (
+                "id=object-A&itag=251&itag=140&lmt=123&clen=12345",
+                "audio/webm",
+                false,
+            ),
+        ] {
+            let (resolver, mut requests) = Resolver::controlled();
+            let provider = CurrentAudioRefresh {
+                resolver,
+                video_id: "A".into(),
+                credential: None,
+                capabilities: Default::default(),
+                codec: PreferredVideoCodec::Auto,
+                identity: AudioObjectIdentity::from_stream(&original).unwrap(),
+            };
+            let task = tokio::spawn(async move { provider.refresh().await });
+            let (id, response) = requests.recv().await.unwrap();
+            assert_eq!(id, "A");
+            let mut media = test_media("A");
+            let url = format!("https://other-cdn.test/audio?{query}");
+            media
+                .streams
+                .push(vibecast_sdk::PlaybackStream::cached_url(&url, mime));
+            response.send(Ok(media)).unwrap();
+            assert_eq!(task.await.unwrap(), accepted.then_some(url));
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_audio_installs_refresh_and_carries_reload_budget() {
+        let (resolver, mut requests) = Resolver::controlled();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            Default::default(),
+            test_settings(),
+            cancelled,
+        ));
+        tx.send(selection(&["A"], 0)).await.unwrap();
+        let (_, response) = requests.recv().await.unwrap();
+        let mut media = test_media("A");
+        media.streams.push(vibecast_sdk::PlaybackStream::cached_url(
+            "https://media.test/audio?id=object-A&itag=251&lmt=123&clen=12345",
+            "audio/webm",
+        ));
+        response.send(Ok(media.clone())).unwrap();
+        wait_loads(&player, 1).await;
+        let hint = match &player.loaded.lock().unwrap()[0].streams[0].source {
+            vibecast_sdk::StreamSource::CachedUrl { cache, .. } => cache.clone(),
+            _ => panic!("expected cached audio"),
+        };
+        assert_eq!(hint.recovery_attempts(), 0);
+        let refresh = tokio::spawn(async move { hint.source_refresh().unwrap().refresh().await });
+        let (id, response) = requests.recv().await.unwrap();
+        assert_eq!(id, "A");
+        response.send(Ok(media.clone())).unwrap();
+        assert!(refresh.await.unwrap().is_some());
+        tx.send(LoungeCommand::ReloadCurrent {
+            video_id: "A".into(),
+            current_time: 42.0,
+            autoplay: false,
+            retries_used: 2,
+            credential: None,
+        })
+        .await
+        .unwrap();
+        let (_, response) = requests.recv().await.unwrap();
+        response.send(Ok(media)).unwrap();
+        wait_loads(&player, 2).await;
+        {
+            let loaded = player.loaded.lock().unwrap();
+            let vibecast_sdk::StreamSource::CachedUrl { cache, .. } = &loaded[1].streams[0].source
+            else {
+                panic!()
+            };
+            assert_eq!(cache.recovery_attempts(), 2);
+            assert!(!cache.try_recovery());
+            assert_eq!(loaded[1].start_time, 42.0);
+            assert!(!loaded[1].autoplay);
+        }
+        cancel.send(true).unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_refresh_rejects_a_different_resolved_video() {
+        use vibecast_sdk::MediaSourceRefresh;
+        let stream = vibecast_sdk::PlaybackStream::cached_url(
+            "https://media.test/audio?itag=251&lmt=123&clen=12345",
+            "audio/webm",
+        );
+        let (resolver, mut requests) = Resolver::controlled();
+        let provider = CurrentAudioRefresh {
+            resolver,
+            video_id: "A".into(),
+            credential: None,
+            capabilities: Default::default(),
+            codec: PreferredVideoCodec::Auto,
+            identity: AudioObjectIdentity::from_stream(&stream).unwrap(),
+        };
+        let task = tokio::spawn(async move { provider.refresh().await });
+        let (requested_id, response) = requests.recv().await.unwrap();
+        assert_eq!(requested_id, "A");
+        let mut media = test_media("B");
+        media.streams.push(stream);
+        response.send(Ok(media)).unwrap();
+        assert!(task.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_refresh_reuses_the_same_video_credential() {
+        use vibecast_sdk::MediaSourceRefresh;
+        let stream = vibecast_sdk::PlaybackStream::cached_url(
+            "https://media.test/audio?itag=251&lmt=123&clen=12345",
+            "audio/webm",
+        );
+        let (resolver, mut requests, mut contexts) = Resolver::controlled_with_contexts();
+        let provider = CurrentAudioRefresh {
+            resolver,
+            video_id: "A".into(),
+            credential: Some(CredentialTransferToken::new(
+                "A".into(),
+                "refresh-synthetic-token".into(),
+            )),
+            capabilities: Default::default(),
+            codec: PreferredVideoCodec::Auto,
+            identity: AudioObjectIdentity::from_stream(&stream).unwrap(),
+        };
+        let task = tokio::spawn(async move { provider.refresh().await });
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "A");
+        assert_eq!(
+            credential.as_ref().map(CredentialTransferToken::value),
+            Some("refresh-synthetic-token")
+        );
+        let (_, response) = requests.recv().await.unwrap();
+        let mut media = test_media("A");
+        media.streams.push(stream);
+        response.send(Ok(media)).unwrap();
+        assert!(task.await.unwrap().is_some());
+    }
     #[test]
     fn playlist_advance_can_use_prefetch_but_new_selection_cannot() {
         let queue = QueueState {
             video_ids: vec!["a".into(), "b".into()],
             current_index: 0,
             list_id: Some("queue".into()),
+            credential: None,
             next_pending: false,
         };
         let selection = |list: &str, index, time| LoungeCommand::SetPlaylist {
@@ -899,12 +1350,21 @@ mod tests {
             current_index: index,
             current_time: time,
             list_id: Some(list.into()),
+            credential: None,
         };
         assert!(queue.advances_to_prepared_next(&selection("queue", 1, 0.0)));
         assert!(queue.advances_to_prepared_next(&LoungeCommand::Next));
         assert!(!queue.advances_to_prepared_next(&selection("other", 1, 0.0)));
         assert!(!queue.advances_to_prepared_next(&selection("queue", 0, 0.0)));
         assert!(!queue.advances_to_prepared_next(&selection("queue", 1, 42.0)));
+        let mut credential_advance = selection("queue", 1, 0.0);
+        if let LoungeCommand::SetPlaylist { credential, .. } = &mut credential_advance {
+            *credential = Some(CredentialTransferToken::new(
+                "b".into(),
+                "synthetic-token".into(),
+            ));
+        }
+        assert!(!queue.advances_to_prepared_next(&credential_advance));
     }
     #[test]
     fn prefetch_expires_after_ten_minutes() {
@@ -1097,6 +1557,34 @@ mod tests {
         assert!(sender.sent.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn cancelled_session_never_sends_a_ready_lounge_identity() {
+        let (session, ctx, sender) = mdx_test_session();
+        session.cancel.send_replace(true);
+        send_mdx_session_status_when_ready(
+            ctx,
+            session.identity.clone(),
+            session.cancel.subscribe(),
+            session.ownership_generation_tx.subscribe(),
+            0,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(sender.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_session_never_sends_a_ready_lounge_identity() {
+        let (session, ctx, sender) = mdx_test_session();
+        let cancel = session.cancel.subscribe();
+        let identity = session.identity.clone();
+        let generation = session.ownership_generation_tx.subscribe();
+        drop(session);
+        send_mdx_session_status_when_ready(ctx, identity, cancel, generation, 0, None);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(sender.sent.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn provider_declares_captured_identity() {
         let manifest = YouTube::new().manifest();
@@ -1184,7 +1672,110 @@ mod tests {
             current_index: index,
             current_time: 0.0,
             list_id: Some("test-queue".into()),
+            credential: None,
         }
+    }
+
+    fn credential_selection(ids: &[&str], index: usize, token: &str) -> LoungeCommand {
+        let video_id = ids[index].to_string();
+        LoungeCommand::SetPlaylist {
+            video_ids: ids.iter().map(|s| s.to_string()).collect(),
+            current_index: index,
+            current_time: 0.0,
+            list_id: Some("test-queue".into()),
+            credential: Some(CredentialTransferToken::new(video_id, token.into())),
+        }
+    }
+
+    #[test]
+    fn credential_debug_is_redacted() {
+        let credential =
+            CredentialTransferToken::new("A".into(), "synthetic-secret-must-not-appear".into());
+        let debug = format!("{credential:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("synthetic-secret-must-not-appear"));
+    }
+
+    #[tokio::test]
+    async fn selection_context_survives_retry_but_not_prefetch_or_stop() {
+        let (resolver, mut requests, mut contexts) = Resolver::controlled_with_contexts();
+        let player = Arc::new(RecordingPlayback::default());
+        let (tx, rx) = mpsc::channel(16);
+        let (cancel, cancelled) = watch::channel(false);
+        let worker = tokio::spawn(run_commands(
+            rx,
+            resolver,
+            player.clone(),
+            Default::default(),
+            test_settings(),
+            cancelled,
+        ));
+
+        tx.send(credential_selection(
+            &["A", "B"],
+            0,
+            "first-synthetic-token",
+        ))
+        .await
+        .unwrap();
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "A");
+        assert_eq!(
+            credential.as_ref().map(CredentialTransferToken::value),
+            Some("first-synthetic-token")
+        );
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .1
+            .send(Ok(test_media("A")))
+            .unwrap();
+        wait_loads(&player, 1).await;
+
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "B");
+        assert!(
+            credential.is_none(),
+            "the current video's CTT must not reach prefetch"
+        );
+        let (_, old_prefetch) = requests.recv().await.unwrap();
+
+        tx.send(credential_selection(
+            &["A", "B"],
+            0,
+            "second-synthetic-token",
+        ))
+        .await
+        .unwrap();
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "A");
+        assert_eq!(
+            credential.as_ref().map(CredentialTransferToken::value),
+            Some("second-synthetic-token")
+        );
+        let (_, replacement) = requests.recv().await.unwrap();
+        assert!(old_prefetch.is_closed());
+        replacement.send(Ok(test_media("A"))).unwrap();
+        wait_loads(&player, 2).await;
+
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "B");
+        assert!(credential.is_none());
+        let (_, new_prefetch) = requests.recv().await.unwrap();
+
+        tx.send(LoungeCommand::Stop).await.unwrap();
+        tx.send(selection(&["A"], 0)).await.unwrap();
+        let (id, credential) = contexts.recv().await.unwrap();
+        assert_eq!(id, "A");
+        assert!(credential.is_none(), "Stop must discard the prior CTT");
+        let (_, anonymous) = requests.recv().await.unwrap();
+        assert!(new_prefetch.is_closed());
+        anonymous.send(Ok(test_media("A"))).unwrap();
+        wait_loads(&player, 3).await;
+
+        cancel.send(true).unwrap();
+        worker.await.unwrap();
     }
 
     fn test_media(id: &str) -> PlaybackMedia {
@@ -1201,6 +1792,47 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tail_next_preserves_pending_load_and_extension_advances() {
+        for finish_current_first in [true, false] {
+            let (resolver, mut requests) = Resolver::controlled();
+            let player = Arc::new(RecordingPlayback::default());
+            let (tx, rx) = mpsc::channel(16);
+            let (cancel, cancelled) = watch::channel(false);
+            let worker = tokio::spawn(run_commands(
+                rx,
+                resolver,
+                player.clone(),
+                vibecast_sdk::PlayerCapabilities::default(),
+                test_settings(),
+                cancelled,
+            ));
+            tx.send(selection(&["A"], 0)).await.unwrap();
+            let (_, pending) = requests.recv().await.unwrap();
+            let mut pending = Some(pending);
+            tx.send(LoungeCommand::Next).await.unwrap();
+            if finish_current_first {
+                pending.take().unwrap().send(Ok(test_media("A"))).unwrap();
+                wait_loads(&player, 1).await;
+            }
+            tx.send(LoungeCommand::UpdatePlaylist {
+                video_ids: vec!["A".into(), "B".into()],
+                list_id: Some("test-queue".into()),
+            })
+            .await
+            .unwrap();
+            let (id, next) = requests.recv().await.unwrap();
+            assert_eq!(id, "B");
+            if let Some(pending) = pending {
+                assert!(pending.is_closed());
+            }
+            next.send(Ok(test_media("B"))).unwrap();
+            wait_loads(&player, if finish_current_first { 2 } else { 1 }).await;
+            cancel.send(true).unwrap();
+            worker.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1315,6 +1947,8 @@ mod tests {
             video_id: "A".into(),
             current_time: 66.0,
             autoplay: false,
+            retries_used: 0,
+            credential: None,
         })
         .await
         .unwrap();
@@ -1334,6 +1968,8 @@ mod tests {
             video_id: "A".into(),
             current_time: 66.0,
             autoplay: true,
+            retries_used: 0,
+            credential: None,
         })
         .await
         .unwrap();
@@ -1378,6 +2014,8 @@ mod tests {
             video_id: "A".into(),
             current_time: 66.0,
             autoplay: true,
+            retries_used: 0,
+            credential: None,
         };
         tx.send(reload.clone()).await.unwrap();
         let (_, retry) = requests.recv().await.unwrap();
@@ -1447,6 +2085,57 @@ mod tests {
         );
         cancel.send(true).unwrap();
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_reorder_preserves_active_title_and_next_during_or_after_resolution() {
+        for during_resolution in [false, true] {
+            let (resolver, mut requests) = Resolver::controlled();
+            let player = Arc::new(RecordingPlayback::default());
+            let (tx, rx) = mpsc::channel(16);
+            let (cancel, cancelled) = watch::channel(false);
+            let worker = tokio::spawn(run_commands(
+                rx,
+                resolver,
+                player.clone(),
+                Default::default(),
+                test_settings(),
+                cancelled,
+            ));
+            tx.send(selection(&["A", "B"], 1)).await.unwrap();
+            let (id, response) = requests.recv().await.unwrap();
+            assert_eq!(id, "B");
+            let mut response = Some(response);
+            if !during_resolution {
+                response.take().unwrap().send(Ok(test_media("B"))).unwrap();
+                wait_loads(&player, 1).await;
+            }
+            tx.send(LoungeCommand::UpdatePlaylist {
+                video_ids: vec!["B".into(), "A".into()],
+                list_id: Some("test-queue".into()),
+            })
+            .await
+            .unwrap();
+            if let Some(response) = response {
+                response.send(Ok(test_media("B"))).unwrap();
+            }
+            wait_loads(&player, 1).await;
+            let (id, prepared) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(id, "A");
+            prepared.send(Ok(test_media("A"))).unwrap();
+            tx.send(LoungeCommand::Next).await.unwrap();
+            wait_loads(&player, 2).await;
+            assert_eq!(
+                player.loaded.lock().unwrap()[1].content_id.as_deref(),
+                Some("A")
+            );
+            cancel.send(true).unwrap();
+            worker.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1523,6 +2212,7 @@ mod tests {
         media.autoplay = false;
         let mut current = CurrentResolution {
             video_id: id.clone(),
+            credential: None,
             media,
             completed: std::time::Instant::now(),
             codec: PreferredVideoCodec::Auto,
@@ -1530,22 +2220,28 @@ mod tests {
         let original_age = current.completed;
         for _ in 0..2 {
             let replay = current
-                .replay(Some(&id), PreferredVideoCodec::Auto)
+                .replay(Some(&id), PreferredVideoCodec::Auto, None)
                 .unwrap();
             assert_eq!(replay.start_time, 0.0);
             assert!(replay.autoplay);
             assert_eq!(current.completed, original_age);
         }
+        let credential = CredentialTransferToken::new("A".into(), "synthetic-token".into());
         assert!(current
-            .replay(Some(&"B".into()), PreferredVideoCodec::Auto)
+            .replay(Some(&id), PreferredVideoCodec::Auto, Some(&credential))
             .is_none());
-        assert!(current.replay(None, PreferredVideoCodec::Auto).is_none());
         assert!(current
-            .replay(Some(&id), PreferredVideoCodec::H264)
+            .replay(Some(&"B".into()), PreferredVideoCodec::Auto, None)
+            .is_none());
+        assert!(current
+            .replay(None, PreferredVideoCodec::Auto, None)
+            .is_none());
+        assert!(current
+            .replay(Some(&id), PreferredVideoCodec::H264, None)
             .is_none());
         current.completed = std::time::Instant::now() - std::time::Duration::from_secs(601);
         assert!(current
-            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .replay(Some(&id), PreferredVideoCodec::Auto, None)
             .is_none());
     }
 
@@ -1562,28 +2258,29 @@ mod tests {
         media.streams = vec![stream];
         let current = CurrentResolution {
             video_id: id.clone(),
+            credential: None,
             media,
             completed: std::time::Instant::now() - std::time::Duration::from_secs(3600),
             codec: PreferredVideoCodec::Auto,
         };
         assert!(current
-            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .replay(Some(&id), PreferredVideoCodec::Auto, None)
             .is_none());
         hint.mark_complete();
         let replay = current
-            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .replay(Some(&id), PreferredVideoCodec::Auto, None)
             .unwrap();
         assert_eq!(replay.start_time, 0.0);
         assert!(replay.autoplay);
         assert!(current
-            .replay(Some(&"B".into()), PreferredVideoCodec::Auto)
+            .replay(Some(&"B".into()), PreferredVideoCodec::Auto, None)
             .is_none());
         assert!(current
-            .replay(Some(&id), PreferredVideoCodec::H264)
+            .replay(Some(&id), PreferredVideoCodec::H264, None)
             .is_none());
         hint.invalidate();
         assert!(current
-            .replay(Some(&id), PreferredVideoCodec::Auto)
+            .replay(Some(&id), PreferredVideoCodec::Auto, None)
             .is_none());
     }
 

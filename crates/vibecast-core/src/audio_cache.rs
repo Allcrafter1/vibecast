@@ -13,6 +13,7 @@ use vibecast_sdk::MediaCacheHint;
 pub(crate) const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 const BLOCK: usize = 128 * 1024;
+const UPSTREAM_RANGE: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -30,6 +31,9 @@ struct Data {
     wanted: VecDeque<usize>,
     length: usize,
     content_type: HeaderValue,
+    resume_index: usize,
+    bypass_url: Option<String>,
+    integrity_failed: bool,
 }
 
 struct Shared {
@@ -64,6 +68,9 @@ impl AudioCache {
                     wanted: VecDeque::new(),
                     length: 0,
                     content_type: HeaderValue::from_static("application/octet-stream"),
+                    resume_index: 0,
+                    bypass_url: None,
+                    integrity_failed: false,
                 }),
                 changed: watch::channel(()).0,
                 hint,
@@ -87,6 +94,10 @@ impl AudioCache {
         self.shared.changed.send_replace(());
     }
 
+    pub(crate) fn has_failed(&self) -> bool {
+        self.shared.data.lock().unwrap().phase == Phase::Failed
+    }
+
     fn start(&self) {
         let mut task = self.task.lock().unwrap();
         if task.is_some() || self.shared.data.lock().unwrap().phase != Phase::Pending {
@@ -94,14 +105,59 @@ impl AudioCache {
         }
         let shared = self.shared.clone();
         let http = self.http.clone();
-        let url = self.url.clone();
+        let mut url = self.url.clone();
         let limit = self.limit;
         let idle_timeout = self.idle_timeout;
         *task = Some(tokio::spawn(async move {
-            if download(&http, &url, &shared, limit, idle_timeout)
-                .await
-                .is_err()
-            {
+            loop {
+                if download(&http, &url, &shared, limit, idle_timeout)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                // Repair the same object while the decoder can still play its
+                // buffered audio. Keep partial blocks and pending HTTP readers;
+                // closing them here would defer recovery until decoder EOF.
+                if shared.data.lock().unwrap().phase == Phase::Cancelled {
+                    return;
+                }
+                let mut refreshed = None;
+                // Conflicting cached bytes or an invalid response tail must
+                // never be promoted to a complete object on another attempt.
+                // Leave clean decoder reloads to the app's remaining budget.
+                if let Some(refresh) = shared
+                    .hint
+                    .source_refresh()
+                    .filter(|_| !shared.data.lock().unwrap().integrity_failed)
+                {
+                    // Keep the final round for a clean decoder reload. A
+                    // different representation cannot be spliced into existing
+                    // bytes, but may still play successfully as a new load.
+                    if shared.hint.recovery_attempts() == 0 && shared.hint.try_recovery() {
+                        tracing::warn!(
+                            attempt = shared.hint.recovery_attempts(),
+                            "refreshing failed audio source before decoder buffer drains"
+                        );
+                        if let Ok(Some(next)) =
+                            tokio::time::timeout(Duration::from_secs(30), refresh.refresh()).await
+                        {
+                            refreshed = Some(next);
+                        }
+                    }
+                }
+                if let Some(next) = refreshed {
+                    let data = shared.data.lock().unwrap();
+                    tracing::info!(
+                        attempt = shared.hint.recovery_attempts(),
+                        resume_byte = data.resume_index * BLOCK
+                            + data.blocks.get(data.resume_index).map_or(0, Vec::len),
+                        "resuming cached audio with refreshed source"
+                    );
+                    drop(data);
+                    url = next;
+                    continue;
+                }
                 let mut data = shared.data.lock().unwrap();
                 if data.phase != Phase::Cancelled {
                     data.phase = Phase::Failed;
@@ -111,6 +167,7 @@ impl AudioCache {
                     tracing::warn!("current audio cache fetch failed");
                     shared.changed.send_replace(());
                 }
+                return;
             }
         }));
     }
@@ -136,7 +193,12 @@ impl AudioCache {
         };
         if phase == Phase::Bypass {
             let mut response = empty(307);
-            if let Ok(location) = HeaderValue::from_str(&self.url) {
+            let data = self.shared.data.lock().unwrap();
+            if let Some(location) = data
+                .bypass_url
+                .as_ref()
+                .and_then(|url| HeaderValue::from_str(url).ok())
+            {
                 response.headers.insert(header::LOCATION, location);
             } else {
                 response.status = 502;
@@ -214,32 +276,63 @@ async fn download(
     limit: usize,
     idle_timeout: Duration,
 ) -> Result<(), ()> {
-    // Fetch only requested blocks, not the rest of the song. A single worker
-    // coalesces concurrent decoder reads; holes from seeking stay unallocated.
+    // Drain each downloader-sized response promptly. Holding an origin body
+    // open across playback pauses/seeks can trigger peer resets. Local readers
+    // still receive bytes immediately; demand gates only the next HTTP range.
     let mut changed = shared.changed.subscribe();
-    let mut index = 0;
+    let started = std::time::Instant::now();
+    let mut index = shared.data.lock().unwrap().resume_index;
     loop {
-        let start = index * BLOCK;
-        let known_length = shared.data.lock().unwrap().length;
-        let end = if known_length == 0 {
-            start + BLOCK
-        } else {
-            (start + BLOCK).min(known_length)
+        let (known_length, present) = {
+            let data = shared.data.lock().unwrap();
+            (data.length, data.blocks.get(index).map_or(0, Vec::len))
         };
+        if known_length != 0 && present == BLOCK.min(known_length - index * BLOCK) {
+            if shared
+                .data
+                .lock()
+                .unwrap()
+                .blocks
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                == known_length
+            {
+                let mut data = shared.data.lock().unwrap();
+                if data.phase == Phase::Cancelled {
+                    return Ok(());
+                }
+                // Reaching this branch on restart means the prior response
+                // failed after filling a hole but before validating its tail.
+                // Only the normal, fully drained response path may complete.
+                data.integrity_failed = true;
+                return Err(fetch_failure("unvalidated_complete_cache"));
+            }
+            index = next_wanted(shared, &mut changed).await?;
+            continue;
+        }
+        let start = index * BLOCK + present;
+        let end = if known_length == 0 {
+            index * BLOCK + UPSTREAM_RANGE
+        } else {
+            (index * BLOCK + UPSTREAM_RANGE).min(known_length)
+        };
+        shared.data.lock().unwrap().resume_index = index;
+        let response_started = std::time::Instant::now();
         let request = http
             .get(url)
             .header(header::ACCEPT_ENCODING, "identity")
-            .header(header::RANGE, format!("bytes={start}-{}", end - 1))
-            .timeout(Duration::from_secs(120));
+            .header(header::RANGE, format!("bytes={start}-{}", end - 1));
         let mut response = tokio::time::timeout(Duration::from_secs(15), request.send())
             .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|_| fetch_failure("response_headers_timeout"))?
+            .map_err(|error| transport_failure("response_headers", &error))?;
         if response.status().as_u16() == 200 && known_length == 0 {
             // Do not silently turn a range-ignoring origin into an eager download.
             let mut data = shared.data.lock().unwrap();
             if data.phase != Phase::Cancelled {
                 data.phase = Phase::Bypass;
+                data.bypass_url = Some(url.to_string());
                 shared.changed.send_replace(());
             }
             return Ok(());
@@ -247,6 +340,11 @@ async fn download(
         if response.status().as_u16() != 206 {
             tracing::warn!(
                 status = response.status().as_u16(),
+                range_start = start,
+                range_end = end - 1,
+                known_length,
+                elapsed_seconds = started.elapsed().as_secs(),
+                http_version = ?response.version(),
                 "current audio cache HTTP failure"
             );
             return Err(());
@@ -255,23 +353,26 @@ async fn download(
             .headers()
             .get(header::CONTENT_RANGE)
             .and_then(|h| h.to_str().ok())
-            .ok_or(())?;
+            .ok_or_else(|| fetch_failure("missing_content_range"))?;
         if known_length == 0 && range_header.ends_with("/*") {
             let mut data = shared.data.lock().unwrap();
             if data.phase != Phase::Cancelled {
                 data.phase = Phase::Bypass;
+                data.bypass_url = Some(url.to_string());
                 shared.changed.send_replace(());
             }
             return Ok(());
         }
-        let (first, last, length) = content_range(range_header)?;
+        let (first, last, length) =
+            content_range(range_header).map_err(|_| fetch_failure("invalid_content_range"))?;
         if length == 0 || length > limit {
             if known_length != 0 {
-                return Err(());
+                return Err(fetch_failure("changed_or_oversized_length"));
             }
             let mut data = shared.data.lock().unwrap();
             if data.phase != Phase::Cancelled {
                 data.phase = Phase::Bypass;
+                data.bypass_url = Some(url.to_string());
                 shared.changed.send_replace(());
             }
             return Ok(());
@@ -283,7 +384,7 @@ async fn download(
                 .content_length()
                 .is_some_and(|n| n != (last + 1 - first) as u64)
         {
-            return Err(());
+            return Err(fetch_failure("mismatched_range_or_length"));
         }
         {
             let mut data = shared.data.lock().unwrap();
@@ -302,60 +403,155 @@ async fn download(
                 shared.changed.send_replace(());
             }
         }
-        let expected = last + 1 - first;
-        while let Some(chunk) = tokio::time::timeout(idle_timeout, response.chunk())
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?
-        {
-            let mut data = shared.data.lock().unwrap();
-            if data.phase == Phase::Cancelled {
-                return Ok(());
-            }
-            let bytes = &mut data.blocks[index];
-            if chunk.len() > expected - bytes.len() {
-                return Err(());
-            }
-            bytes.extend_from_slice(&chunk);
-            shared.changed.send_replace(());
-        }
-        {
-            let mut data = shared.data.lock().unwrap();
-            if data.phase == Phase::Cancelled {
-                return Ok(());
-            }
-            if data.blocks[index].len() != expected {
-                return Err(());
-            }
-            if data.blocks.iter().map(Vec::len).sum::<usize>() == length {
-                data.phase = Phase::Complete;
-                shared.hint.mark_complete();
+        let mut pending = bytes::Bytes::new();
+        let mut received = 0;
+        loop {
+            shared.data.lock().unwrap().resume_index = index;
+            let block_end = ((index + 1) * BLOCK).min(length);
+            let expected = block_end - index * BLOCK;
+            let mut response_offset = start.saturating_sub(index * BLOCK);
+            loop {
+                if response_offset == expected {
+                    break;
+                }
+                if pending.is_empty() {
+                    // No timeout runs between completed ranges while paused.
+                    pending = tokio::time::timeout(idle_timeout, response.chunk())
+                        .await
+                        .map_err(|_| fetch_failure("body_read_timeout"))?
+                        .map_err(|error| {
+                            tracing::warn!(
+                                range_start = start,
+                                range_end = end - 1,
+                                received_bytes = received,
+                                response_age_seconds = response_started.elapsed().as_secs(),
+                                "audio cache interrupted response"
+                            );
+                            transport_failure("body_read", &error)
+                        })?
+                        .ok_or_else(|| fetch_failure("truncated_body"))?;
+                    received += pending.len();
+                    if received > last + 1 - first {
+                        shared.data.lock().unwrap().integrity_failed = true;
+                        return Err(fetch_failure("oversized_body"));
+                    }
+                }
+                let mut data = shared.data.lock().unwrap();
+                if data.phase == Phase::Cancelled {
+                    return Ok(());
+                }
+                let count = pending.len().min(expected - response_offset);
+                let block = &mut data.blocks[index];
+                if response_offset > block.len() {
+                    data.integrity_failed = true;
+                    return Err(fetch_failure("cache_range_gap"));
+                }
+                let overlap = count.min(block.len() - response_offset);
+                if block[response_offset..response_offset + overlap] != pending[..overlap] {
+                    data.integrity_failed = true;
+                    return Err(fetch_failure("changed_cached_bytes"));
+                }
+                let incoming = pending.split_to(count);
+                block.extend_from_slice(&incoming[overlap..]);
+                response_offset += count;
                 shared.changed.send_replace(());
-                tracing::info!(bytes = length, "current audio cache complete");
-                return Ok(());
             }
-        }
-        // Being paused/no demand is not a network stall. Wait without a timer.
-        index = loop {
-            changed.borrow_and_update();
+            if block_end == last + 1 {
+                // Cached bytes alone do not prove response integrity. A failed
+                // tail validation must not become Complete on an in-place retry.
+                shared.data.lock().unwrap().integrity_failed = true;
+                if !pending.is_empty()
+                    || tokio::time::timeout(idle_timeout, response.chunk())
+                        .await
+                        .map_err(|_| fetch_failure("body_end_timeout"))?
+                        .map_err(|error| transport_failure("body_end", &error))?
+                        .is_some()
+                {
+                    return Err(fetch_failure("unexpected_body_tail"));
+                }
+                shared.data.lock().unwrap().integrity_failed = false;
+            }
             {
                 let mut data = shared.data.lock().unwrap();
                 if data.phase == Phase::Cancelled {
                     return Ok(());
                 }
-                let mut next = None;
-                while let Some(i) = data.wanted.pop_front() {
-                    if data.blocks[i].len() != BLOCK.min(length - i * BLOCK) {
-                        next = Some(i);
-                        break;
-                    }
-                }
-                if let Some(i) = next {
-                    break i;
+                if block_end == last + 1
+                    && data.blocks.iter().map(Vec::len).sum::<usize>() == length
+                {
+                    data.phase = Phase::Complete;
+                    shared.hint.mark_complete();
+                    shared.changed.send_replace(());
+                    tracing::info!(bytes = length, "current audio cache complete");
+                    return Ok(());
                 }
             }
-            changed.changed().await.map_err(|_| ())?;
+            // Finish the open response even without decoder demand. Do not
+            // issue the next bounded range until a local reader needs it.
+            if block_end < last + 1 {
+                index += 1;
+                continue;
+            }
+            let next = next_wanted(shared, &mut changed).await?;
+            index = next;
+            if index * BLOCK != block_end || block_end == last + 1 {
+                break;
+            }
+        }
+    }
+}
+
+fn fetch_failure(kind: &'static str) {
+    tracing::warn!(kind, "audio cache fetch failure detail");
+}
+
+fn transport_failure(stage: &'static str, error: &reqwest::Error) {
+    // reqwest's Display/Debug may contain a signed media URL: only safe flags.
+    let (io_kind, os_error) = transport_io_cause(error);
+    tracing::warn!(
+        stage,
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        body = error.is_body(),
+        decode = error.is_decode(),
+        io_kind = ?io_kind,
+        os_error,
+        "audio cache transport failure"
+    );
+}
+
+fn transport_io_cause(
+    error: &(dyn std::error::Error + 'static),
+) -> (Option<std::io::ErrorKind>, Option<i32>) {
+    let mut source = Some(error);
+    // Bound traversal even for an incorrectly self-referencing external error.
+    for _ in 0..16 {
+        let Some(error) = source else {
+            break;
         };
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return (Some(io.kind()), io.raw_os_error());
+        }
+        source = error.source();
+    }
+    (None, None)
+}
+
+async fn next_wanted(shared: &Shared, changed: &mut watch::Receiver<()>) -> Result<usize, ()> {
+    loop {
+        changed.borrow_and_update();
+        {
+            let mut data = shared.data.lock().unwrap();
+            if data.phase == Phase::Cancelled {
+                return Err(());
+            }
+            while let Some(index) = data.wanted.pop_front() {
+                if data.blocks[index].len() != BLOCK.min(data.length - index * BLOCK) {
+                    return Ok(index);
+                }
+            }
+        }
+        changed.changed().await.map_err(|_| ())?;
     }
 }
 
@@ -458,6 +654,158 @@ impl CachedMediaBody for Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn restart_cannot_complete_filled_cache_after_unvalidated_response_tail() {
+        let hint = MediaCacheHint::default();
+        let cache = AudioCache::new(
+            reqwest::Client::new(),
+            "http://invalid.invalid".into(),
+            hint.clone(),
+        );
+        {
+            let mut data = cache.shared.data.lock().unwrap();
+            // A backfill filled the last hole, then the transport failed while
+            // traversing an already cached tail. Byte count is not validation.
+            data.phase = Phase::Streaming;
+            data.length = BLOCK * 2;
+            data.blocks = vec![vec![42; BLOCK], vec![42; BLOCK]];
+            data.resume_index = 1;
+        }
+        assert!(download(
+            &cache.http,
+            &cache.url,
+            &cache.shared,
+            cache.limit,
+            cache.idle_timeout
+        )
+        .await
+        .is_err());
+        assert!(cache.shared.data.lock().unwrap().integrity_failed);
+        assert!(!hint.is_complete());
+    }
+
+    #[tokio::test]
+    async fn backfill_drains_overlapping_cached_blocks_without_shifting_bytes() {
+        let payload: Vec<u8> = (0..UPSTREAM_RANGE * 5 / 2)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let origin = origin(&payload, Some(payload.len()), 200).await;
+        origin.release.send(true).unwrap();
+        let cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        assert_eq!(
+            read_all(open(&cache, Some("bytes=0-9"), Method::GET).await).await,
+            payload[..10]
+        );
+        let tail_start = UPSTREAM_RANGE * 3 / 2;
+        let tail_range = format!("bytes={tail_start}-");
+        assert_eq!(
+            read_all(open(&cache, Some(&tail_range), Method::GET).await).await,
+            payload[tail_start..]
+        );
+        assert!(!cache.hint.is_complete());
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            payload
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cache.hint.is_complete() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *origin.ranges.lock().unwrap(),
+            [
+                (0, UPSTREAM_RANGE),
+                (tail_start, payload.len()),
+                (UPSTREAM_RANGE, 2 * UPSTREAM_RANGE),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_rejects_bytes_inconsistent_with_the_already_cached_prefix() {
+        let payload = vec![7; UPSTREAM_RANGE * 5 / 2];
+        let origin = origin(&payload, Some(payload.len()), 200).await;
+        origin.release.send(true).unwrap();
+        let (_ready, ready) = watch::channel(true);
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(Arc::new(Refresh {
+            url: origin.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready,
+        }));
+        let cache = AudioCache::new(reqwest::Client::new(), origin.url.clone(), hint);
+        read_all(open(&cache, Some("bytes=0-9"), Method::GET).await).await;
+        let tail_start = UPSTREAM_RANGE * 3 / 2;
+        let tail_range = format!("bytes={tail_start}-");
+        read_all(open(&cache, Some(&tail_range), Method::GET).await).await;
+        // Simulate bytes previously delivered by a different representation.
+        // Backfill must compare its overlap, never silently overwrite it.
+        cache.shared.data.lock().unwrap().blocks[tail_start / BLOCK][0] ^= 1;
+        let mut response = open(&cache, None, Method::GET).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match response.body.as_mut().unwrap().next_chunk().await {
+                    Ok(Some(_)) => {}
+                    // Readers can finish from existing bytes before the
+                    // downloader validates the tail; cache completion cannot.
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cache.has_failed() {
+                assert!(
+                    !cache.hint.is_complete(),
+                    "inconsistent overlap was accepted"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cache.has_failed());
+        assert!(cache.hint.is_failed());
+        assert!(!cache.hint.is_complete());
+    }
+
+    #[test]
+    fn transport_cause_extracts_only_safe_io_metadata() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("error formatting can expose credentials")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = Wrapper(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "private details",
+        ));
+        assert_eq!(
+            transport_io_cause(&error),
+            (Some(std::io::ErrorKind::ConnectionReset), None)
+        );
+        assert_eq!(
+            transport_io_cause(&std::io::Error::from_raw_os_error(104)).1,
+            Some(104)
+        );
+        assert_eq!(transport_io_cause(&std::fmt::Error), (None, None));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -689,6 +1037,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_block_http_failure_is_a_body_error_not_clean_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let origin = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let count = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+                assert!(request.contains(&format!(
+                    "range: bytes={}-{}",
+                    index * UPSTREAM_RANGE,
+                    (index + 1) * UPSTREAM_RANGE - 1
+                )));
+                if index == 0 {
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {UPSTREAM_RANGE}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                        UPSTREAM_RANGE - 1,
+                        UPSTREAM_RANGE * 2
+                    );
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(&vec![42; UPSTREAM_RANGE]).await.unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await.unwrap();
+                }
+            }
+        });
+        let cache = AudioCache::new(reqwest::Client::new(), url, MediaCacheHint::default());
+        let mut response = open(&cache, None, Method::GET).await;
+        assert_eq!(
+            response.headers[header::CONTENT_LENGTH],
+            (UPSTREAM_RANGE * 2).to_string()
+        );
+        let body = response.body.as_mut().unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut received = 0;
+            loop {
+                match body.next_chunk().await {
+                    Ok(Some(bytes)) => received += bytes.len(),
+                    Ok(None) => panic!("failed cache must not report clean EOF"),
+                    Err(_) => break received,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, UPSTREAM_RANGE);
+        assert!(cache.hint.is_failed());
+        assert!(!cache.hint.is_complete());
+        assert!(cache.has_failed());
+        assert_eq!(open(&cache, None, Method::GET).await.status, 502);
+        cache.cancel();
+        assert!(
+            !cache.has_failed(),
+            "cancellation is not an upstream failure"
+        );
+        origin.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stalled_download_fails_and_releases_partial_bytes() {
         let origin = origin(b"abcdefghij", Some(10), 200).await;
         let mut cache = AudioCache::new(
@@ -735,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demand_fetches_only_needed_blocks_and_retains_sparse_seeks() {
+    async fn drains_open_response_and_reuses_cached_bytes_for_sparse_seeks() {
         let payload: Vec<u8> = (0..BLOCK * 5 + 13).map(|i| (i % 251) as u8).collect();
         let origin = origin(&payload, Some(payload.len()), 200).await;
         origin.release.send(true).unwrap();
@@ -752,7 +1161,7 @@ mod tests {
         assert_eq!(
             origin.count.load(Ordering::SeqCst),
             1,
-            "idle cache must not download ahead"
+            "one native-sized response covers this title"
         );
         let tail = format!("bytes={}-", BLOCK * 5);
         let (a, b) = tokio::join!(
@@ -763,16 +1172,13 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(
             origin.count.load(Ordering::SeqCst),
-            2,
-            "concurrent reads share one fetch"
+            1,
+            "concurrent reads reuse the promptly completed response"
         );
-        assert_eq!(
-            *origin.ranges.lock().unwrap(),
-            vec![(0, BLOCK), (BLOCK * 5, payload.len())]
-        );
+        assert_eq!(*origin.ranges.lock().unwrap(), vec![(0, payload.len())]);
         assert!(
-            !cache.hint.is_complete(),
-            "a hole is not a complete cached song"
+            cache.hint.is_complete(),
+            "the open response should finish even without more local demand"
         );
         assert_eq!(
             read_all(open(&cache, None, Method::GET).await).await,
@@ -785,13 +1191,363 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(origin.count.load(Ordering::SeqCst), 6);
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
         origin.task.abort();
         assert_eq!(
             read_all(open(&cache, None, Method::GET).await).await,
             payload
         );
-        assert_eq!(origin.count.load(Ordering::SeqCst), 6);
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sequential_reads_reuse_response_and_pause_is_not_a_network_stall() {
+        let payload = vec![42; UPSTREAM_RANGE + BLOCK * 4 + 13];
+        let origin = origin(&payload, Some(payload.len()), 200).await;
+        origin.release.send(true).unwrap();
+        let mut cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        cache.idle_timeout = Duration::from_millis(30);
+        assert_eq!(
+            read_all(open(&cache, Some(&format!("bytes=0-{}", BLOCK - 1)), Method::GET).await)
+                .await,
+            payload[..BLOCK]
+        );
+        // Finish the open response, then wait without another HTTP request.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!cache.has_failed());
+        assert!(!cache.hint.is_complete());
+        assert_eq!(
+            cache
+                .shared
+                .data
+                .lock()
+                .unwrap()
+                .blocks
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            UPSTREAM_RANGE,
+            "idle cache drains exactly the open upstream response"
+        );
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_all(open(&cache, Some(&format!("bytes={BLOCK}-")), Method::GET).await).await,
+            payload[BLOCK..]
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cache.hint.is_complete() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            origin.count.load(Ordering::SeqCst),
+            2,
+            "crossing the completed upstream range opens only one new response"
+        );
+        assert_eq!(
+            *origin.ranges.lock().unwrap(),
+            [(0, UPSTREAM_RANGE), (UPSTREAM_RANGE, payload.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_continuous_response_fails_without_waiting_for_later_demand() {
+        let origin = origin(&vec![42; BLOCK + 13], Some(BLOCK * 3), 200).await;
+        origin.release.send(true).unwrap();
+        let cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        let mut response = open(&cache, None, Method::GET).await;
+        let body = response.body.as_mut().unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut received = 0;
+            loop {
+                match body.next_chunk().await {
+                    Ok(Some(bytes)) => received += bytes.len(),
+                    Ok(None) => panic!("truncated response must not produce EOF"),
+                    Err(_) => break received,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(received <= BLOCK + 13);
+        assert!(cache.has_failed());
+        assert!(!cache.hint.is_complete());
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct Refresh {
+        url: String,
+        calls: AtomicUsize,
+        ready: watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl vibecast_sdk::MediaSourceRefresh for Refresh {
+        async fn refresh(&self) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut ready = self.ready.clone();
+            while !*ready.borrow_and_update() {
+                ready.changed().await.ok()?;
+            }
+            Some(self.url.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_reader_and_partial_bytes_before_decoder_eof() {
+        let payload: Vec<u8> = (0..BLOCK * 3 + 19).map(|i| (i % 251) as u8).collect();
+        let broken = origin(&payload[..BLOCK + 13], Some(payload.len()), 200).await;
+        broken.release.send(true).unwrap();
+        let fresh = origin(&payload, Some(payload.len()), 200).await;
+        fresh.release.send(true).unwrap();
+        let (ready, gate) = watch::channel(false);
+        let refresh = Arc::new(Refresh {
+            url: fresh.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        });
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(refresh.clone());
+        let cache = AudioCache::new(reqwest::Client::new(), broken.url.clone(), hint.clone());
+        let mut response = open(&cache, None, Method::GET).await;
+        let body = response.body.as_mut().unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while refresh.calls.load(Ordering::SeqCst) == 0 {
+                tokio::select! {
+                    result = body.next_chunk() => bytes.extend(result.unwrap().unwrap()),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !cache.has_failed(),
+            "refresh must not close the playing response"
+        );
+        assert!(!hint.is_failed());
+        assert_eq!(hint.recovery_attempts(), 1);
+        assert_eq!(
+            cache
+                .shared
+                .data
+                .lock()
+                .unwrap()
+                .blocks
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            BLOCK + 13
+        );
+        ready.send(true).unwrap();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(2), body.next_chunk())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            bytes.extend(chunk);
+        }
+        assert_eq!(
+            bytes, payload,
+            "partial block must resume without duplicated/skipped bytes"
+        );
+        assert_eq!(*fresh.ranges.lock().unwrap(), [(BLOCK + 13, payload.len())]);
+        assert_eq!(refresh.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_changed_length_and_reserves_decoder_reload() {
+        let broken = origin(&vec![42; BLOCK + 13], Some(BLOCK * 3), 200).await;
+        broken.release.send(true).unwrap();
+        let wrong = origin(&vec![42; BLOCK * 3 + 1], Some(BLOCK * 3 + 1), 200).await;
+        wrong.release.send(true).unwrap();
+        let (_ready, gate) = watch::channel(true);
+        let refresh = Arc::new(Refresh {
+            url: wrong.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        });
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(refresh.clone());
+        let cache = AudioCache::new(reqwest::Client::new(), broken.url.clone(), hint.clone());
+        let mut response = open(&cache, None, Method::GET).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match response.body.as_mut().unwrap().next_chunk().await {
+                    Ok(Some(_)) => {}
+                    Err(_) => break,
+                    Ok(None) => panic!("changed representation cannot be spliced into old bytes"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(refresh.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hint.recovery_attempts(), 1);
+        assert!(cache.has_failed());
+        assert_eq!(wrong.count.load(Ordering::SeqCst), 1);
+        assert!(hint.try_recovery(), "one decoder reload must remain");
+        assert!(!hint.try_recovery(), "no third recovery round");
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_pending_refresh_without_new_origin_request() {
+        let broken = origin(b"x", Some(20), 200).await;
+        broken.release.send(true).unwrap();
+        let fresh = origin(&[42; 20], Some(20), 200).await;
+        let (ready, gate) = watch::channel(false);
+        let refresh = Arc::new(Refresh {
+            url: fresh.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        });
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(refresh.clone());
+        let cache = AudioCache::new(reqwest::Client::new(), broken.url.clone(), hint.clone());
+        let mut response = open(&cache, None, Method::GET).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while refresh.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cache.cancel();
+        ready.send(true).unwrap();
+        assert!(response.body.as_mut().unwrap().next_chunk().await.is_err());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(fresh.count.load(Ordering::SeqCst), 0);
+        assert_eq!(hint.recovery_attempts(), 1);
+        assert!(hint.is_failed());
+    }
+
+    #[tokio::test]
+    async fn initial_forbidden_response_recovers_inside_same_pending_request() {
+        let rejected = origin(b"", Some(0), 403).await;
+        let fresh = origin(b"playable audio", Some(14), 200).await;
+        fresh.release.send(true).unwrap();
+        let (_ready, gate) = watch::channel(true);
+        let refresh = Arc::new(Refresh {
+            url: fresh.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        });
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(refresh.clone());
+        let cache = AudioCache::new(reqwest::Client::new(), rejected.url.clone(), hint.clone());
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            b"playable audio"
+        );
+        assert_eq!(refresh.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hint.recovery_attempts(), 1);
+        assert!(!hint.is_failed());
+    }
+
+    #[tokio::test]
+    async fn inherited_selection_budget_reserves_remaining_round_for_decoder() {
+        let rejected = origin(b"", Some(0), 403).await;
+        let (_ready, gate) = watch::channel(true);
+        let refresh = Arc::new(Refresh {
+            url: rejected.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        });
+        let hint = MediaCacheHint::default();
+        hint.set_recovery_attempts(1);
+        hint.set_refresh(refresh.clone());
+        let cache = AudioCache::new(reqwest::Client::new(), rejected.url.clone(), hint.clone());
+        assert_eq!(open(&cache, None, Method::GET).await.status, 502);
+        assert_eq!(refresh.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hint.recovery_attempts(), 1);
+        assert!(hint.try_recovery());
+        assert!(!hint.try_recovery());
+        hint.set_recovery_attempts(0);
+        assert_eq!(
+            hint.recovery_attempts(),
+            2,
+            "replacement must not replenish selection budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_range_ignoring_origin_bypasses_to_fresh_not_rejected_url() {
+        let rejected = origin(b"", Some(0), 403).await;
+        let fresh = origin_with_ranges(b"audio", Some(5), 200, false).await;
+        let (_ready, gate) = watch::channel(true);
+        let hint = MediaCacheHint::default();
+        hint.set_refresh(Arc::new(Refresh {
+            url: fresh.url.clone(),
+            calls: AtomicUsize::new(0),
+            ready: gate,
+        }));
+        let cache = AudioCache::new(reqwest::Client::new(), rejected.url.clone(), hint);
+        let response = open(&cache, None, Method::GET).await;
+        assert_eq!(response.status, 307);
+        assert_eq!(response.headers[header::LOCATION], fresh.url);
+    }
+
+    #[tokio::test]
+    async fn sequential_demand_crosses_upstream_range_boundary() {
+        let payload = vec![42; UPSTREAM_RANGE + BLOCK + 7];
+        let origin = origin(&payload, Some(payload.len()), 200).await;
+        origin.release.send(true).unwrap();
+        let cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            payload
+        );
+        assert_eq!(origin.count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *origin.ranges.lock().unwrap(),
+            [(0, UPSTREAM_RANGE), (UPSTREAM_RANGE, payload.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_response_while_waiting_for_demand() {
+        let payload = vec![42; BLOCK * 4];
+        let origin = origin(&payload, Some(payload.len()), 200).await;
+        origin.release.send(true).unwrap();
+        let cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        assert_eq!(
+            read_all(open(&cache, Some(&format!("bytes=0-{}", BLOCK - 1)), Method::GET).await)
+                .await,
+            payload[..BLOCK]
+        );
+        // Session teardown releases retained bytes and any active response.
+        tokio::task::yield_now().await;
+        cache.cancel();
+        assert!(cache.task.lock().unwrap().is_none());
+        assert_eq!(cache.shared.data.lock().unwrap().blocks.capacity(), 0);
+        assert!(cache.hint.is_failed());
+        assert!(!cache.has_failed());
+        assert_eq!(open(&cache, None, Method::GET).await.status, 502);
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -810,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires installed mpv; silent real-decoder buffering check"]
-    async fn real_mpv_does_not_eagerly_fetch_whole_song() {
+    async fn real_mpv_pause_does_not_leave_origin_response_open() {
         let audio_size = 180_u32 * 8_000 * 2;
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
@@ -902,11 +1658,12 @@ mod tests {
         player.kill().unwrap();
         player.wait().unwrap();
         server.abort();
-        assert!(bytes > 0, "decoder did not load");
-        assert!(
-            bytes < wav.len() / 2,
-            "paused decoder fetched {bytes}/{} bytes",
-            wav.len()
+        assert_eq!(
+            bytes,
+            wav.len(),
+            "finish the current native-sized response even while mpv is paused"
         );
+        assert!(cache.hint.is_complete());
+        assert_eq!(origin.count.load(Ordering::SeqCst), 1);
     }
 }

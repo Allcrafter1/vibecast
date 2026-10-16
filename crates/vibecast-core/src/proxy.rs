@@ -29,6 +29,37 @@ use vibecast_sdk::{
     LicenseRoute as SdkLicenseRoute, PlaybackMedia, PlaybackStream, StreamSource,
 };
 
+// These endpoints buffer structured documents, never progressive media.
+const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+enum ProxyBodyError {
+    #[error("upstream request failed")]
+    Request(#[from] reqwest::Error),
+    #[error("upstream document exceeds size limit")]
+    TooLarge,
+}
+
+async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ProxyBodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ProxyBodyError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit - body.len() {
+            return Err(ProxyBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// A resolved DRM license target.
 pub(crate) struct LicenseRoute {
     pub system: DrmSystem,
@@ -113,7 +144,6 @@ impl LicenseHandler for SessionProxy {
             session_id = %request.session_id,
             req_bytes,
             ?system,
-            upstream = %upstream_url,
             "license request forwarding"
         );
         let started = tokio::time::Instant::now();
@@ -203,8 +233,8 @@ impl ManifestHandler for SessionProxy {
         let builder = self.ctx.http.request(method, upstream_url).headers(headers);
         let response = match builder.send().await {
             Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(%error, route = %upstream_url, "manifest fetch failed");
+            Err(_) => {
+                tracing::warn!("manifest fetch failed");
                 return Ok(error_manifest(502, "manifest request failed"));
             }
         };
@@ -233,8 +263,8 @@ impl ManifestHandler for SessionProxy {
             });
         }
 
-        let mut body = match response.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
+        let mut body = match bounded_body(response, MAX_PROXY_BODY_BYTES).await {
+            Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%error, "manifest body read failed");
                 return Ok(error_manifest(502, "manifest request failed"));
@@ -266,7 +296,7 @@ impl DefaultLicenseForwarder {
         &self,
         request: &LicenseRequest,
         route: &SdkLicenseRoute,
-    ) -> Result<LicenseResponse, reqwest::Error> {
+    ) -> Result<LicenseResponse, ProxyBodyError> {
         // Route headers take precedence; add non-hop-by-hop request headers that
         // the route did not already set.
         let mut headers = route.headers.clone();
@@ -298,7 +328,7 @@ impl DefaultLicenseForwarder {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let body = response.bytes().await?.to_vec();
+        let body = bounded_body(response, MAX_PROXY_BODY_BYTES).await?;
         Ok(LicenseResponse {
             body,
             content_type,
@@ -313,7 +343,7 @@ impl LicenseForwarder for DefaultLicenseForwarder {
         match self.post(&request, &route).await {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(%error, route = %route.upstream_url, "license forward failed");
+                tracing::warn!(%error, "license forward failed");
                 LicenseResponse {
                     body: b"app license resolution failed".to_vec(),
                     content_type: "application/octet-stream".to_string(),
@@ -452,6 +482,7 @@ pub(crate) fn rewrite_streams(
 /// Convert SDK media into the bridge's player wire payload.
 pub(crate) fn to_payload(media: &PlaybackMedia) -> PlaybackMediaPayload {
     PlaybackMediaPayload {
+        media_session_id: None,
         streams: media
             .streams
             .iter()
@@ -499,6 +530,50 @@ mod tests {
     use vibecast_sdk::{
         LoadRequest, MediaResolveError, NoopSenderChannel, ReceiverContext, StreamType,
     };
+
+    #[tokio::test]
+    async fn proxy_document_limit_rejects_declared_and_streaming_oversize() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (framing, payload, accepted) in [
+            ("Content-Length: 5\r\n", "hello", true),
+            // Reject from headers even if the oversized body never arrives.
+            ("Content-Length: 6\r\n", "", false),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/document?token=private",
+                listener.local_addr().unwrap()
+            );
+            let origin = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{framing}\r\n{payload}").as_bytes())
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let response = reqwest::Client::new().get(url).send().await.unwrap();
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), bounded_body(response, 5))
+                    .await
+                    .unwrap();
+            if accepted {
+                assert_eq!(result.unwrap(), b"hello");
+            } else {
+                assert!(matches!(result, Err(ProxyBodyError::TooLarge)));
+            }
+            origin.abort();
+        }
+    }
 
     fn inline_media() -> PlaybackMedia {
         PlaybackMedia::new(

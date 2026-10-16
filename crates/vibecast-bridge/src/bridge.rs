@@ -13,8 +13,11 @@
 //! (session ids are globally unique), shared across all players' receivers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
@@ -26,7 +29,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use vibecast_player_api::headers::{filter_upstream_headers, filter_upstream_response_headers};
@@ -63,6 +67,92 @@ async fn bind_player_listener(host: &str, port: u16) -> std::io::Result<tokio::n
         }
     }
     tokio::net::TcpListener::bind((host, port)).await
+}
+
+// Axum owns detached connection tasks. Cancelling only its accept task cannot
+// close a slow HTTP reader; wake every accepted socket when this run stops.
+struct BridgeListener {
+    inner: tokio::net::TcpListener,
+    stopped: watch::Receiver<u64>,
+    generation: u64,
+}
+
+struct BridgeSocket {
+    inner: tokio::net::TcpStream,
+    stopped: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    closed: bool,
+}
+
+impl BridgeSocket {
+    fn is_stopped(&mut self, cx: &mut Context<'_>) -> bool {
+        if !self.closed {
+            self.closed = self.stopped.as_mut().poll(cx).is_ready();
+        }
+        self.closed
+    }
+}
+
+impl axum::serve::Listener for BridgeListener {
+    type Io = BridgeSocket;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (inner, address) = axum::serve::Listener::accept(&mut self.inner).await;
+        let mut stopped = self.stopped.clone();
+        let generation = self.generation;
+        let stopped = Box::pin(async move {
+            if *stopped.borrow() == generation {
+                let _ = stopped.changed().await;
+            }
+        });
+        (
+            BridgeSocket {
+                inner,
+                stopped,
+                closed: false,
+            },
+            address,
+        )
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+impl AsyncRead for BridgeSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.is_stopped(cx) {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BridgeSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.is_stopped(cx) {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.is_stopped(cx) {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Lifecycle events emitted by the bridge as players connect and disconnect.
@@ -102,14 +192,32 @@ pub enum PlayerEvent {
 /// A per-player command sink: serializes commands to one socket's out channel.
 struct PlayerSink {
     out: mpsc::Sender<String>,
+    closing: watch::Sender<bool>,
 }
+
+const PLAYER_QUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+const PLAYER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const PLAYER_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 impl Player for PlayerSink {
     async fn send(&self, command: PlayerCommand) {
         match serde_json::to_string(&ServerMessage::Playback(command)) {
             Ok(text) => {
-                let _ = self.out.send(text).await;
+                let mut closing = self.closing.subscribe();
+                if *closing.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = closing.changed() => {},
+                    result = tokio::time::timeout(PLAYER_QUEUE_TIMEOUT, self.out.send(text)) => {
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::warn!("player command queue unavailable; closing player connection");
+                            self.closing.send_replace(true);
+                        }
+                    }
+                }
             }
             Err(error) => tracing::error!(%error, "failed to serialize player command"),
         }
@@ -132,6 +240,7 @@ struct BridgeState {
     epochs: Arc<AtomicU64>,
     /// Current writable connection epoch for each stable player id.
     current_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    stopped: watch::Sender<u64>,
 }
 
 impl BridgeState {
@@ -163,6 +272,18 @@ pub struct PlayerBridge {
     state: BridgeState,
     bind_host: Arc<str>,
     tasks: Mutex<Option<RunningTasks>>,
+    lifecycle: tokio::sync::Mutex<()>,
+}
+
+impl Drop for PlayerBridge {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.tasks.get_mut().unwrap().take() {
+            let _ = tasks.shutdown.send(());
+            self.state
+                .stopped
+                .send_modify(|generation| *generation += 1);
+        }
+    }
 }
 
 impl PlayerBridge {
@@ -194,18 +315,21 @@ impl PlayerBridge {
             port: Arc::new(AtomicU16::new(0)),
             epochs: Arc::new(AtomicU64::new(0)),
             current_epochs: Arc::new(Mutex::new(HashMap::new())),
+            stopped: watch::channel(0).0,
         };
 
         Self {
             state,
             bind_host: Arc::from(host.as_str()),
             tasks: Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Bind the listener and start serving. A second call while already running
     /// is a no-op.
     pub async fn start(&self) -> std::io::Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if self.tasks.lock().unwrap().is_some() {
             return Ok(());
         }
@@ -216,6 +340,11 @@ impl PlayerBridge {
         self.state.port.store(port, Ordering::SeqCst);
 
         let app = router(self.state.clone());
+        let listener = BridgeListener {
+            inner: listener,
+            stopped: self.state.stopped.subscribe(),
+            generation: *self.state.stopped.borrow(),
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let server_handle = tokio::spawn(async move {
             let served = axum::serve(listener, app)
@@ -246,16 +375,26 @@ impl PlayerBridge {
     /// Gracefully stop serving, await task completion, and clear session
     /// handlers. Safe to call when not running.
     pub async fn stop(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
         let tasks = self.tasks.lock().unwrap().take();
-        if let Some(tasks) = tasks {
-            let _ = tasks.shutdown.send(());
-            if let Err(error) = tasks.server.await {
-                tracing::warn!(%error, "player bridge server task join failed");
-            }
-        }
+        // Clear ownership before the first await so cancellation cannot leave
+        // stopped session handlers registered in a reusable bridge.
         self.state.port.store(0, Ordering::SeqCst);
         self.state.licenses.lock().unwrap().clear();
         self.state.manifests.lock().unwrap().clear();
+        if let Some(tasks) = tasks {
+            let _ = tasks.shutdown.send(());
+            self.state
+                .stopped
+                .send_modify(|generation| *generation += 1);
+            if let Err(error) = tasks.server.await {
+                tracing::warn!(%error, "player bridge server task join failed");
+            }
+            // Also close upgrades accepted while the HTTP listener was draining.
+            self.state
+                .stopped
+                .send_modify(|generation| *generation += 1);
+        }
         tracing::info!("player bridge stopped");
     }
 
@@ -347,7 +486,24 @@ fn router(state: BridgeState) -> Router {
             "/manifest/{session_id}/{route_path}",
             get(manifest_handler).head(manifest_handler),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cancel_request_on_stop,
+        ))
         .with_state(state)
+}
+
+async fn cancel_request_on_stop(
+    State(state): State<BridgeState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut stopped = state.stopped.subscribe();
+    tokio::select! {
+        biased;
+        _ = stopped.changed() => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        response = next.run(request) => response,
+    }
 }
 
 #[cfg(feature = "browser-player")]
@@ -361,7 +517,8 @@ async fn serve_script() -> impl IntoResponse {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<BridgeState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let stopped = state.stopped.subscribe();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, stopped))
 }
 
 async fn settings_snapshot(
@@ -493,11 +650,18 @@ async fn apply_settings_update(
     ServerMessage::SettingsUpdateResult(SettingsUpdateResultMessage::new(request_id, status, app))
 }
 
-async fn handle_socket(socket: WebSocket, state: BridgeState) {
+async fn handle_socket(socket: WebSocket, state: BridgeState, mut stopped: watch::Receiver<u64>) {
+    let generation = *stopped.borrow();
     let (mut sink, mut stream) = socket.split();
 
     // The first frame must be a `register` client message.
-    let Some(Ok(Message::Text(first_frame))) = stream.next().await else {
+    let first_frame = tokio::select! {
+        biased;
+        _ = stopped.changed() => return,
+        _ = tokio::time::sleep(PLAYER_REGISTER_TIMEOUT) => return,
+        frame = stream.next() => frame,
+    };
+    let Some(Ok(Message::Text(first_frame))) = first_frame else {
         return;
     };
     let Ok(ClientMessage::Register {
@@ -561,7 +725,14 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
             return;
         }
     };
-    if sink.send(Message::Text(snapshot.into())).await.is_err() {
+    if !matches!(
+        tokio::time::timeout(
+            PLAYER_WRITE_TIMEOUT,
+            sink.send(Message::Text(snapshot.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
 
@@ -574,35 +745,43 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
 
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
     let (reports_tx, reports_rx) = mpsc::channel::<PlayerReport>(64);
-    let player: Arc<dyn Player> = Arc::new(PlayerSink { out: out_tx });
-    let previous_epoch = state
-        .current_epochs
-        .lock()
-        .unwrap()
-        .insert(player_id.clone(), epoch);
-
-    if state
-        .events
-        .send(PlayerEvent::Registered {
-            registration: Box::new(registration),
-            player,
-            reports: reports_rx,
-            settings: player_settings.clone(),
-            epoch,
-        })
-        .await
-        .is_err()
-    {
-        let mut current_epochs = state.current_epochs.lock().unwrap();
-        if current_epochs.get(&player_id).copied() == Some(epoch) {
-            match previous_epoch {
-                Some(previous_epoch) => {
-                    current_epochs.insert(player_id, previous_epoch);
-                }
-                None => {
-                    current_epochs.remove(&player_id);
-                }
-            }
+    let (closing, mut closed) = watch::channel(false);
+    let player: Arc<dyn Player> = Arc::new(PlayerSink {
+        out: out_tx,
+        closing: closing.clone(),
+    });
+    // Reserve event capacity before changing ownership. Claiming the epoch
+    // then awaiting send allowed two concurrent registrations to reach the
+    // manager in the opposite order (and rollback could revive a dead owner).
+    let permit = tokio::select! {
+        biased;
+        _ = stopped.changed() => None,
+        result = tokio::time::timeout(PLAYER_WRITE_TIMEOUT, state.events.reserve()) => result.ok().and_then(Result::ok),
+    };
+    let registered = if let Some(permit) = permit {
+        let mut epochs = state.current_epochs.lock().unwrap();
+        if epochs
+            .get(&player_id)
+            .is_some_and(|current| *current >= epoch)
+        {
+            false
+        } else {
+            epochs.insert(player_id.clone(), epoch);
+            permit.send(PlayerEvent::Registered {
+                registration: Box::new(registration),
+                player,
+                reports: reports_rx,
+                settings: player_settings.clone(),
+                epoch,
+            });
+            true
+        }
+    } else {
+        false
+    };
+    if !registered {
+        for task in settings_watch_tasks {
+            task.abort();
         }
         return;
     }
@@ -610,10 +789,13 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
 
     loop {
         tokio::select! {
+            _ = closed.changed() => break,
+            _ = stopped.changed() => break,
             outgoing = out_rx.recv() => {
                 match outgoing {
                     Some(text) => {
-                        if sink.send(Message::Text(text.into())).await.is_err() {
+                        if !matches!(tokio::time::timeout(PLAYER_WRITE_TIMEOUT, sink.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
+                            tracing::warn!(player_id, "player socket write failed or timed out");
                             break;
                         }
                     }
@@ -644,7 +826,7 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
                 let snapshot = ServerMessage::SettingsSnapshot(snapshot);
                 match serde_json::to_string(&snapshot) {
                     Ok(text) => {
-                        if sink.send(Message::Text(text.into())).await.is_err() {
+                        if !matches!(tokio::time::timeout(PLAYER_WRITE_TIMEOUT, sink.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
                             break;
                         }
                     }
@@ -659,14 +841,20 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
                             | Ok(message @ ClientMessage::Artwork { .. })
                             | Ok(message @ ClientMessage::Error { .. }) => {
                                 if let Some(report) = message.into_report() {
-                                    let _ = reports_tx.send(report).await;
+                                    if !matches!(tokio::time::timeout(PLAYER_QUEUE_TIMEOUT, reports_tx.send(report)).await, Ok(Ok(()))) {
+                                        tracing::warn!(player_id, "player report queue unavailable; closing connection");
+                                        break;
+                                    }
                                 }
                             }
                             Ok(message @ ClientMessage::ControlRequest { .. })
                                 if protocol_version >= 2 =>
                             {
                                 if let Some(report) = message.into_report() {
-                                    let _ = reports_tx.send(report).await;
+                                    if !matches!(tokio::time::timeout(PLAYER_QUEUE_TIMEOUT, reports_tx.send(report)).await, Ok(Ok(()))) {
+                                        tracing::warn!(player_id, "player control queue unavailable; closing connection");
+                                        break;
+                                    }
                                 }
                             }
                             Ok(ClientMessage::ControlRequest { .. }) => {
@@ -699,7 +887,7 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
                                 }
                                 match serde_json::to_string(&response) {
                                     Ok(text) => {
-                                        if sink.send(Message::Text(text.into())).await.is_err() {
+                                        if !matches!(tokio::time::timeout(PLAYER_WRITE_TIMEOUT, sink.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
                                             break;
                                         }
                                     }
@@ -722,20 +910,35 @@ async fn handle_socket(socket: WebSocket, state: BridgeState) {
         }
     }
 
+    closing.send_replace(true);
+    drop(out_rx);
+    drop(reports_tx);
+    drop(sink);
+    drop(stream);
     for task in settings_watch_tasks {
         task.abort();
     }
 
-    let _ = state
-        .events
-        .send(PlayerEvent::Disconnected {
-            player_id: player_id.clone(),
-            epoch,
-        })
-        .await;
-    let mut current_epochs = state.current_epochs.lock().unwrap();
-    if current_epochs.get(&player_id).copied() == Some(epoch) {
-        current_epochs.remove(&player_id);
+    {
+        let mut current_epochs = state.current_epochs.lock().unwrap();
+        if current_epochs.get(&player_id).copied() == Some(epoch) {
+            current_epochs.remove(&player_id);
+        }
+    }
+    let event = PlayerEvent::Disconnected {
+        player_id: player_id.clone(),
+        epoch,
+    };
+    if *stopped.borrow() != generation {
+        // The orchestrator may already be shutting down. Do not leave detached
+        // websocket tasks waiting forever for lifecycle-event queue capacity.
+        let _ = state.events.try_send(event);
+    } else {
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => {},
+            _ = state.events.send(event) => {},
+        }
     }
     tracing::info!(player_id = %player_id, "player disconnected");
 }
@@ -784,8 +987,8 @@ async fn license_handler(
             .header(CONTENT_TYPE, response.content_type)
             .body(Body::from(response.body))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        Err(error) => {
-            tracing::warn!(%error, "license request failed");
+        Err(_) => {
+            tracing::warn!("license request failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -879,8 +1082,8 @@ async fn manifest_handler(
                 .body(Body::from(body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        Err(error) => {
-            tracing::warn!(%error, "manifest request failed");
+        Err(_) => {
+            tracing::warn!("manifest request failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -897,6 +1100,191 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     use super::*;
+
+    #[tokio::test]
+    async fn stop_cancels_stalled_http_handler_and_releases_request() {
+        use tokio::io::AsyncWriteExt;
+        struct PendingManifest {
+            entered: tokio::sync::Notify,
+            released: Arc<std::sync::atomic::AtomicBool>,
+        }
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait]
+        impl ManifestHandler for PendingManifest {
+            async fn handle_manifest(
+                &self,
+                _: ManifestProxyRequest,
+            ) -> ProxyResult<ManifestProxyResponse> {
+                let _release = Release(self.released.clone());
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+        let (bridge, _events) = bridge().await;
+        let handler = Arc::new(PendingManifest {
+            entered: tokio::sync::Notify::new(),
+            released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        bridge.register_manifest_handler("pending", handler.clone());
+        bridge.start().await.unwrap();
+        let mut socket =
+            tokio::net::TcpStream::connect(("127.0.0.1", bridge.serving_port().unwrap()))
+                .await
+                .unwrap();
+        socket
+            .write_all(b"GET /manifest/pending/m0.mpd HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handler.entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), bridge.stop())
+            .await
+            .expect("bridge shutdown must cancel a pending proxy handler");
+        assert!(handler.released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_share_one_listener() {
+        let (bridge, _events) = bridge().await;
+        let start = || async {
+            bridge.start().await.unwrap();
+            bridge.serving_port().unwrap()
+        };
+        let (first, second) = tokio::join!(start(), start());
+        assert_eq!(first, second);
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stop_closes_http_connection_with_backpressured_response() {
+        use tokio::io::AsyncWriteExt;
+        struct LargeManifest(tokio::sync::Notify);
+        #[async_trait]
+        impl ManifestHandler for LargeManifest {
+            async fn handle_manifest(
+                &self,
+                _: ManifestProxyRequest,
+            ) -> ProxyResult<ManifestProxyResponse> {
+                self.0.notify_one();
+                Ok(ManifestProxyResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    content_type: "application/dash+xml".into(),
+                    body: vec![b'x'; 4 * 1024 * 1024],
+                })
+            }
+        }
+        let (bridge, _events) = bridge().await;
+        let handler = Arc::new(LargeManifest(tokio::sync::Notify::new()));
+        bridge.register_manifest_handler("large", handler.clone());
+        bridge.start().await.unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(1024).unwrap();
+        let mut socket = socket
+            .connect(([127, 0, 0, 1], bridge.serving_port().unwrap()).into())
+            .await
+            .unwrap();
+        socket
+            .write_all(b"GET /manifest/large/m0.mpd HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handler.0.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), bridge.stop())
+            .await
+            .expect("non-reading HTTP client must not prevent bridge shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropping_bridge_closes_its_listener_and_socket() {
+        let (bridge, _events) = bridge().await;
+        bridge.start().await.unwrap();
+        let port = bridge.serving_port().unwrap();
+        let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{port}/player"))
+            .await
+            .unwrap();
+        drop(bridge);
+        let terminal = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            terminal,
+            None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_socket_task_when_lifecycle_consumer_is_stalled() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        let (mut socket, _) = connect_async(format!(
+            "ws://127.0.0.1:{}/player",
+            bridge.serving_port().unwrap()
+        ))
+        .await
+        .unwrap();
+        socket
+            .send(WsMessage::Text(register_frame().into()))
+            .await
+            .unwrap();
+        let _registered = events.recv().await.unwrap();
+        while bridge.state.events.capacity() > 0 {
+            bridge
+                .state
+                .events
+                .send(PlayerEvent::Disconnected {
+                    player_id: "filler".into(),
+                    epoch: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let state = Arc::downgrade(&bridge.state.licenses);
+        drop(bridge);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed websocket task must release bridge state even if events are full");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unregistered_player_socket_expires_without_lifecycle_event() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        let url = format!("ws://127.0.0.1:{}/player", bridge.state.effective_port());
+        let (mut socket, _) = connect_async(url).await.unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(11), socket.next())
+            .await
+            .expect("unregistered websocket must not live forever");
+        assert!(matches!(
+            terminal,
+            None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))
+        ));
+        assert!(events.try_recv().is_err());
+        assert!(bridge.state.current_epochs.lock().unwrap().is_empty());
+        bridge.stop().await;
+    }
     use tokio::net::TcpStream;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
     use vibecast_messages::{PlayerState, StreamType};
@@ -1080,6 +1468,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_bridge_closes_registered_and_unregistered_sockets_and_can_restart() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        let mut pending = connect(&bridge).await;
+        let mut active = connect(&bridge).await;
+        active
+            .send(WsMessage::Text(register_frame().into()))
+            .await
+            .unwrap();
+        let _ = next_json(&mut active).await;
+        let _registration = events.recv().await.unwrap();
+        bridge.stop().await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap(),
+            Some(PlayerEvent::Disconnected { .. })
+        ));
+        for socket in [&mut pending, &mut active] {
+            let terminal = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .unwrap();
+            assert!(!matches!(terminal, Some(Ok(WsMessage::Text(_)))));
+        }
+        bridge.start().await.unwrap();
+        let mut restarted = connect(&bridge).await;
+        restarted
+            .send(WsMessage::Text(register_frame().into()))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut restarted).await["type"], "settingsSnapshot");
+        assert!(matches!(
+            events.recv().await,
+            Some(PlayerEvent::Registered { .. })
+        ));
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn full_command_queue_closes_player_and_rejects_later_commands() {
+        let (out, mut pending) = mpsc::channel(1);
+        out.send("already queued".to_owned()).await.unwrap();
+        let (closing, closed) = watch::channel(false);
+        let player = PlayerSink { out, closing };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            player.send(PlayerCommand::Pause {
+                session_id: "s1".into(),
+            }),
+        )
+        .await
+        .expect("congested player must not block the hub");
+        assert!(*closed.borrow());
+        assert_eq!(pending.recv().await.as_deref(), Some("already queued"));
+        player
+            .send(PlayerCommand::Play {
+                session_id: "s1".into(),
+            })
+            .await;
+        assert!(
+            pending.try_recv().is_err(),
+            "closed connection must not accept another command"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_reading_player_is_disconnected_after_write_deadline() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        let mut ws = connect(&bridge).await;
+        ws.send(WsMessage::Text(register_frame().into()))
+            .await
+            .unwrap();
+        let _ = next_json(&mut ws).await;
+        let (player, _reports) = match events.recv().await.unwrap() {
+            PlayerEvent::Registered {
+                player, reports, ..
+            } => (player, reports),
+            _ => panic!("expected registration"),
+        };
+        // Exceed the peer's receive window, then never read another WS frame.
+        for _ in 0..8 {
+            let mut payload = media();
+            payload.title = Some("x".repeat(2 * 1024 * 1024));
+            player
+                .send(PlayerCommand::Load {
+                    session_id: "s1".into(),
+                    media: payload,
+                })
+                .await;
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(7), events.recv())
+                .await
+                .unwrap(),
+            Some(PlayerEvent::Disconnected { .. })
+        ));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            player.send(PlayerCommand::Stop {
+                session_id: "s1".into(),
+            }),
+        )
+        .await
+        .expect("stalled socket must not keep the command sink blocked");
+        drop(ws);
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_report_consumer_disconnects_socket_and_releases_command_sink() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        let mut ws = connect(&bridge).await;
+        ws.send(WsMessage::Text(register_frame().into()))
+            .await
+            .unwrap();
+        let _ = next_json(&mut ws).await;
+        let (player, _unread_reports) = match events.recv().await.unwrap() {
+            PlayerEvent::Registered {
+                player, reports, ..
+            } => (player, reports),
+            _ => panic!("expected registration"),
+        };
+        for _ in 0..65 {
+            ws.send(WsMessage::Text(json!({
+                "type": "state", "sessionId": "s1", "playerState": "PLAYING", "currentTime": 12.0
+            }).to_string().into())).await.unwrap();
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap(),
+            Some(PlayerEvent::Disconnected { .. })
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(1), ws.next())
+            .await
+            .unwrap();
+        assert!(!matches!(terminal, Some(Ok(WsMessage::Text(_)))));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            player.send(PlayerCommand::Stop {
+                session_id: "s1".into(),
+            }),
+        )
+        .await
+        .expect("disconnected player sink must return promptly");
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
     async fn registration_delivers_capabilities_command_sink_and_reports() {
         let (bridge, mut events) = bridge().await;
         bridge.start().await.expect("start");
@@ -1186,6 +1725,7 @@ mod tests {
             PlayerReport::ControlRequest {
                 session_id,
                 control: vibecast_player_api::PlayerControlRequest::Next,
+                ..
             } if session_id == "s1"
         ));
 
@@ -1549,6 +2089,89 @@ mod tests {
 
         drop(ws2);
         bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_older_registration_cannot_displace_a_newer_epoch() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        // Model an earlier socket still awaiting its settings/snapshot while
+        // a later registration has already claimed this stable player id.
+        bridge
+            .state
+            .current_epochs
+            .lock()
+            .unwrap()
+            .insert("dup".into(), 100);
+        let mut ws = connect(&bridge).await;
+        ws.send(WsMessage::Text(register_frame_with_id("dup").into()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "stale registration must not reach the receiver manager"
+        );
+        assert_eq!(
+            bridge.state.current_epochs.lock().unwrap().get("dup"),
+            Some(&100)
+        );
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn backpressured_registration_keeps_previous_owner_until_event_is_queued() {
+        let (bridge, mut events) = bridge().await;
+        bridge.start().await.unwrap();
+        bridge
+            .state
+            .current_epochs
+            .lock()
+            .unwrap()
+            .insert("dup".into(), 100);
+        bridge.state.epochs.store(101, Ordering::Relaxed);
+        while bridge
+            .state
+            .events
+            .try_send(PlayerEvent::Disconnected {
+                player_id: "filler".into(),
+                epoch: 0,
+            })
+            .is_ok()
+        {}
+        let mut ws = connect(&bridge).await;
+        ws.send(WsMessage::Text(register_frame_with_id("dup").into()))
+            .await
+            .unwrap();
+        ws.next().await.unwrap().unwrap(); // settings snapshot precedes registration
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            bridge.state.current_epochs.lock().unwrap().get("dup"),
+            Some(&100)
+        );
+        let (player, reports) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let PlayerEvent::Registered {
+                    epoch,
+                    player,
+                    reports,
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(epoch, 101);
+                    break (player, reports);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            bridge.state.current_epochs.lock().unwrap().get("dup"),
+            Some(&101)
+        );
+        bridge.stop().await;
+        drop((player, reports));
     }
 
     struct EchoLicense;

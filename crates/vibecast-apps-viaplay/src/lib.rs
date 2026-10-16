@@ -1126,6 +1126,7 @@ mod tests {
                     current_time: 260.9,
                     duration: Some(2535.48),
                     idle_reason: None,
+                    media_recovery_attempts: 0,
                 },
             )
             .await;

@@ -161,6 +161,7 @@ enum AppPlaybackCommand {
 /// The (spawned) result of resolving media for one LOAD request.
 struct MediaResolved {
     session_id: String,
+    generation: u64,
     request_id: i64,
     connection_id: u64,
     sender_id: String,
@@ -275,8 +276,25 @@ async fn run_app_session(app: Arc<dyn AppSession>, mut jobs: mpsc::Receiver<AppJ
     }
 }
 
+#[derive(Default)]
+struct PendingLoadControls {
+    autoplay: Option<bool>,
+    position: Option<f64>,
+}
+
 /// A running app session registered as a Cast transport (id == transport id).
 struct Session {
+    failed_cache_eof: bool,
+    // Retain the source retry count after an error evicts the cache.
+    media_recovery_attempts: u8,
+    resolve_generation: u64,
+    resolve_task: Option<tokio::task::JoinHandle<()>>,
+    pending_load_controls: Option<PendingLoadControls>,
+    callback_task: tokio::task::JoinHandle<()>,
+    proxy: Arc<dyn ProxyRegistrar>,
+    /// Displaced owners remain revoked if their app channel auto-reconnects.
+    /// Other subscribed connections may control the current media as observers.
+    superseded_senders: HashSet<u64>,
     audio_cache: Option<Arc<crate::audio_cache::AudioCache>>,
     app_id: String,
     app_key: String,
@@ -291,6 +309,28 @@ struct Session {
     jobs: mpsc::Sender<AppJob>,
 }
 
+impl Session {
+    fn cancel_resolution(&mut self) {
+        self.pending_load_controls = None;
+        self.resolve_generation = self.resolve_generation.wrapping_add(1);
+        if let Some(task) = self.resolve_task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.cancel_resolution();
+        self.callback_task.abort();
+        if let Some(cache) = &self.audio_cache {
+            cache.cancel();
+        }
+        self.proxy.unregister_manifest(&self.ctx.session_id);
+        self.proxy.unregister_license(&self.ctx.session_id);
+    }
+}
+
 /// Construction parameters for the hub.
 pub struct HubConfig {
     /// Device identity.
@@ -303,6 +343,8 @@ pub struct HubConfig {
     pub proxy: Arc<dyn ProxyRegistrar>,
     /// Shared HTTP client for apps and the license/manifest proxy.
     pub http: reqwest::Client,
+    /// Shared progressive-media client without a total response-body timeout.
+    pub media_http: reqwest::Client,
     /// Base data directory.
     pub data_dir: PathBuf,
     /// Initial receiver volume.
@@ -324,6 +366,7 @@ pub struct DeviceHub {
     player: Arc<dyn Player>,
     proxy: Arc<dyn ProxyRegistrar>,
     http: reqwest::Client,
+    media_http: reqwest::Client,
     data_dir: PathBuf,
     volume: Volume,
     user_agent: String,
@@ -372,6 +415,7 @@ impl DeviceHub {
             player: config.player,
             proxy: config.proxy,
             http: config.http,
+            media_http: config.media_http,
             data_dir: config.data_dir,
             volume,
             user_agent: config.user_agent,
@@ -443,6 +487,9 @@ impl DeviceHub {
                 self.connections.insert(handle.id(), handle);
             }
             HubEvent::Server(ServerEvent::Disconnected { id, .. }) => {
+                for session in self.sessions.values_mut() {
+                    session.superseded_senders.remove(&id);
+                }
                 let owned: HashSet<String> = self
                     .session_owners
                     .iter()
@@ -754,9 +801,17 @@ impl DeviceHub {
         // Per-session callback task: app callbacks run here, in order, so a slow
         // app never blocks the hub mailbox.
         let (jobs_tx, jobs_rx) = mpsc::channel(32);
-        tokio::spawn(run_app_session(app.clone(), jobs_rx));
+        let callback_task = tokio::spawn(run_app_session(app.clone(), jobs_rx));
 
         let session = Session {
+            failed_cache_eof: false,
+            media_recovery_attempts: 0,
+            resolve_generation: 0,
+            resolve_task: None,
+            pending_load_controls: None,
+            callback_task,
+            proxy: self.proxy.clone(),
+            superseded_senders: HashSet::new(),
             audio_cache: None,
             app_id: request.app_id.clone(),
             app_key: app_key.to_string(),
@@ -782,6 +837,7 @@ impl DeviceHub {
         let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
+        session.cancel_resolution();
         if let Some(cache) = session.audio_cache.take() {
             cache.cancel();
         }
@@ -805,7 +861,13 @@ impl DeviceHub {
         // session's final job; dropping `session` then closes its task once the
         // job has drained.
         let ctx = self.callback_context(&session, None);
-        let _ = session.jobs.send(AppJob::Stop { ctx }).await;
+        // A stuck callback must not keep an app alive after its session ends.
+        // Keep normal ordered on_stop delivery, but bound both enqueue and drain.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = session.jobs.send(AppJob::Stop { ctx }).await;
+            let _ = (&mut session.callback_task).await;
+        })
+        .await;
         self.subscriptions
             .retain(|_, transport| transport != session_id);
     }
@@ -906,12 +968,15 @@ impl DeviceHub {
                     if !self.sender_may_control(&transport, conn_id) {
                         return;
                     }
-                    let _ = jobs
-                        .send(AppJob::SenderConnected {
+                    self.enqueue_app_job(
+                        &transport,
+                        jobs,
+                        AppJob::SenderConnected {
                             ctx,
                             sender_id: source,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 Ok(ConnectionMessage::Close(_)) => {
                     self.subscriptions.remove(&(conn_id, source));
@@ -941,7 +1006,9 @@ impl DeviceHub {
                 }
             },
             ns::MEDIA => {
-                if payload["type"] != "GET_STATUS" && !self.sender_may_control(&transport, conn_id)
+                if payload["type"] != "GET_STATUS"
+                    && !self.sender_may_control(&transport, conn_id)
+                    && !self.observer_may_control_media(&transport, conn_id, &source, &payload)
                 {
                     tracing::debug!(session_id = %transport, conn_id,
                         "ignoring media command from superseded sender");
@@ -970,13 +1037,16 @@ impl DeviceHub {
                     ),
                     None => return,
                 };
-                let _ = jobs
-                    .send(AppJob::Message {
+                self.enqueue_app_job(
+                    &transport,
+                    jobs,
+                    AppJob::Message {
                         ctx,
                         namespace: other.to_string(),
                         data: payload,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         }
     }
@@ -1000,6 +1070,32 @@ impl DeviceHub {
                 return;
             }
         };
+
+        let target = match &request {
+            MediaRequest::Play(r) => Some((r.media_session_id, r.request_id)),
+            MediaRequest::Pause(r) => Some((r.media_session_id, r.request_id)),
+            MediaRequest::Seek(r) => Some((r.media_session_id, r.request_id)),
+            MediaRequest::Stop(r) => Some((r.media_session_id, r.request_id)),
+            MediaRequest::SetVolume(r) => Some((r.media_session_id, r.request_id)),
+            _ => None,
+        };
+        if let Some((media_id, request_id)) = target {
+            if !self
+                .sessions
+                .get(transport)
+                .is_some_and(|session| session.coordinator.media_session_id == media_id)
+            {
+                self.send_to(
+                    conn_id,
+                    transport,
+                    source,
+                    ns::MEDIA,
+                    &MediaInvalidRequestResponse::new(request_id, "Invalid media session"),
+                )
+                .await;
+                return;
+            }
+        }
 
         match request {
             MediaRequest::Load(load) => {
@@ -1142,6 +1238,14 @@ impl DeviceHub {
     }
 
     async fn request_play(&mut self, session_id: &str, request_id: i64) {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|s| s.pending_load_controls.is_some())
+        {
+            self.play(session_id, request_id).await;
+            return;
+        }
         if let Some(session) = self.sessions.get(session_id) {
             if session.app.handles_play_requests() {
                 let jobs = session.jobs.clone();
@@ -1150,12 +1254,15 @@ impl DeviceHub {
                 // empty decoder. The app will load fresh media when necessary.
                 let response = session.coordinator.status_response(request_id);
                 self.broadcast(session_id, ns::MEDIA, &response).await;
-                let _ = jobs
-                    .send(AppJob::OutputControl {
+                self.enqueue_app_job(
+                    session_id,
+                    jobs,
+                    AppJob::OutputControl {
                         ctx,
                         control: OutputControl::Play,
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 return;
             }
         }
@@ -1163,11 +1270,22 @@ impl DeviceHub {
     }
 
     async fn play(&mut self, session_id: &str, request_id: i64) {
+        let pending = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.pending_load_controls.as_mut());
+        let deferred = pending.is_some();
+        if let Some(pending) = pending {
+            pending.autoplay = Some(true);
+        }
         self.transition(session_id, request_id, |coordinator| {
             coordinator.player_state = PlayerState::Playing;
             coordinator.idle_reason = None;
         })
         .await;
+        if deferred {
+            return;
+        }
         self.player
             .send(PlayerCommand::Play {
                 session_id: session_id.to_string(),
@@ -1177,11 +1295,22 @@ impl DeviceHub {
     }
 
     async fn pause(&mut self, session_id: &str, request_id: i64) {
+        let pending = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.pending_load_controls.as_mut());
+        let deferred = pending.is_some();
+        if let Some(pending) = pending {
+            pending.autoplay = Some(false);
+        }
         self.transition(session_id, request_id, |coordinator| {
             coordinator.player_state = PlayerState::Paused;
             coordinator.idle_reason = None;
         })
         .await;
+        if deferred {
+            return;
+        }
         self.player
             .send(PlayerCommand::Pause {
                 session_id: session_id.to_string(),
@@ -1191,11 +1320,22 @@ impl DeviceHub {
     }
 
     async fn seek(&mut self, session_id: &str, request_id: i64, position: f64) {
+        let pending = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.pending_load_controls.as_mut());
+        let deferred = pending.is_some();
+        if let Some(pending) = pending {
+            pending.position = Some(position);
+        }
         self.transition(session_id, request_id, |coordinator| {
             coordinator.current_time = position;
             coordinator.idle_reason = None;
         })
         .await;
+        if deferred {
+            return;
+        }
         self.player
             .send(PlayerCommand::Seek {
                 session_id: session_id.to_string(),
@@ -1206,6 +1346,9 @@ impl DeviceHub {
     }
 
     async fn stop_playback(&mut self, session_id: &str, request_id: i64) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.cancel_resolution();
+        }
         self.clear_audio_cache(session_id);
         self.transition(session_id, request_id, |coordinator| {
             coordinator.set_idle(Some(IdleReason::Cancelled));
@@ -1233,13 +1376,14 @@ impl DeviceHub {
         tracing::info!(
             session_id = %transport,
             request_id = load.request_id,
-            content_id = %load.media.content_id,
             stream_type = ?load.media.stream_type,
             "LOAD"
         );
         // Phase 1: broadcast IDLE + LOADING with the request's media info.
         let response = match self.sessions.get_mut(transport) {
             Some(session) => {
+                session.cancel_resolution();
+                session.pending_load_controls = Some(PendingLoadControls::default());
                 let coordinator = &mut session.coordinator;
                 coordinator.media_session_id += 1;
                 let loading = loading_media_info(&load);
@@ -1256,19 +1400,24 @@ impl DeviceHub {
         // Phase 2: resolve media off the mailbox and feed the result back. The
         // context is broadcast-capable so apps can push custom messages while
         // resolving (e.g. TV4's legacy snapshot).
-        let (app, ctx) = match self.sessions.get(transport) {
-            Some(session) => (session.app.clone(), self.callback_context(session, None)),
+        let (app, ctx, generation) = match self.sessions.get(transport) {
+            Some(session) => (
+                session.app.clone(),
+                self.callback_context(session, None),
+                session.resolve_generation,
+            ),
             None => return,
         };
         let self_tx = self.self_tx.clone();
         let session_id = transport.to_string();
         let sender_id = source.to_string();
         let request_id = load.request_id;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = app.resolve_media(&ctx, &load).await;
             let _ = self_tx
                 .send(HubEvent::MediaResolved(MediaResolved {
                     session_id,
+                    generation,
                     request_id,
                     connection_id: conn_id,
                     sender_id,
@@ -1276,22 +1425,36 @@ impl DeviceHub {
                 }))
                 .await;
         });
+        if let Some(session) = self.sessions.get_mut(transport) {
+            session.resolve_task = Some(task);
+        } else {
+            task.abort();
+        }
     }
 
     async fn on_media_resolved(&mut self, resolved: MediaResolved) {
         let MediaResolved {
             session_id,
+            generation,
             request_id,
             connection_id,
             sender_id,
             result,
         } = resolved;
-        if !self.sessions.contains_key(&session_id) {
-            tracing::debug!(session_id = %session_id, "media resolved for stopped session; dropping");
-            return; // session stopped while resolving
+        if !self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.resolve_generation == generation)
+        {
+            tracing::debug!(session_id = %session_id, "media resolved for obsolete load; dropping");
+            return;
         }
 
-        let media = match result {
+        let pending = self.sessions.get_mut(&session_id).and_then(|session| {
+            session.resolve_task.take();
+            session.pending_load_controls.take()
+        });
+        let mut media = match result {
             Ok(media) => media,
             Err(failure) => {
                 self.fail_load(&session_id, connection_id, &sender_id, request_id, &failure)
@@ -1299,6 +1462,16 @@ impl DeviceHub {
                 return;
             }
         };
+        // Controls accepted for this loading media must not operate on the old
+        // decoder or get overwritten by the resolver's original LOAD snapshot.
+        if let Some(pending) = pending {
+            if let Some(autoplay) = pending.autoplay {
+                media.autoplay = autoplay;
+            }
+            if let Some(position) = pending.position {
+                media.start_time = position;
+            }
+        }
         if media.streams.is_empty() {
             let failure = MediaResolveError::internal("INVALID_APP_MEDIA");
             self.fail_load(&session_id, connection_id, &sender_id, request_id, &failure)
@@ -1326,6 +1499,7 @@ impl DeviceHub {
             }
             AppPlaybackCommand::Load(media) => {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.cancel_resolution();
                     session.coordinator.media_session_id += 1;
                 }
                 self.start_resolved_media(&session_id, 0, media).await;
@@ -1343,6 +1517,10 @@ impl DeviceHub {
         request_id: i64,
         mut media: PlaybackMedia,
     ) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.failed_cache_eof = false;
+            session.media_recovery_attempts = 0;
+        }
         media.session_id = session_id.to_string();
         let media_session_id = self
             .sessions
@@ -1378,10 +1556,12 @@ impl DeviceHub {
         self.broadcast(session_id, ns::MEDIA, &loading).await;
         self.broadcast(session_id, ns::MEDIA, &buffering).await;
 
+        let mut payload = to_payload(&media);
+        payload.media_session_id = Some(media_session_id);
         self.player
             .send(PlayerCommand::Load {
                 session_id: session_id.to_string(),
-                media: to_payload(&media),
+                media: payload,
             })
             .await;
         self.notify_app(session_id).await;
@@ -1417,7 +1597,7 @@ impl DeviceHub {
                 }
                 session.audio_cache = requested.map(|(url, hint)| {
                     Arc::new(crate::audio_cache::AudioCache::new(
-                        self.http.clone(),
+                        self.media_http.clone(),
                         url,
                         hint,
                     ))
@@ -1463,12 +1643,13 @@ impl DeviceHub {
     }
 
     fn clear_audio_cache(&mut self, session_id: &str) {
-        if let Some(cache) = self
-            .sessions
-            .get_mut(session_id)
-            .and_then(|s| s.audio_cache.take())
-        {
-            cache.cancel();
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Some(cache) = session.audio_cache.take() {
+                cache.cancel();
+                session.media_recovery_attempts = session
+                    .media_recovery_attempts
+                    .max(cache.hint.recovery_attempts());
+            }
         }
     }
 
@@ -1487,20 +1668,29 @@ impl DeviceHub {
             retryable = failure.retryable,
             "load failed"
         );
-        let (failed, status) = match self.sessions.get_mut(session_id) {
+        let (failed, status, stop_previous) = match self.sessions.get_mut(session_id) {
             Some(session) => {
                 let coordinator = &mut session.coordinator;
+                let stop_previous = coordinator.playback_media.is_some();
                 coordinator.set_idle(Some(IdleReason::Error));
                 coordinator.clear_media();
                 (
                     LoadFailedResponse::new(request_id, failure.reason()),
                     coordinator.status_response(request_id),
+                    stop_previous,
                 )
             }
             None => return,
         };
         self.unregister_proxies(session_id);
         self.clear_audio_cache(session_id);
+        if stop_previous {
+            self.player
+                .send(PlayerCommand::Stop {
+                    session_id: session_id.to_owned(),
+                })
+                .await;
+        }
         self.send_to(conn_id, session_id, sender_id, ns::MEDIA, &failed)
             .await;
         self.broadcast(session_id, ns::MEDIA, &status).await;
@@ -1522,16 +1712,21 @@ impl DeviceHub {
         if let Err(error) = result {
             tracing::warn!(%error, "cannot persist receiver volume");
         }
-        for session in self.sessions.values_mut() {
+        let mut updates = Vec::new();
+        for (session_id, session) in &mut self.sessions {
             session.coordinator.volume = self.volume.clone();
-            let _ = session
-                .jobs
-                .send(AppJob::VolumeUpdate {
+            updates.push((
+                session_id.clone(),
+                session.jobs.clone(),
+                AppJob::VolumeUpdate {
                     ctx: session.ctx.clone(),
                     level: self.volume.level,
                     muted: self.volume.muted,
-                })
-                .await;
+                },
+            ));
+        }
+        for (session_id, jobs, update) in updates {
+            self.enqueue_app_job(&session_id, jobs, update).await;
         }
     }
 
@@ -1540,6 +1735,23 @@ impl DeviceHub {
         if !self.sessions.contains_key(&session_id) {
             return;
         }
+        let report_media_id = match &report {
+            PlayerReport::State {
+                media_session_id, ..
+            }
+            | PlayerReport::Error {
+                media_session_id, ..
+            }
+            | PlayerReport::ControlRequest {
+                media_session_id, ..
+            } => *media_session_id,
+            _ => None,
+        };
+        let stale_media = report_media_id.is_some_and(|id| {
+            self.sessions
+                .get(&session_id)
+                .is_some_and(|session| session.coordinator.media_session_id != id)
+        });
         match report {
             PlayerReport::Artwork {
                 source_url, url, ..
@@ -1553,6 +1765,9 @@ impl DeviceHub {
                 }
             }
             PlayerReport::ControlRequest { control, .. } => {
+                if stale_media && !matches!(control, PlayerControlRequest::Volume { .. }) {
+                    return;
+                }
                 self.on_output_control(&session_id, control).await;
             }
             PlayerReport::State {
@@ -1576,6 +1791,9 @@ impl DeviceHub {
                     let response = self.receiver_status(0);
                     self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
                 }
+                if stale_media {
+                    return;
+                }
                 tracing::debug!(
                     session_id = %session_id,
                     state = ?player_state,
@@ -1593,8 +1811,11 @@ impl DeviceHub {
                 )
                 .await;
             }
-            PlayerReport::Error { code, message, .. } => {
-                tracing::warn!(session = %session_id, %code, %message, "player error");
+            PlayerReport::Error { code, .. } => {
+                if stale_media {
+                    return;
+                }
+                tracing::warn!(session = %session_id, %code, "player error");
                 let (current_time, duration) = match self.sessions.get(&session_id) {
                     Some(session) => (
                         session.coordinator.current_time,
@@ -1646,7 +1867,8 @@ impl DeviceHub {
                     .get(session_id)
                     .map(|session| (session.jobs.clone(), session.ctx.clone()))
                 {
-                    let _ = jobs.send(AppJob::OutputControl { ctx, control }).await;
+                    self.enqueue_app_job(session_id, jobs, AppJob::OutputControl { ctx, control })
+                        .await;
                 }
             }
         }
@@ -1660,6 +1882,37 @@ impl DeviceHub {
         duration: Option<f64>,
         idle_reason: Option<IdleReason>,
     ) {
+        // Until the resolver commits a new decoder load, reports still belong
+        // to the previous selection. Keep global volume handling in on_report.
+        if self.sessions.get(session_id).is_some_and(|s| {
+            s.pending_load_controls.is_some() || s.coordinator.playback_media.is_none()
+        }) {
+            // Stop/failure already emitted the authoritative terminal state.
+            // Late decoder acknowledgements must not resurrect it or turn a
+            // duplicate CANCELLED into another app-level resolver retry.
+            return;
+        }
+        // mpv may call a truncated HTTP stream EOF after draining its buffer.
+        // An authoritative cache failure must reach both Cast and the app as
+        // ERROR, before either can advance the playlist on a false FINISHED.
+        let idle_reason = if player_state == PlayerState::Idle
+            && idle_reason == Some(IdleReason::Finished)
+            && self.sessions.get_mut(session_id).is_some_and(|session| {
+                session.failed_cache_eof |= session
+                    .audio_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.has_failed());
+                session.failed_cache_eof
+            }) {
+            tracing::warn!(
+                session_id,
+                current_time,
+                "decoder EOF after failed audio download; treating as error"
+            );
+            Some(IdleReason::Error)
+        } else {
+            idle_reason
+        };
         let response = match self.sessions.get_mut(session_id) {
             Some(session) => {
                 let coordinator = &mut session.coordinator;
@@ -1694,6 +1947,12 @@ impl DeviceHub {
 
     async fn claim_sender(&mut self, transport: &str, conn_id: u64, source: &str) {
         let previous_owner = self.session_owners.insert(transport.to_owned(), conn_id);
+        if let Some(session) = self.sessions.get_mut(transport) {
+            if let Some(previous) = previous_owner.filter(|previous| *previous != conn_id) {
+                session.superseded_senders.insert(previous);
+            }
+            session.superseded_senders.remove(&conn_id);
+        }
         self.sender_disconnect_deadlines.remove(transport);
         // Only close the previous controller; status observers remain subscribed.
         let stale: Vec<_> = self
@@ -1749,13 +2008,16 @@ impl DeviceHub {
         );
         if let Some(session) = self.sessions.get(transport) {
             let ctx = self.callback_context(session, Some((conn_id, source.to_owned())));
-            let _ = session
-                .jobs
-                .send(AppJob::SenderConnected {
+            let jobs = session.jobs.clone();
+            self.enqueue_app_job(
+                transport,
+                jobs,
+                AppJob::SenderConnected {
                     ctx,
                     sender_id: source.to_owned(),
-                })
-                .await;
+                },
+            )
+            .await;
         }
     }
 
@@ -1765,6 +2027,30 @@ impl DeviceHub {
             .get(transport)
             .is_some_and(|session| session.app.exclusive_sender_takeover())
             || self.session_owners.get(transport) == Some(&conn_id)
+    }
+
+    /// Basic transport controls do not acquire app/playlist ownership. Require
+    /// the actual subscribed sender and current media id so an observer cannot
+    /// replace media or revive commands from a displaced owner.
+    fn observer_may_control_media(
+        &self,
+        transport: &str,
+        conn_id: u64,
+        source: &str,
+        payload: &Value,
+    ) -> bool {
+        matches!(payload["type"].as_str(), Some("PLAY" | "PAUSE" | "SEEK"))
+            && self
+                .subscriptions
+                .get(&(conn_id, source.to_owned()))
+                .map(String::as_str)
+                == Some(transport)
+            && self.sessions.get(transport).is_some_and(|session| {
+                !session.superseded_senders.contains(&conn_id)
+                    && session.coordinator.current_media.is_some()
+                    && payload["mediaSessionId"].as_i64()
+                        == Some(session.coordinator.media_session_id)
+            })
     }
 
     /// Current connection handles subscribed to a transport (for broadcasts).
@@ -1810,7 +2096,7 @@ impl DeviceHub {
         .with_playback_controller(session.ctx.playback_controller())
     }
 
-    async fn notify_app(&self, session_id: &str) {
+    async fn notify_app(&mut self, session_id: &str) {
         let (jobs, ctx, state) = match self.sessions.get(session_id) {
             Some(session) => {
                 let coordinator = &session.coordinator;
@@ -1819,6 +2105,12 @@ impl DeviceHub {
                     current_time: coordinator.current_time,
                     duration: coordinator.current_media.as_ref().and_then(|m| m.duration),
                     idle_reason: coordinator.idle_reason,
+                    media_recovery_attempts: session
+                        .audio_cache
+                        .as_ref()
+                        .map_or(session.media_recovery_attempts, |cache| {
+                            cache.hint.recovery_attempts()
+                        }),
                 };
                 (
                     session.jobs.clone(),
@@ -1828,7 +2120,29 @@ impl DeviceHub {
             }
             None => return,
         };
-        let _ = jobs.send(AppJob::PlaybackUpdate { ctx, state }).await;
+        self.enqueue_app_job(session_id, jobs, AppJob::PlaybackUpdate { ctx, state })
+            .await;
+    }
+
+    async fn enqueue_app_job(&mut self, session_id: &str, jobs: mpsc::Sender<AppJob>, job: AppJob) {
+        // A callback can itself await the hub mailbox. Never wait indefinitely
+        // for callback capacity while the hub is its only possible consumer.
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), jobs.send(job)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+        tracing::warn!(
+            session_id,
+            "app callback mailbox unavailable; stopping session"
+        );
+        if let Some(session) = self.sessions.get(session_id) {
+            session.callback_task.abort();
+        }
+        self.stop_session(session_id).await;
+        let response = self.receiver_status(0);
+        self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
     }
 
     fn unregister_proxies(&self, session_id: &str) {

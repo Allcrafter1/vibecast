@@ -149,6 +149,20 @@ struct FakeSession(
 
 #[async_trait]
 impl AppSession for FakeSession {
+    async fn on_playback_update(&self, ctx: &AppContext, state: vibecast_sdk::PlaybackState) {
+        if state.media_recovery_attempts > 0 {
+            ctx.send_custom(
+                FAKE_NS,
+                serde_json::json!({
+                    "type": "RECOVERY_STATE",
+                    "attempts": state.media_recovery_attempts,
+                    "error": state.idle_reason == Some(vibecast_messages::IdleReason::Error),
+                }),
+            )
+            .await;
+        }
+    }
+
     fn exclusive_sender_takeover(&self) -> bool {
         self.3
     }
@@ -183,6 +197,9 @@ impl AppSession for FakeSession {
         ctx: &AppContext,
         request: &LoadRequest,
     ) -> Result<PlaybackMedia, MediaResolveError> {
+        if request.media.content_id == "slow" {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         if request.media.content_id == "fail" {
             return Err(MediaResolveError::content_unavailable("NO_CONTENT"));
         }
@@ -224,6 +241,11 @@ impl AppSession for FakeSession {
                         }
                         current.clone().unwrap()
                     };
+                    if let vibecast_sdk::StreamSource::CachedUrl { cache, .. } = &stream.source {
+                        if let Some(attempts) = data["recoveryAttempts"].as_u64() {
+                            cache.set_recovery_attempts(attempts as u8);
+                        }
+                    }
                     ctx.playback_controller()
                         .load(PlaybackMedia::new(
                             ctx.session_id.clone(),
@@ -254,6 +276,13 @@ impl AppSession for FakeSession {
                 Some("APP_PAUSE") => ctx.playback_controller().pause().await,
                 Some("APP_SEEK") => ctx.playback_controller().seek(33.0).await,
                 Some("APP_STOP") => ctx.playback_controller().stop().await,
+                Some("FLOOD_CALLBACK") => {
+                    // More than both bounded mailboxes combined: the callback
+                    // waits for hub capacity while hub notifications fill jobs.
+                    for _ in 0..512 {
+                        ctx.playback_controller().pause().await;
+                    }
+                }
                 message_type => {
                     ctx.send_custom(
                         namespace,
@@ -295,6 +324,7 @@ struct Harness {
     player: Arc<FakePlayer>,
     proxy: Arc<FakeProxy>,
     launched_setting: Arc<Mutex<Option<String>>>,
+    hub_abort: tokio::task::AbortHandle,
 }
 
 fn attenuation_volume() -> Volume {
@@ -373,6 +403,7 @@ async fn setup_with_options(
         player: player.clone(),
         proxy: proxy.clone(),
         http: reqwest::Client::new(),
+        media_http: reqwest::Client::new(),
         data_dir: std::env::temp_dir().join("vibecast-core-tests"),
         volume: attenuation_volume(),
         user_agent: String::new(),
@@ -391,7 +422,7 @@ async fn setup_with_options(
             }
         });
     }
-    tokio::spawn(hub.run());
+    let hub_abort = tokio::spawn(hub.run()).abort_handle();
 
     Harness {
         client: Framed::new(client_end, CastCodec),
@@ -399,6 +430,7 @@ async fn setup_with_options(
         player,
         proxy,
         launched_setting,
+        hub_abort,
     }
 }
 
@@ -475,6 +507,136 @@ async fn launch_id(client: &mut Framed<DuplexStream, CastCodec>, app_id: &str) -
 // -- tests -----------------------------------------------------------------
 
 #[tokio::test]
+async fn stale_media_controls_cannot_modify_a_new_selection() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        send(
+            &mut h.client,
+            FAKE_NS,
+            &transport,
+            r#"{"type":"PUSH_MEDIA"}"#,
+        )
+        .await;
+        next_json(&mut h.client).await;
+        let status = next_json(&mut h.client).await;
+        ids.push(status["status"][0]["mediaSessionId"].as_i64().unwrap());
+    }
+    assert_ne!(ids[0], ids[1]);
+    let before = h.player.commands().len();
+    for (n, kind) in ["PLAY", "PAUSE", "SEEK", "STOP", "SET_VOLUME"]
+        .iter()
+        .enumerate()
+    {
+        let request = serde_json::json!({
+            "type": kind, "requestId": 50 + n, "mediaSessionId": ids[0],
+            "currentTime": 40, "volume": {"level": 0.1},
+        });
+        send(&mut h.client, ns::MEDIA, &transport, &request.to_string()).await;
+        let reply = next_json(&mut h.client).await;
+        assert_eq!(
+            reply["type"], "INVALID_REQUEST",
+            "stale {kind} was accepted"
+        );
+        assert_eq!(reply["requestId"], 50 + n);
+        assert_eq!(h.player.commands().len(), before);
+    }
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        &serde_json::json!({
+            "type": "PAUSE", "requestId": 90, "mediaSessionId": ids[1],
+        })
+        .to_string(),
+    )
+    .await;
+    let reply = next_json(&mut h.client).await;
+    assert_eq!(reply["status"][0]["playerState"], "PAUSED");
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_cache_eof_is_error_before_cast_broadcast_and_stays_error() {
+    let mut h = setup().await;
+    let session = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &session,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        FAKE_NS,
+        &session,
+        r#"{"type":"PUSH_CACHE","recoveryAttempts":2}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    next_json(&mut h.client).await;
+    let recovery = next_json(&mut h.client).await;
+    assert_eq!(recovery["type"], "RECOVERY_STATE");
+    assert_eq!(recovery["attempts"], 2);
+    let proxy = h.proxy.manifests.lock().unwrap()[&session].clone();
+    let token = h
+        .player
+        .commands()
+        .into_iter()
+        .find_map(|command| match command {
+            PlayerCommand::Load { media, .. } => {
+                Some(media.streams[0].url.rsplit('/').next().unwrap().to_owned())
+            }
+            _ => None,
+        })
+        .unwrap();
+    // The fake source is a closed localhost port; it fails without external traffic.
+    let response = proxy
+        .handle_cached_media(&token, http::Method::GET, http::HeaderMap::new())
+        .await
+        .unwrap();
+    assert_eq!(response.status, 502);
+    for _ in 0..2 {
+        h.hub
+            .send_player_report(PlayerReport::State {
+                media_session_id: None,
+                session_id: session.clone(),
+                player_state: PlayerState::Idle,
+                current_time: 55.2,
+                duration: Some(230.0),
+                idle_reason: Some(vibecast_messages::IdleReason::Finished),
+                volume: None,
+                muted: None,
+            })
+            .await
+            .unwrap();
+        let status = next_json(&mut h.client).await;
+        assert_eq!(status["status"][0]["idleReason"], "ERROR");
+        assert_eq!(status["status"][0]["currentTime"], 55.2);
+        let recovery = next_json(&mut h.client).await;
+        assert_eq!(recovery["type"], "RECOVERY_STATE");
+        assert_eq!(
+            recovery["attempts"], 2,
+            "eviction must not replenish retries"
+        );
+        assert_eq!(recovery["error"], true);
+    }
+    assert!(!h.proxy.manifests.lock().unwrap().contains_key(&session));
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn current_cache_survives_eof_repeat_but_not_title_change_or_stop() {
     async fn push(h: &mut Harness, session: &str, kind: &str, loads: usize) -> String {
         send(
@@ -521,6 +683,7 @@ async fn current_cache_survives_eof_repeat_but_not_title_change_or_stop() {
     let old = h.proxy.manifests.lock().unwrap()[&session].clone();
     h.hub
         .send_player_report(PlayerReport::State {
+            media_session_id: None,
             session_id: session.clone(),
             player_state: PlayerState::Idle,
             current_time: 100.0,
@@ -618,6 +781,7 @@ async fn app_owned_cast_play_loads_fresh_media_without_false_playing() {
     harness
         .hub
         .send_player_report(PlayerReport::ControlRequest {
+            media_session_id: None,
             session_id: transport.clone(),
             control: vibecast_player_api::PlayerControlRequest::Play,
         })
@@ -710,6 +874,390 @@ async fn unavailable_app_settings_return_launch_error() {
     let response = next_json(&mut harness.client).await;
     assert_eq!(response["type"], "LAUNCH_ERROR");
     assert_eq!(response["requestId"], 7);
+}
+
+#[tokio::test]
+async fn obsolete_load_cannot_replace_new_selection_or_restart_after_stop() {
+    for stop in [false, true] {
+        let mut h = setup().await;
+        let transport = launch(&mut h.client).await;
+        send(
+            &mut h.client,
+            ns::CONNECTION,
+            &transport,
+            r#"{"type":"CONNECT"}"#,
+        )
+        .await;
+        next_json(&mut h.client).await;
+        send(
+            &mut h.client,
+            ns::MEDIA,
+            &transport,
+            r#"{"type":"LOAD","requestId":20,"currentTime":1,"media":{"contentId":"slow"}}"#,
+        )
+        .await;
+        next_json(&mut h.client).await; // first LOAD entered resolution
+        if stop {
+            send(&mut h.client, FAKE_NS, &transport, r#"{"type":"APP_STOP"}"#).await;
+        } else {
+            send(
+                &mut h.client,
+                ns::MEDIA,
+                &transport,
+                r#"{"type":"LOAD","requestId":20,"currentTime":7,"media":{"contentId":"fast"}}"#,
+            )
+            .await;
+        }
+        // Reused request IDs must not let the older result through either.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let loads: Vec<_> = h
+            .player
+            .commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                PlayerCommand::Load { media, .. } => Some(media.start_time),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads, if stop { vec![] } else { vec![7.0] });
+        h.hub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn controls_during_resolution_apply_to_the_new_load() {
+    for resume in [false, true] {
+        let mut h = setup().await;
+        let transport = launch(&mut h.client).await;
+        send(
+            &mut h.client,
+            ns::CONNECTION,
+            &transport,
+            r#"{"type":"CONNECT"}"#,
+        )
+        .await;
+        next_json(&mut h.client).await;
+        if resume {
+            send(
+                &mut h.client,
+                FAKE_NS,
+                &transport,
+                r#"{"type":"HANDLE_PLAY"}"#,
+            )
+            .await;
+            next_json(&mut h.client).await;
+        }
+        send(
+            &mut h.client,
+            ns::MEDIA,
+            &transport,
+            r#"{"type":"LOAD","requestId":20,"media":{"contentId":"slow"}}"#,
+        )
+        .await;
+        let loading = next_json(&mut h.client).await;
+        let media_id = loading["status"][0]["mediaSessionId"].as_i64().unwrap();
+        for kind in ["PAUSE", "SEEK"] {
+            send(
+                &mut h.client,
+                ns::MEDIA,
+                &transport,
+                &serde_json::json!({
+                    "type": kind, "requestId": 21, "mediaSessionId": media_id, "currentTime": 37.0,
+                })
+                .to_string(),
+            )
+            .await;
+            next_json(&mut h.client).await;
+        }
+        if resume {
+            send(
+                &mut h.client,
+                ns::MEDIA,
+                &transport,
+                &serde_json::json!({
+                    "type": "PLAY", "requestId": 22, "mediaSessionId": media_id,
+                })
+                .to_string(),
+            )
+            .await;
+            next_json(&mut h.client).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let commands = h.player.commands();
+        let loaded = commands
+            .iter()
+            .find_map(|command| match command {
+                PlayerCommand::Load { media, .. } => Some(media),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            loaded.autoplay, resume,
+            "pending playback intent was lost when resolution completed"
+        );
+        assert_eq!(loaded.start_time, 37.0, "pending Seek was lost");
+        assert!(
+            !commands.iter().any(|command| matches!(
+                command,
+                PlayerCommand::Play { .. }
+                    | PlayerCommand::Pause { .. }
+                    | PlayerCommand::Seek { .. }
+            )),
+            "pending controls must not affect the previous decoder load"
+        );
+        h.hub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn old_decoder_report_cannot_finish_a_pending_load() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":20,"media":{"contentId":"slow"}}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    h.hub
+        .send_player_report(PlayerReport::State {
+            media_session_id: None,
+            session_id: transport.clone(),
+            player_state: PlayerState::Idle,
+            current_time: 111.0,
+            duration: Some(111.0),
+            idle_reason: Some(vibecast_messages::IdleReason::Finished),
+            volume: None,
+            muted: None,
+        })
+        .await
+        .unwrap();
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":25}"#,
+    )
+    .await;
+    let status = next_json(&mut h.client).await;
+    assert_eq!(
+        status["requestId"], 25,
+        "old EOF was broadcast for the pending selection"
+    );
+    assert_eq!(status["status"][0]["currentTime"], 0.0);
+    assert!(status["status"][0].get("idleReason").is_none());
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn late_decoder_reports_after_stop_cannot_republish_or_overwrite_terminal_state() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":1,"media":{"contentId":"fast"}}"#,
+    )
+    .await;
+    let loading = next_json(&mut h.client).await;
+    let media_id = loading["status"][0]["mediaSessionId"].as_i64().unwrap();
+    next_json(&mut h.client).await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        &serde_json::json!({
+            "type": "STOP", "requestId": 2, "mediaSessionId": media_id,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut h.client).await["status"][0]["idleReason"],
+        "CANCELLED"
+    );
+    for reason in [
+        Some(vibecast_messages::IdleReason::Cancelled),
+        Some(vibecast_messages::IdleReason::Finished),
+        Some(vibecast_messages::IdleReason::Error),
+        None,
+    ] {
+        h.hub
+            .send_player_report(PlayerReport::State {
+                media_session_id: None,
+                session_id: transport.clone(),
+                player_state: if reason.is_some() {
+                    PlayerState::Idle
+                } else {
+                    PlayerState::Playing
+                },
+                current_time: 42.0,
+                duration: Some(99.0),
+                idle_reason: reason,
+                volume: None,
+                muted: None,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":3}"#,
+    )
+    .await;
+    let status = next_json(&mut h.client).await;
+    assert_eq!(
+        status["requestId"], 3,
+        "late report must not be republished as a fresh app state"
+    );
+    assert_eq!(status["status"][0]["idleReason"], "CANCELLED");
+    assert_eq!(status["status"][0]["currentTime"], 0.0);
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":4,"media":{"contentId":"fast"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        next_json(&mut h.client).await;
+    }
+    h.hub
+        .send_player_report(PlayerReport::State {
+            media_session_id: None,
+            session_id: transport.clone(),
+            player_state: PlayerState::Playing,
+            current_time: 7.0,
+            duration: Some(90.0),
+            idle_reason: None,
+            volume: None,
+            muted: None,
+        })
+        .await
+        .unwrap();
+    let resumed = next_json(&mut h.client).await;
+    assert_eq!(resumed["status"][0]["playerState"], "PLAYING");
+    assert_eq!(resumed["status"][0]["currentTime"], 7.0);
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn aborting_hub_unregisters_session_proxy() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":20,"media":{"contentId":"fast"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        next_json(&mut h.client).await;
+    }
+    assert!(h.proxy.manifests.lock().unwrap().contains_key(&transport));
+    h.hub_abort.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while h.proxy.manifests.lock().unwrap().contains_key(&transport) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forced shutdown must release proxy registrations");
+}
+
+#[tokio::test]
+async fn saturated_callback_cannot_deadlock_hub_control_or_shutdown() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":20,"media":{"contentId":"fast"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        next_json(&mut h.client).await;
+    }
+    send(
+        &mut h.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"FLOOD_CALLBACK"}"#,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let response = next_json(&mut h.client).await;
+            if response["type"] == "RECEIVER_STATUS"
+                && response["status"]["applications"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("callback overload must tear down the session and unblock the hub");
+    assert!(h.player.commands().iter().any(|command| matches!(command,
+        PlayerCommand::Stop { session_id } if session_id == &transport)));
+    assert!(!h.proxy.manifests.lock().unwrap().contains_key(&transport));
+    send(
+        &mut h.client,
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"GET_STATUS","requestId":99}"#,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while next_json(&mut h.client).await["requestId"] != 99 {}
+    })
+    .await
+    .expect("receiver controls must remain responsive after callback overload");
+    tokio::time::timeout(std::time::Duration::from_secs(1), h.hub.shutdown())
+        .await
+        .expect("overloaded callback must not block shutdown");
 }
 
 #[tokio::test]
@@ -852,7 +1400,7 @@ async fn live_seek_is_rejected_without_player_command() {
         &mut harness.client,
         ns::MEDIA,
         &transport,
-        r#"{"type":"SEEK","requestId":73,"mediaSessionId":1,"currentTime":5}"#,
+        r#"{"type":"SEEK","requestId":73,"mediaSessionId":2,"currentTime":5}"#,
     )
     .await;
     let rejected = next_json(&mut harness.client).await;
@@ -895,6 +1443,76 @@ async fn load_failure_sends_load_failed() {
 }
 
 #[tokio::test]
+async fn failed_replacement_load_stops_the_previous_decoder() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":1,"media":{"contentId":"fast"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        next_json(&mut h.client).await;
+    }
+    let before = h.player.commands().len();
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"LOAD","requestId":2,"media":{"contentId":"fail"}}"#,
+    )
+    .await;
+    for _ in 0..3 {
+        next_json(&mut h.client).await;
+    }
+    assert!(
+        h.player.commands()[before..]
+            .iter()
+            .any(|command| matches!(command,
+                PlayerCommand::Stop { session_id } if session_id == &transport
+            )),
+        "old playback must not outlive a failed replacement and lost media state"
+    );
+    // Stop acknowledgement must not erase LOAD_FAILED/ERROR or look like a
+    // second resolver failure to the app.
+    h.hub
+        .send_player_report(PlayerReport::State {
+            media_session_id: None,
+            session_id: transport.clone(),
+            player_state: PlayerState::Idle,
+            current_time: 0.0,
+            duration: None,
+            idle_reason: Some(vibecast_messages::IdleReason::Cancelled),
+            volume: None,
+            muted: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":3}"#,
+    )
+    .await;
+    let terminal = next_json(&mut h.client).await;
+    assert_eq!(terminal["requestId"], 3);
+    assert_eq!(terminal["status"][0]["idleReason"], "ERROR");
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn primary_player_report_broadcasts_status() {
     let mut harness = setup().await;
     let transport = {
@@ -920,6 +1538,7 @@ async fn primary_player_report_broadcasts_status() {
     harness
         .hub
         .send_player_report(PlayerReport::State {
+            media_session_id: None,
             session_id: transport.clone(),
             player_state: PlayerState::Playing,
             current_time: 33.5,
@@ -935,6 +1554,164 @@ async fn primary_player_report_broadcasts_status() {
     assert_eq!(status["type"], "MEDIA_STATUS");
     assert_eq!(status["status"][0]["playerState"], "PLAYING");
     assert_eq!(status["status"][0]["currentTime"], 33.5);
+}
+
+#[tokio::test]
+async fn correlated_old_reports_and_controls_cannot_finish_or_stop_a_replacement() {
+    let mut h = setup().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    next_json(&mut h.client).await;
+    let mut ids = Vec::new();
+    for request in [1, 2] {
+        send(
+            &mut h.client,
+            ns::MEDIA,
+            &transport,
+            &serde_json::json!({
+                "type":"LOAD", "requestId":request, "media":{"contentId":"fast"},
+            })
+            .to_string(),
+        )
+        .await;
+        ids.push(
+            next_json(&mut h.client).await["status"][0]["mediaSessionId"]
+                .as_i64()
+                .unwrap(),
+        );
+        next_json(&mut h.client).await;
+        next_json(&mut h.client).await;
+    }
+    assert_ne!(ids[0], ids[1]);
+    let dispatched: Vec<_> = h
+        .player
+        .commands()
+        .iter()
+        .filter_map(|c| match c {
+            PlayerCommand::Load { media, .. } => media.media_session_id,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dispatched, ids);
+    let before = h.player.commands().len();
+    h.hub
+        .send_player_report(PlayerReport::State {
+            session_id: transport.clone(),
+            media_session_id: Some(ids[0]),
+            player_state: PlayerState::Idle,
+            current_time: 99.0,
+            duration: Some(99.0),
+            idle_reason: Some(vibecast_messages::IdleReason::Finished),
+            volume: None,
+            muted: None,
+        })
+        .await
+        .unwrap();
+    h.hub
+        .send_player_report(PlayerReport::Error {
+            session_id: transport.clone(),
+            media_session_id: Some(ids[0]),
+            code: "OLD".into(),
+            message: "old load failed".into(),
+        })
+        .await
+        .unwrap();
+    for control in [
+        vibecast_player_api::PlayerControlRequest::Stop,
+        vibecast_player_api::PlayerControlRequest::Seek { position: 99.0 },
+    ] {
+        h.hub
+            .send_player_report(PlayerReport::ControlRequest {
+                session_id: transport.clone(),
+                media_session_id: Some(ids[0]),
+                control,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":3}"#,
+    )
+    .await;
+    let state = next_json(&mut h.client).await;
+    assert_eq!(
+        state["requestId"], 3,
+        "old report was published as replacement state"
+    );
+    assert_eq!(state["status"][0]["playerState"], "BUFFERING");
+    assert_eq!(h.player.commands().len(), before);
+    for (media_session_id, position) in [(Some(ids[1]), 7.0), (None, 8.0)] {
+        h.hub
+            .send_player_report(PlayerReport::State {
+                session_id: transport.clone(),
+                media_session_id,
+                player_state: PlayerState::Playing,
+                current_time: position,
+                duration: Some(90.0),
+                idle_reason: None,
+                volume: None,
+                muted: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_json(&mut h.client).await["status"][0]["currentTime"],
+            position
+        );
+    }
+    // Output-wide volume remains usable even on a delayed old-title report.
+    h.hub
+        .send_player_report(PlayerReport::ControlRequest {
+            session_id: transport.clone(),
+            media_session_id: Some(ids[0]),
+            control: vibecast_player_api::PlayerControlRequest::Volume {
+                level: 0.75,
+                muted: false,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_json(&mut h.client).await["status"]["volume"]["level"],
+        0.75
+    );
+    h.hub
+        .send_player_report(PlayerReport::State {
+            session_id: transport.clone(),
+            media_session_id: Some(ids[0]),
+            player_state: PlayerState::Idle,
+            current_time: 99.0,
+            duration: None,
+            idle_reason: Some(vibecast_messages::IdleReason::Finished),
+            volume: Some(0.25),
+            muted: None,
+        })
+        .await
+        .unwrap();
+    let receiver = next_json(&mut h.client).await;
+    assert_eq!(receiver["type"], "RECEIVER_STATUS");
+    assert_eq!(receiver["status"]["volume"]["level"], 0.25);
+    send(
+        &mut h.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":4}"#,
+    )
+    .await;
+    let media = next_json(&mut h.client).await;
+    assert_eq!(media["status"][0]["currentTime"], 8.0);
+    assert_eq!(media["status"][0]["volume"]["level"], 0.25);
+    h.hub.shutdown().await;
 }
 
 #[tokio::test]
@@ -1540,6 +2317,94 @@ async fn owner_disconnect_notifies_a_separate_observer_and_allows_takeover() {
 }
 
 #[tokio::test]
+async fn stalled_observer_does_not_block_active_owner_or_player_reports() {
+    let mut h = setup_exclusive().await;
+    let transport = launch(&mut h.client).await;
+    send(
+        &mut h.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut h.client).await["type"], "MEDIA_STATUS");
+    let (mut owner_tx, mut owner_rx) = h.client.split();
+    let drain = tokio::spawn(async move {
+        while let Some(Ok(message)) = owner_rx.next().await {
+            let value: Value =
+                serde_json::from_str(message.payload_utf8.as_deref().unwrap()).unwrap();
+            if value["type"] == "PONG" {
+                return;
+            }
+        }
+        panic!("active owner was disconnected by a stalled observer");
+    });
+
+    let (server, client) = tokio::io::duplex(256);
+    let (events_tx, mut events_rx) = mpsc::channel(32);
+    tokio::spawn(run_connection(
+        server,
+        2,
+        Arc::from("stalled-observer"),
+        Arc::new(dummy_auth()),
+        events_tx,
+    ));
+    let hub = h.hub.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if hub.send_server_event(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut observer = Framed::new(client, CastCodec);
+    send(
+        &mut observer,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    // Confirm subscription, then stop consuming any observer messages.
+    assert_eq!(next_json(&mut observer).await["type"], "MEDIA_STATUS");
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        for n in 0..300 {
+            h.hub
+                .send_player_report(PlayerReport::State {
+                    media_session_id: None,
+                    session_id: transport.clone(),
+                    player_state: PlayerState::Playing,
+                    current_time: n as f64,
+                    duration: Some(600.0),
+                    idle_reason: None,
+                    volume: None,
+                    muted: None,
+                })
+                .await
+                .unwrap();
+        }
+        owner_tx
+            .send(message::build_string(
+                "sender-1",
+                &transport,
+                FAKE_NS,
+                r#"{"type":"PING"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        drain.await.unwrap();
+        h.hub.shutdown().await;
+    })
+    .await
+    .expect("a slow observer must not block reports, owner control or shutdown");
+    assert!(!h
+        .player
+        .commands()
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Stop { .. })));
+}
+
+#[tokio::test]
 async fn replacing_running_app_announces_removal_before_launch_response() {
     let mut harness = setup_exclusive().await;
     let previous = launch(&mut harness.client).await;
@@ -2013,4 +2878,151 @@ async fn platform_volume_subscription_survives_app_connect() {
     .await
     .expect("media volume changes must update platform observers too");
     assert_eq!(reply["status"]["volume"]["level"], 0.43);
+}
+
+#[tokio::test]
+async fn secondary_controller_operates_current_media_without_claiming_ownership() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    let status = next_json(&mut harness.client).await;
+    let media_id = status["status"][0]["mediaSessionId"].as_i64().unwrap();
+
+    let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+    let (events_tx, mut events_rx) = mpsc::channel::<ServerEvent>(32);
+    tokio::spawn(run_connection(
+        server_end,
+        2,
+        Arc::from("ha-observer"),
+        Arc::new(dummy_auth()),
+        events_tx,
+    ));
+    let hub = harness.hub.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if hub.send_server_event(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut observer = Framed::new(client_end, CastCodec);
+
+    // A connection must subscribe to this exact app transport before controlling it.
+    for subscribed in [false, true] {
+        if subscribed {
+            send(
+                &mut observer,
+                ns::CONNECTION,
+                &transport,
+                r#"{"type":"CONNECT"}"#,
+            )
+            .await;
+            let _ = next_json(&mut observer).await;
+        }
+        let before = harness.player.commands().len();
+        for request in [
+            serde_json::json!({"type":"PAUSE","requestId":50,"mediaSessionId":if subscribed { media_id+1 } else { media_id }}),
+            serde_json::json!({"type":"PLAY","requestId":51}),
+            serde_json::json!({"type":"STOP","requestId":52,"mediaSessionId":media_id}),
+            serde_json::json!({"type":"LOAD","requestId":53,"media":{"contentId":"replacement","contentType":"audio/mpeg"}}),
+        ] {
+            send(&mut observer, ns::MEDIA, &transport, &request.to_string()).await;
+        }
+        send(
+            &mut observer,
+            ns::MEDIA,
+            &transport,
+            r#"{"type":"GET_STATUS","requestId":59}"#,
+        )
+        .await;
+        assert_eq!(next_json(&mut observer).await["requestId"], 59);
+        assert_eq!(harness.player.commands().len(), before);
+    }
+
+    for (request_id, kind, expected) in [
+        (60, "PAUSE", "PAUSED"),
+        (61, "PLAY", "PLAYING"),
+        (62, "SEEK", "PLAYING"),
+    ] {
+        let request = serde_json::json!({"type":kind,"requestId":request_id,"mediaSessionId":media_id,"currentTime":33.0});
+        send(&mut observer, ns::MEDIA, &transport, &request.to_string()).await;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(1), next_json(&mut observer))
+                .await
+                .expect("secondary controller must receive command acknowledgement, not time out");
+        assert_eq!(response["requestId"], request_id);
+        assert_eq!(response["status"][0]["playerState"], expected);
+        assert_eq!(
+            next_json(&mut harness.client).await["requestId"],
+            request_id
+        );
+    }
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PING"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+    let commands = harness.player.commands();
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Pause { .. })));
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Play { .. })));
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, PlayerCommand::Seek { position: 33.0, .. })));
+
+    // A real takeover still revokes the previous owner, even if it automatically
+    // reconnects as an apparent observer with the current media session id.
+    send(&mut observer, FAKE_NS, &transport, r#"{"type":"CLAIM"}"#).await;
+    assert_eq!(
+        next_json(&mut harness.client).await["type"],
+        "RECEIVER_STATUS"
+    );
+    assert_eq!(next_json(&mut harness.client).await["type"], "CLOSE");
+    assert_eq!(next_json(&mut observer).await["type"], "PONG");
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    let before = harness.player.commands().len();
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        &serde_json::json!({"type":"PAUSE","requestId":70,"mediaSessionId":media_id}).to_string(),
+    )
+    .await;
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":71}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["requestId"], 71);
+    assert_eq!(harness.player.commands().len(), before);
 }

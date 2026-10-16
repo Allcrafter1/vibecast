@@ -177,6 +177,103 @@ async fn dropping_client_emits_disconnected() {
 
 // --- TLS roundtrip --------------------------------------------------------
 
+#[tokio::test]
+async fn non_reading_sender_cannot_block_enqueue_forever() {
+    let (_client, mut events, handle) = connect(dummy_auth()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for _ in 0..100 {
+            if handle
+                .send(message::build_string(
+                    "r",
+                    "s",
+                    ns::MEDIA,
+                    "x".repeat(32 * 1024),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("blocked sender must be disconnected, not accept unlimited messages");
+    })
+    .await
+    .expect("full Cast queue must not stall its caller");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap(),
+        Some(ServerEvent::Disconnected { .. })
+    ));
+    assert!(handle
+        .send(message::build_string("r", "s", ns::MEDIA, "late".into()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn stalled_write_closes_even_without_another_outgoing_message() {
+    let (_client, mut events, handle) = connect(dummy_auth()).await;
+    let started = std::time::Instant::now();
+    // Valid individual frames, together larger than the duplex transport.
+    // Keep the outbound queue below its limit to exercise only write timeout.
+    for _ in 0..3 {
+        handle
+            .send(message::build_string(
+                "r",
+                "s",
+                ns::MEDIA,
+                "x".repeat(32 * 1024),
+            ))
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(7), events.recv())
+            .await
+            .expect("writer timeout must wake the idle reader"),
+        Some(ServerEvent::Disconnected { .. })
+    ));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn closing_releases_socket_even_when_event_consumer_is_full() {
+    let (mut client, _events, handle) = connect(dummy_auth()).await;
+    // Fill the event channel and leave dispatch suspended inside its send.
+    for _ in 0..20 {
+        client
+            .send(message::build_string(
+                "s",
+                "r",
+                ns::RECEIVER,
+                r#"{"type":"GET_STATUS"}"#.into(),
+            ))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for _ in 0..100 {
+            if handle
+                .send(message::build_string(
+                    "r",
+                    "s",
+                    ns::MEDIA,
+                    "x".repeat(32 * 1024),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Do not drain ServerEvents: socket teardown must precede Disconnected.
+        while let Some(Ok(_)) = client.next().await {}
+    })
+    .await
+    .expect("blocked lifecycle event must not retain the transport");
+}
+
 fn real_auth_material() -> (AuthMaterial, Vec<u8>) {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();

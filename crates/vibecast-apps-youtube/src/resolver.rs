@@ -13,6 +13,8 @@ use vibecast_sdk::{
     StreamType,
 };
 
+use crate::CredentialTransferToken;
+
 // The VR client is currently challenged by YouTube for otherwise public
 // videos.  The regular Android client returns the same clear adaptive
 // formats without requiring a browser login or cookies.
@@ -64,6 +66,9 @@ pub(crate) struct Resolver {
             tokio::sync::oneshot::Sender<Result<PlaybackMedia, ResolveError>>,
         )>,
     >,
+    #[cfg(test)]
+    test_contexts:
+        Option<tokio::sync::mpsc::UnboundedSender<(String, Option<CredentialTransferToken>)>>,
 }
 
 #[derive(Clone)]
@@ -95,12 +100,29 @@ impl Resolver {
         resolver.test_requests = Some(tx);
         (resolver, rx)
     }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_with_contexts() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<(
+            String,
+            tokio::sync::oneshot::Sender<Result<PlaybackMedia, ResolveError>>,
+        )>,
+        tokio::sync::mpsc::UnboundedReceiver<(String, Option<CredentialTransferToken>)>,
+    ) {
+        let (mut resolver, requests) = Self::controlled();
+        let (context_tx, contexts) = tokio::sync::mpsc::unbounded_channel();
+        resolver.test_contexts = Some(context_tx);
+        (resolver, requests, contexts)
+    }
     pub(crate) fn new(http: reqwest::Client) -> Self {
         Self {
             http,
             endpoints: Endpoints::default(),
             #[cfg(test)]
             test_requests: None,
+            #[cfg(test)]
+            test_contexts: None,
         }
     }
 
@@ -113,6 +135,7 @@ impl Resolver {
                 player: format!("{base}/youtubei/v1/player"),
             },
             test_requests: None,
+            test_contexts: None,
         }
     }
 
@@ -122,18 +145,48 @@ impl Resolver {
         start_time: f64,
         capabilities: &PlayerCapabilities,
         preferred_video_codec: PreferredVideoCodec,
+        credential: Option<&CredentialTransferToken>,
     ) -> Result<PlaybackMedia, ResolveError> {
         #[cfg(test)]
         if let Some(requests) = &self.test_requests {
+            if let Some(contexts) = &self.test_contexts {
+                contexts
+                    .send((video_id.to_owned(), credential.cloned()))
+                    .unwrap();
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             requests.send((video_id.to_owned(), tx)).unwrap();
             return rx.await.unwrap();
         }
+        let credential = credential.filter(|credential| credential.applies_to(video_id));
         let started = std::time::Instant::now();
+        if credential.is_some() {
+            let media = self
+                .resolve_metadata(
+                    video_id,
+                    start_time,
+                    capabilities,
+                    preferred_video_codec,
+                    credential,
+                )
+                .await?;
+            tracing::info!(
+                %video_id,
+                has_ctt = true,
+                total_ms = started.elapsed().as_millis() as u64,
+                "YouTube credential-bound resolution completed"
+            );
+            return Ok(media);
+        }
         // Metadata and checked audio extraction are independent network work.
         // Join both futures rather than waiting for metadata before extraction.
-        let metadata =
-            self.resolve_metadata(video_id, start_time, capabilities, preferred_video_codec);
+        let metadata = self.resolve_metadata(
+            video_id,
+            start_time,
+            capabilities,
+            preferred_video_codec,
+            None,
+        );
         let audio = async {
             let result = external_audio_url(video_id).await;
             let elapsed = started.elapsed().as_millis();
@@ -178,6 +231,7 @@ impl Resolver {
         start_time: f64,
         capabilities: &PlayerCapabilities,
         preferred_video_codec: PreferredVideoCodec,
+        credential: Option<&CredentialTransferToken>,
     ) -> Result<PlaybackMedia, ResolveError> {
         let mut watch_url = Url::parse(&self.endpoints.watch)
             .map_err(|_| ResolveError::Protocol("invalid watch endpoint"))?;
@@ -207,7 +261,11 @@ impl Resolver {
             self.http
                 .post(player_url)
                 .header("User-Agent", CLIENT_USER_AGENT)
-                .json(&PlayerRequest::new(video_id, visitor_data.as_deref()))
+                .json(&PlayerRequest::new(
+                    video_id,
+                    visitor_data.as_deref(),
+                    credential,
+                ))
                 .send()
                 .await?
                 .error_for_status()?
@@ -608,7 +666,11 @@ struct PlayerRequest<'a> {
 }
 
 impl<'a> PlayerRequest<'a> {
-    fn new(video_id: &'a str, visitor_data: Option<&'a str>) -> Self {
+    fn new(
+        video_id: &'a str,
+        visitor_data: Option<&'a str>,
+        credential: Option<&'a CredentialTransferToken>,
+    ) -> Self {
         Self {
             video_id,
             context: RequestContext {
@@ -620,6 +682,12 @@ impl<'a> PlayerRequest<'a> {
                     gl: "US",
                     android_sdk_version: 32,
                 },
+                user: credential.map(|credential| UserContext {
+                    credential_transfer_tokens: [CredentialTokenContext {
+                        scope: "VIDEO",
+                        token: credential.value(),
+                    }],
+                }),
             },
         }
     }
@@ -628,6 +696,20 @@ impl<'a> PlayerRequest<'a> {
 #[derive(Serialize)]
 struct RequestContext<'a> {
     client: ClientContext<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<UserContext<'a>>,
+}
+
+#[derive(Serialize)]
+struct UserContext<'a> {
+    #[serde(rename = "credentialTransferTokens")]
+    credential_transfer_tokens: [CredentialTokenContext<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct CredentialTokenContext<'a> {
+    scope: &'static str,
+    token: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1584,6 +1666,7 @@ mod tests {
                     0.0,
                     &Default::default(),
                     super::PreferredVideoCodec::Auto,
+                    None,
                 )
                 .await;
             println!(
@@ -1595,8 +1678,28 @@ mod tests {
         }
     }
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn player_request_includes_only_the_supplied_video_credential() {
+        let credential =
+            CredentialTransferToken::new("dQw4w9WgXcQ".into(), "synthetic-credential".into());
+        let authenticated = serde_json::to_value(PlayerRequest::new(
+            "dQw4w9WgXcQ",
+            Some("visitor"),
+            Some(&credential),
+        ))
+        .unwrap();
+        assert_eq!(
+            authenticated["context"]["user"]["credentialTransferTokens"],
+            serde_json::json!([{"scope": "VIDEO", "token": "synthetic-credential"}])
+        );
+
+        let anonymous =
+            serde_json::to_value(PlayerRequest::new("dQw4w9WgXcQ", Some("visitor"), None)).unwrap();
+        assert!(anonymous["context"].get("user").is_none());
+    }
 
     #[test]
     fn extracts_supported_video_id_forms() {
@@ -2141,6 +2244,7 @@ mod tests {
                     0.0,
                     &PlayerCapabilities::default(),
                     PreferredVideoCodec::Auto,
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -2192,7 +2296,13 @@ mod tests {
         let mut capabilities = caps(&["av1", "vp9", "h264"], &["opus", "aac"], &[], (3840, 2160));
         capabilities.subtitle_formats = vec!["vtt".into()];
         let media = resolver
-            .resolve_metadata("dQw4w9WgXcQ", 12.5, &capabilities, PreferredVideoCodec::Vp9)
+            .resolve_metadata(
+                "dQw4w9WgXcQ",
+                12.5,
+                &capabilities,
+                PreferredVideoCodec::Vp9,
+                None,
+            )
             .await
             .unwrap();
 
@@ -2203,5 +2313,70 @@ mod tests {
         assert_eq!(media.subtitle.as_deref(), Some("Channel"));
         assert_eq!(media.duration, Some(213.0));
         assert_eq!(media.start_time, 12.5);
+    }
+
+    #[tokio::test]
+    async fn credential_bound_resolution_posts_ctt_and_uses_innertube_audio() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"ytcfg.set({"INNERTUBE_API_KEY":"test-key","VISITOR_DATA":"visitor"});"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(body_json(serde_json::json!({
+                "videoId": "dQw4w9WgXcQ",
+                "context": {
+                    "client": {
+                        "clientName": "ANDROID",
+                        "clientVersion": "20.10.38",
+                        "visitorData": "visitor",
+                        "hl": "en",
+                        "gl": "US",
+                        "androidSdkVersion": 32
+                    },
+                    "user": {
+                        "credentialTransferTokens": [{
+                            "scope": "VIDEO",
+                            "token": "synthetic-credential"
+                        }]
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "playabilityStatus": {"status": "OK"},
+                "streamingData": {"adaptiveFormats": adaptive_formats()},
+                "videoDetails": {
+                    "videoId": "dQw4w9WgXcQ",
+                    "title": "Credential-bound fixture",
+                    "author": "Test",
+                    "lengthSeconds": "213"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resolver = Resolver::with_endpoints(reqwest::Client::new(), &server.uri());
+        let credential =
+            CredentialTransferToken::new("dQw4w9WgXcQ".into(), "synthetic-credential".into());
+        let media = resolver
+            .resolve(
+                "dQw4w9WgXcQ",
+                0.0,
+                &caps(&["av1", "vp9", "h264"], &["opus", "aac"], &[], (3840, 2160)),
+                PreferredVideoCodec::Auto,
+                Some(&credential),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(media.title.as_deref(), Some("Credential-bound fixture"));
+        assert_eq!(media.streams.len(), 1);
+        assert_eq!(media.streams[0].content_type, "audio/webm");
     }
 }

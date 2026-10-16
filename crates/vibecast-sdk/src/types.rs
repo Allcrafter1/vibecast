@@ -70,10 +70,25 @@ impl StreamSource {
     }
 }
 
-/// Shared cache identity/status; contains no media bytes or transport objects.
+/// Shared cache identity/status and optional source refresh contract; no media bytes.
 /// Only a fully downloaded entry is safe to replay after its source URL expires.
 #[derive(Debug, Clone, Default)]
-pub struct MediaCacheHint(std::sync::Arc<std::sync::atomic::AtomicU8>);
+pub struct MediaCacheHint(std::sync::Arc<MediaCacheState>);
+
+#[derive(Debug, Default)]
+struct MediaCacheState {
+    status: std::sync::atomic::AtomicU8,
+    recovery_attempts: std::sync::atomic::AtomicU8,
+    refresh: std::sync::Mutex<Option<std::sync::Arc<dyn MediaSourceRefresh>>>,
+}
+
+/// Refresh an expired progressive URL without replacing the playing object.
+/// Implementations must only return the same immutable byte representation;
+/// changing formats would corrupt readers already consuming the cached bytes.
+#[async_trait::async_trait]
+pub trait MediaSourceRefresh: Send + Sync + std::fmt::Debug {
+    async fn refresh(&self) -> Option<String>;
+}
 
 impl PartialEq for MediaCacheHint {
     fn eq(&self, other: &Self) -> bool {
@@ -84,18 +99,51 @@ impl Eq for MediaCacheHint {}
 
 impl MediaCacheHint {
     pub fn is_complete(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire) == 1
+        self.0.status.load(std::sync::atomic::Ordering::Acquire) == 1
     }
     pub fn is_failed(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire) == 2
+        self.0.status.load(std::sync::atomic::Ordering::Acquire) == 2
     }
     /// Receiver-side completion notification.
     pub fn mark_complete(&self) {
-        self.0.store(1, std::sync::atomic::Ordering::Release);
+        self.0.status.store(1, std::sync::atomic::Ordering::Release);
     }
     /// Receiver-side failure/cancellation notification.
     pub fn invalidate(&self) {
-        self.0.store(2, std::sync::atomic::Ordering::Release);
+        self.0.status.store(2, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_refresh(&self, refresh: std::sync::Arc<dyn MediaSourceRefresh>) {
+        *self.0.refresh.lock().unwrap() = Some(refresh);
+    }
+
+    pub fn source_refresh(&self) -> Option<std::sync::Arc<dyn MediaSourceRefresh>> {
+        self.0.refresh.lock().unwrap().clone()
+    }
+
+    pub fn recovery_attempts(&self) -> u8 {
+        self.0
+            .recovery_attempts
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Carry the selection's consumed budget into a replacement player load.
+    pub fn set_recovery_attempts(&self, attempts: u8) {
+        self.0
+            .recovery_attempts
+            .fetch_max(attempts.min(2), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Reserve one of at most two automatic recovery rounds for this selection.
+    pub fn try_recovery(&self) -> bool {
+        self.0
+            .recovery_attempts
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |attempts| (attempts < 2).then(|| attempts + 1),
+            )
+            .is_ok()
     }
 }
 
@@ -216,6 +264,10 @@ pub struct PlaybackState {
     pub duration: Option<f64>,
     /// Reason for entering IDLE, if applicable.
     pub idle_reason: Option<IdleReason>,
+    /// Automatic source recovery rounds already consumed for this load.
+    /// Apps carry this count into decoder-level retries instead of granting
+    /// another budget after the progressive cache has exhausted its attempts.
+    pub media_recovery_attempts: u8,
 }
 
 /// User control forwarded to an app from Cast or a physical output device.

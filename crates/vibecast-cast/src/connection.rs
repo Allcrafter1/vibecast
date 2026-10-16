@@ -6,11 +6,12 @@
 //! answered locally; every other message is forwarded as a [`ServerEvent`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::codec::Framed;
 
 use vibecast_proto::cast_channel::cast_message::{PayloadType, ProtocolVersion};
@@ -21,6 +22,9 @@ use vibecast_security::{build_auth_error, build_auth_response, AuthErrorType, Ce
 
 use crate::error::CastError;
 use crate::{message, namespace as ns};
+
+const ENQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Device-auth material captured for the lifetime of a connection.
 #[derive(Clone, Debug)]
@@ -37,6 +41,7 @@ pub struct ConnectionHandle {
     id: u64,
     peer: Arc<str>,
     tx: mpsc::Sender<CastMessage>,
+    closing: watch::Sender<bool>,
 }
 
 impl ConnectionHandle {
@@ -54,7 +59,24 @@ impl ConnectionHandle {
 
     /// Send a pre-built message to this sender.
     pub async fn send(&self, message: CastMessage) -> Result<(), CastError> {
-        self.tx.send(message).await.map_err(|_| CastError::Closed)
+        let mut closing = self.closing.subscribe();
+        if *closing.borrow() {
+            return Err(CastError::Closed);
+        }
+        tokio::select! {
+            biased;
+            _ = closing.changed() => Err(CastError::Closed),
+            result = tokio::time::timeout(ENQUEUE_TIMEOUT, self.tx.send(message)) => {
+                match result {
+                    Ok(result) => result.map_err(|_| CastError::Closed),
+                    Err(_) => {
+                        tracing::warn!(connection_id = self.id, "Cast outbound queue timed out; closing sender");
+                        self.closing.send_replace(true);
+                        Err(CastError::Closed)
+                    }
+                }
+            }
+        }
     }
 
     /// Send a JSON (STRING) message (compact, no whitespace).
@@ -107,7 +129,7 @@ pub enum ServerEvent {
 }
 
 /// Aborts the wrapped task when dropped, so the writer never outlives the reader.
-struct AbortGuard(tokio::task::JoinHandle<()>);
+struct AbortGuard(tokio::task::JoinHandle<&'static str>);
 
 impl Drop for AbortGuard {
     fn drop(&mut self) {
@@ -130,46 +152,70 @@ pub async fn run_connection<S>(
 {
     let (mut sink, mut reader) = Framed::new(stream, CastCodec).split();
     let (tx, mut rx) = mpsc::channel::<CastMessage>(64);
+    let (closing, mut closed) = watch::channel(false);
     let handle = ConnectionHandle {
         id,
         peer: Arc::clone(&peer),
         tx,
+        closing,
     };
 
     // Writer task: drains outbound messages onto the wire. Aborted on drop.
-    let _writer = AbortGuard(tokio::spawn(async move {
+    let mut writer = AbortGuard(tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if sink.send(message).await.is_err() {
-                break;
+            match tokio::time::timeout(WRITE_TIMEOUT, sink.send(message)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return "write_error",
+                Err(_) => return "write_timeout",
             }
         }
+        "outbound_closed"
     }));
 
     tracing::info!(peer = %peer, "connection opened");
-    if events
-        .send(ServerEvent::Connected(handle.clone()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let close_reason = loop {
-        match reader.next().await {
-            Some(Ok(message)) => {
-                if !dispatch(message, &auth, &handle, &events).await {
-                    break "dispatch_closed";
+    let (close_reason, writer_finished) = {
+        // Select around dispatch as well as reads: dispatch itself can be
+        // waiting on a congested event queue or a heartbeat reply.
+        let read_loop = async {
+            if events
+                .send(ServerEvent::Connected(handle.clone()))
+                .await
+                .is_err()
+            {
+                return "event_consumer_closed";
+            }
+            loop {
+                match reader.next().await {
+                    Some(Ok(message)) => {
+                        if !dispatch(message, &auth, &handle, &events).await {
+                            break "dispatch_closed";
+                        }
+                    }
+                    Some(Err(FramingError::Io(_))) => break "transport_io",
+                    Some(Err(err)) => {
+                        tracing::warn!(peer = %peer, error = %err, "framing error, closing");
+                        break "framing_error";
+                    }
+                    None => break "peer_eof",
                 }
             }
-            Some(Err(FramingError::Io(_))) => break "transport_io", // no raw network error/URL
-            Some(Err(err)) => {
-                tracing::warn!(peer = %peer, error = %err, "framing error, closing");
-                break "framing_error";
-            }
-            None => break "peer_eof",
+        };
+        tokio::select! {
+            biased;
+            _ = closed.changed() => ("outbound_queue_timeout", false),
+            result = &mut writer.0 => (result.unwrap_or("writer_task_failed"), true),
+            reason = read_loop => (reason, false),
         }
     };
 
+    handle.closing.send_replace(true);
+    // Release the transport and pending sends before notifying the hub. Its
+    // inbound queue may itself be backed up behind this connection's output.
+    if !writer_finished {
+        writer.0.abort();
+        let _ = (&mut writer.0).await;
+    }
+    drop(reader);
     tracing::info!(peer = %peer, close_reason, "connection closed");
     let _ = events.send(ServerEvent::Disconnected { id, peer }).await;
 }

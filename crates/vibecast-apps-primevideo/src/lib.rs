@@ -752,6 +752,7 @@ mod tests {
 
         // A 1080p SDR player with hardware Widevine L1 (the SHIELD-on-1080p case).
         let caps = PlayerCapabilities {
+            local_audio_cache: false,
             platform: Platform::Android,
             drm: vec![DrmCapability::new(
                 DrmSystem::Widevine,

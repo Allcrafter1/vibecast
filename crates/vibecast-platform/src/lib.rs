@@ -90,6 +90,18 @@ pub struct PlatformInputs {
 /// Errors assembling or starting the receiver.
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
+    /// Initial volume settings cannot be represented by valid Cast volume values.
+    #[error("invalid volume setting for {field}")]
+    InvalidVolume {
+        /// Name of the invalid configuration field.
+        field: &'static str,
+    },
+    /// A network timeout/poll interval was non-positive, non-finite or too large.
+    #[error("invalid positive duration for {field}")]
+    InvalidDuration {
+        /// Name of the invalid configuration field.
+        field: &'static str,
+    },
     /// Reading persistent receiver state failed.
     #[error("reading receiver state {path}")]
     StateRead {
@@ -211,6 +223,15 @@ pub async fn run(
     inputs: PlatformInputs,
     observer: Option<Arc<dyn PlayerObserver>>,
 ) -> Result<RunningReceiver, PlatformError> {
+    // Validate before filesystem/network work or spawning the manager. Invalid
+    // TOML floats otherwise panic inside Duration or the timer task.
+    let cert_rotation_poll = positive_duration(
+        config.network.cert_rotation_poll,
+        "network.cert_rotation_poll",
+    )?
+    .max(Duration::from_secs(1));
+    positive_duration(config.network.http_timeout, "network.http_timeout")?;
+    let volume = initial_volume(&config)?;
     let PlatformInputs {
         data_dir,
         certs_path,
@@ -258,8 +279,8 @@ pub async fn run(
     )
     .await?;
 
-    // --- shared HTTP client (User-Agent + CAST-DEVICE-CAPABILITIES + timeout) ---
-    let http = build_http_client(&config)?;
+    // Media response bodies can remain open while playback is paused.
+    let (http, media_http) = build_http_clients(&config)?;
 
     // Device-auth CRL: prefer the manifest's embedded CRL, else fetch from Google.
     let crl = resolve_crl(&http, bundle.crl.clone()).await;
@@ -281,9 +302,10 @@ pub async fn run(
         registry,
         installation_id,
         http,
+        media_http,
         data_dir,
         model,
-        volume: initial_volume(&config),
+        volume,
         user_agent: config.cast.user_agent.clone(),
         cast_device_capabilities: config.cast.device_capabilities.header_value(),
         resolver,
@@ -300,7 +322,7 @@ pub async fn run(
             capabilities: config.device.capabilities.clone(),
         },
         advertise_mdns,
-        cert_rotation_poll: config.network.cert_rotation_poll,
+        cert_rotation_poll,
         observer,
     };
     let shutdown = CancellationToken::new();
@@ -610,30 +632,114 @@ impl From<SettingsFileApp> for PersistedAppSettings {
     }
 }
 
-fn initial_volume(config: &Config) -> Volume {
-    Volume {
+fn initial_volume(config: &Config) -> Result<Volume, PlatformError> {
+    if !config.volume.level.is_finite() || !(0.0..=1.0).contains(&config.volume.level) {
+        return Err(PlatformError::InvalidVolume {
+            field: "volume.level",
+        });
+    }
+    if !config.volume.step_interval.is_finite() || config.volume.step_interval <= 0.0 {
+        return Err(PlatformError::InvalidVolume {
+            field: "volume.step_interval",
+        });
+    }
+    Ok(Volume {
         level: config.volume.level,
         muted: config.volume.muted,
         control_type: Some("attenuation".to_string()),
         step_interval: Some(config.volume.step_interval),
-    }
+    })
 }
 
-fn build_http_client(config: &Config) -> Result<reqwest::Client, PlatformError> {
+fn build_http_clients(
+    config: &Config,
+) -> Result<(reqwest::Client, reqwest::Client), PlatformError> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let timeout = positive_duration(config.network.http_timeout, "network.http_timeout")?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("cast-device-capabilities"),
         HeaderValue::from_str(&config.cast.device_capabilities.header_value())?,
     );
-    reqwest::Client::builder()
-        .user_agent(&config.cast.user_agent)
-        .default_headers(headers)
-        .cookie_store(true)
-        .timeout(Duration::from_secs_f64(config.network.http_timeout))
+    let cookies = Arc::new(reqwest::cookie::Jar::default());
+    let client = || {
+        reqwest::Client::builder()
+            .user_agent(&config.cast.user_agent)
+            .default_headers(headers.clone())
+            .cookie_provider(cookies.clone())
+    };
+    let http = client()
+        .timeout(timeout)
         .build()
-        .map_err(PlatformError::HttpClient)
+        .map_err(PlatformError::HttpClient)?;
+    // Separate connection pools, shared authentication policy. The cache owns
+    // response-header and active-read deadlines; a pause must not expire the body.
+    let media_http = client()
+        .connect_timeout(timeout)
+        .build()
+        .map_err(PlatformError::HttpClient)?;
+    Ok((http, media_http))
+}
+
+fn positive_duration(seconds: f64, field: &'static str) -> Result<Duration, PlatformError> {
+    let duration = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| PlatformError::InvalidDuration { field })?;
+    if duration.is_zero() || std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(PlatformError::InvalidDuration { field });
+    }
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod invalid_timeout_regression {
+    use super::*;
+
+    #[test]
+    fn invalid_http_timeout_returns_an_error_instead_of_panicking() {
+        for value in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -1.0,
+            0.0,
+            1e-99,
+            f64::MAX,
+        ] {
+            let mut config = Config::default();
+            config.network.http_timeout = value;
+            assert!(build_http_clients(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn polling_duration_rejects_invalid_values_and_keeps_valid_intervals() {
+        for value in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -1.0,
+            0.0,
+            1e-99,
+            f64::MAX,
+        ] {
+            assert!(matches!(
+                positive_duration(value, "network.cert_rotation_poll"),
+                Err(PlatformError::InvalidDuration {
+                    field: "network.cert_rotation_poll"
+                })
+            ));
+        }
+        assert_eq!(
+            positive_duration(0.1, "test").unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            positive_duration(60.0, "test").unwrap(),
+            Duration::from_secs(60)
+        );
+    }
 }
 
 /// Resolve the device-auth CRL: prefer the manifest's, else fetch from Google.
@@ -680,6 +786,93 @@ pub fn detect_local_ip(bind_host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_volume_never_emits_nonfinite_or_out_of_range_wire_values() {
+        for value in ["nan", "inf", "-inf", "-0.1", "1.1"] {
+            let config: Config = toml::from_str(&format!("[volume]\nlevel = {value}")).unwrap();
+            assert!(matches!(
+                initial_volume(&config),
+                Err(PlatformError::InvalidVolume {
+                    field: "volume.level"
+                })
+            ));
+        }
+        for value in ["nan", "inf", "-inf", "0.0", "-0.1"] {
+            let config: Config =
+                toml::from_str(&format!("[volume]\nstep_interval = {value}")).unwrap();
+            assert!(matches!(
+                initial_volume(&config),
+                Err(PlatformError::InvalidVolume {
+                    field: "volume.step_interval"
+                })
+            ));
+        }
+        for level in [0.0, 0.25, 1.0] {
+            let mut config = Config::default();
+            config.volume.level = level;
+            assert_eq!(initial_volume(&config).unwrap().level, level);
+        }
+        let mut config = Config::default();
+        config.volume.step_interval = 1.1;
+        assert_eq!(initial_volume(&config).unwrap().step_interval, Some(1.1));
+    }
+
+    #[tokio::test]
+    async fn media_body_survives_metadata_timeout_and_shares_cookie_and_header_policy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut config = Config::default();
+        config.network.http_timeout = 0.1;
+        let (http, media_http) = build_http_clients(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let user_agent = config.cast.user_agent.to_lowercase();
+        let capabilities = config
+            .cast
+            .device_capabilities
+            .header_value()
+            .to_lowercase();
+        let origin = tokio::spawn(async move {
+            for media_request in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 16 * 1024);
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                assert!(request.contains(&format!("user-agent: {user_agent}\r\n")));
+                assert!(request.contains(&format!("cast-device-capabilities: {capabilities}\r\n")));
+                if media_request {
+                    assert!(request.contains("cookie: playback=test\r\n"));
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: playback=test; Path=/\r\nConnection: close\r\n\r\na").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = socket.write_all(b"b").await;
+            }
+        });
+        let url = format!("http://{address}/media");
+        let error = http
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "metadata must retain its total timeout");
+
+        let mut response = media_http.get(&url).send().await.unwrap();
+        assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), b"a");
+        // A paused decoder does not poll the retained response body.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), b"b");
+        assert!(response.chunk().await.unwrap().is_none());
+        origin.await.unwrap();
+    }
 
     #[test]
     fn app_providers_are_registered() {

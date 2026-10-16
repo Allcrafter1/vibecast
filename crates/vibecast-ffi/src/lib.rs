@@ -308,6 +308,8 @@ impl From<PlatformError> for ReceiverError {
                 ReceiverError::Certs { reason: message }
             }
             PlatformError::Registry(_)
+            | PlatformError::InvalidDuration { .. }
+            | PlatformError::InvalidVolume { .. }
             | PlatformError::SettingsCatalog(_)
             | PlatformError::Settings(_) => ReceiverError::Config { reason: message },
             PlatformError::Discovery(_)

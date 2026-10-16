@@ -103,10 +103,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn resolve_certs_path(args: &Args, config: &Config, data_dir: &std::path::Path) -> PathBuf {
-    if let Some(certs) = &args.certs {
-        return certs.clone();
-    }
-    let configured = PathBuf::from(&config.device.certs);
+    let configured = args
+        .certs
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&config.device.certs));
     if configured.is_absolute() {
         configured
     } else {
@@ -155,5 +155,19 @@ mod tests {
         let config = Config::default();
         let path = resolve_certs_path(&args, &config, std::path::Path::new("/data"));
         assert_eq!(path, PathBuf::from("/data/certs.json"));
+    }
+
+    #[test]
+    fn explicit_relative_certs_path_uses_data_dir_not_working_directory() {
+        let args = Args::try_parse_from(["vibecast", "--certs", "custom/certs.json"]).unwrap();
+        assert_eq!(
+            resolve_certs_path(&args, &Config::default(), std::path::Path::new("/data")),
+            PathBuf::from("/data/custom/certs.json")
+        );
+        let args = Args::try_parse_from(["vibecast", "--certs", "/external/certs.json"]).unwrap();
+        assert_eq!(
+            resolve_certs_path(&args, &Config::default(), std::path::Path::new("/data")),
+            PathBuf::from("/external/certs.json")
+        );
     }
 }

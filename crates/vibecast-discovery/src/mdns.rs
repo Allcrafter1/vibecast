@@ -254,18 +254,34 @@ impl MdnsResponder {
     pub fn start(advertisement: &CastAdvertisement) -> Result<Self, DiscoveryError> {
         use mdns_sd::ServiceDaemon;
 
+        // Validate before opening sockets/spawning the daemon thread.
+        let service = service_info(advertisement)?;
         let daemon = ServiceDaemon::new().map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
-        daemon
-            .register(service_info(advertisement)?)
-            .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
+        let responder = Self::register_daemon(daemon, service)?;
 
         tracing::info!(
             service = %advertisement.fullname(),
             "mDNS advertisement started"
         );
-        Ok(Self {
+        Ok(responder)
+    }
+
+    fn register_daemon(
+        daemon: mdns_sd::ServiceDaemon,
+        service: mdns_sd::ServiceInfo,
+    ) -> Result<Self, DiscoveryError> {
+        // ServiceDaemon itself does not stop its thread on Drop. Establish our
+        // owner before registration so every error path runs bounded shutdown.
+        let responder = Self {
             daemon: Some(daemon),
-        })
+        };
+        responder
+            .daemon
+            .as_ref()
+            .expect("new responder owns its daemon")
+            .register(service)
+            .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
+        Ok(responder)
     }
 
     /// Stop advertising and shut down the responder.
@@ -309,6 +325,65 @@ impl Drop for MdnsResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn failed_registration_stops_its_owned_daemon() {
+        use mdns_sd::{DaemonStatus, ServiceDaemon, ServiceInfo};
+        let daemon = ServiceDaemon::new_with_port(0).unwrap();
+        let probe = daemon.clone();
+        // ServiceInfo accepts this but register() rejects the invalid host.
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            "test",
+            &format!("{}.local.", "x".repeat(256)),
+            "",
+            8009,
+            None::<std::collections::HashMap<String, String>>,
+        )
+        .unwrap();
+        assert!(MdnsResponder::register_daemon(daemon, service).is_err());
+        let status = probe
+            .status()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // Clean up even against the buggy implementation before asserting.
+        if status != DaemonStatus::Shutdown {
+            probe
+                .shutdown()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        assert_eq!(status, DaemonStatus::Shutdown);
+    }
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn responder_drop_and_repeated_stop_shutdown_only_the_owned_daemon() {
+        use mdns_sd::{DaemonStatus, ServiceDaemon};
+        for explicit_stop in [false, true] {
+            let daemon = ServiceDaemon::new_with_port(0).unwrap();
+            let probe = daemon.clone();
+            let mut responder = MdnsResponder {
+                daemon: Some(daemon),
+            };
+            if explicit_stop {
+                responder.stop();
+                responder.stop();
+            }
+            drop(responder);
+            assert_eq!(
+                probe
+                    .status()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                DaemonStatus::Shutdown
+            );
+        }
+    }
 
     #[test]
     fn cleans_and_builds_instance_and_bs() {

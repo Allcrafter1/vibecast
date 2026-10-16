@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 use vibecast_cast::{AuthMaterial, CastServer, ServerEvent};
 use vibecast_core::{AppRegistry, DeviceHub, DeviceHubHandle, DeviceIdentity, HubConfig};
@@ -49,6 +49,8 @@ pub struct ReceiverParams {
     pub reports: mpsc::Receiver<PlayerReport>,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// Shared progressive-media client without a total response-body timeout.
+    pub media_http: reqwest::Client,
     /// Base data directory.
     pub data_dir: PathBuf,
     /// Initial receiver volume.
@@ -160,7 +162,7 @@ impl RotationHandle {
 /// A running receiver instance and the discovery facts a frontend needs.
 pub struct RunningReceiver {
     shutdown: CancellationToken,
-    tasks: TaskTracker,
+    tasks: JoinSet<()>,
     hub_handle: DeviceHubHandle,
     cast_server: Arc<CastServer>,
     advertiser: Arc<tokio::sync::Mutex<Advertiser>>,
@@ -188,17 +190,21 @@ impl RunningReceiver {
 
     /// Cooperatively tear this receiver down: stop advertising, stop app
     /// sessions cleanly, then cancel and await the supervised tasks.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.advertiser.lock().await.stop();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.hub_handle.shutdown()).await;
         self.shutdown.cancel();
-        self.tasks.close();
-        if tokio::time::timeout(Duration::from_secs(5), self.tasks.wait())
-            .await
-            .is_err()
-        {
-            tracing::warn!("receiver background tasks did not stop within 5s; exiting anyway");
-        }
+        finish_tasks(&mut self.tasks, Duration::from_secs(5)).await;
+    }
+}
+
+async fn finish_tasks(tasks: &mut JoinSet<()>, grace: Duration) {
+    if tokio::time::timeout(grace, async { while tasks.join_next().await.is_some() {} })
+        .await
+        .is_err()
+    {
+        tracing::warn!("receiver background tasks did not stop within grace period; aborting them");
+        tasks.shutdown().await;
     }
 }
 
@@ -213,6 +219,7 @@ pub async fn spawn(params: ReceiverParams) -> Result<RunningReceiver, ReceiverEr
         proxy,
         reports,
         http,
+        media_http,
         data_dir,
         volume,
         user_agent,
@@ -285,6 +292,7 @@ pub async fn spawn(params: ReceiverParams) -> Result<RunningReceiver, ReceiverEr
         player,
         proxy,
         http,
+        media_http,
         data_dir,
         volume,
         user_agent,
@@ -295,7 +303,7 @@ pub async fn spawn(params: ReceiverParams) -> Result<RunningReceiver, ReceiverEr
     let hub_handle = hub.handle();
 
     let shutdown = CancellationToken::new();
-    let tasks = TaskTracker::new();
+    let mut tasks = JoinSet::new();
 
     // Player reports -> hub.
     {
@@ -308,7 +316,11 @@ pub async fn spawn(params: ReceiverParams) -> Result<RunningReceiver, ReceiverEr
                     () = shutdown.cancelled() => break,
                     report = reports.recv() => match report {
                         Some(report) => {
-                            if hub_handle.send_player_report(report).await.is_err() {
+                            let delivered = tokio::select! {
+                                () = shutdown.cancelled() => break,
+                                result = hub_handle.send_player_report(report) => result,
+                            };
+                            if delivered.is_err() {
                                 break;
                             }
                         }
@@ -326,8 +338,16 @@ pub async fn spawn(params: ReceiverParams) -> Result<RunningReceiver, ReceiverEr
         crl,
     };
     let cast_server = Arc::new(CastServer::new(cast_tls, auth, events_tx));
-    spawn_server_forward(&tasks, shutdown.clone(), events_rx, hub_handle.clone());
-    tasks.spawn(hub.run());
+    spawn_server_forward(&mut tasks, shutdown.clone(), events_rx, hub_handle.clone());
+    {
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            tokio::select! {
+                () = shutdown.cancelled() => {},
+                () = hub.run() => {},
+            }
+        });
+    }
     {
         let cast_server = cast_server.clone();
         let shutdown = shutdown.clone();
@@ -428,7 +448,7 @@ fn local_port(listener: &TcpListener, fallback: u16) -> u16 {
 }
 
 fn spawn_server_forward(
-    tasks: &TaskTracker,
+    tasks: &mut JoinSet<()>,
     shutdown: CancellationToken,
     mut events_rx: mpsc::Receiver<ServerEvent>,
     hub_handle: DeviceHubHandle,
@@ -439,7 +459,11 @@ fn spawn_server_forward(
                 () = shutdown.cancelled() => break,
                 event = events_rx.recv() => match event {
                     Some(event) => {
-                        if hub_handle.send_server_event(event).await.is_err() {
+                        let delivered = tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            result = hub_handle.send_server_event(event) => result,
+                        };
+                        if delivered.is_err() {
                             break;
                         }
                     }
@@ -458,4 +482,33 @@ fn txt_pairs(advertisement: &CastAdvertisement) -> Vec<(String, String)> {
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
         .collect()
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn forced_shutdown_drops_resources_held_by_stalled_tasks() {
+        let mut tasks = JoinSet::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (retained, released) = tokio::sync::oneshot::channel::<()>();
+        tasks.spawn(async move {
+            let _resource = retained;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            finish_tasks(&mut tasks, Duration::from_millis(20)),
+        )
+        .await
+        .expect("shutdown must abort tasks that ignore cooperative cancellation");
+        assert!(
+            released.await.is_err(),
+            "shutdown must drop resources before returning"
+        );
+        assert!(tasks.is_empty());
+    }
 }

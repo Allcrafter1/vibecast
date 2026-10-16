@@ -62,6 +62,9 @@ pub struct PlaybackStreamPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackMediaPayload {
+    /// Correlates reports with this load; absent for legacy protocol peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_session_id: Option<i64>,
     /// Original typed sender metadata, when retained by the app provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<MediaMetadata>,
@@ -96,6 +99,7 @@ pub struct PlaybackMediaPayload {
 impl Default for PlaybackMediaPayload {
     fn default() -> Self {
         Self {
+            media_session_id: None,
             metadata: None,
             streams: Vec::new(),
             stream_type: StreamType::default(),
@@ -198,12 +202,17 @@ pub enum PlayerReport {
     /// A user action originating at the physical output device.
     ControlRequest {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_session_id: Option<i64>,
         control: PlayerControlRequest,
     },
     /// Player state update.
     State {
         /// Owning session id.
         session_id: String,
+        /// LOAD identity echoed by players that support report correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_session_id: Option<i64>,
         /// Current playback state.
         player_state: PlayerState,
         /// Current position in seconds.
@@ -224,6 +233,9 @@ pub enum PlayerReport {
     Error {
         /// Owning session id.
         session_id: String,
+        /// LOAD identity echoed by players that support report correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_session_id: Option<i64>,
         /// Error code.
         code: String,
         /// Human-readable message.
@@ -363,6 +375,8 @@ pub enum ClientMessage {
     #[serde(rename = "controlRequest")]
     ControlRequest {
         session_id: String,
+        #[serde(default)]
+        media_session_id: Option<i64>,
         control: PlayerControlRequest,
     },
     #[serde(rename = "register")]
@@ -370,6 +384,8 @@ pub enum ClientMessage {
     #[serde(rename = "state")]
     State {
         session_id: String,
+        #[serde(default)]
+        media_session_id: Option<i64>,
         player_state: PlayerState,
         #[serde(default)]
         current_time: f64,
@@ -385,6 +401,8 @@ pub enum ClientMessage {
     #[serde(rename = "error")]
     Error {
         session_id: String,
+        #[serde(default)]
+        media_session_id: Option<i64>,
         code: String,
         message: String,
     },
@@ -411,13 +429,16 @@ impl ClientMessage {
             }),
             Self::ControlRequest {
                 session_id,
+                media_session_id,
                 control,
             } => Some(PlayerReport::ControlRequest {
                 session_id,
+                media_session_id,
                 control,
             }),
             Self::State {
                 session_id,
+                media_session_id,
                 player_state,
                 current_time,
                 duration,
@@ -426,6 +447,7 @@ impl ClientMessage {
                 muted,
             } => Some(PlayerReport::State {
                 session_id,
+                media_session_id,
                 player_state,
                 current_time,
                 duration,
@@ -435,10 +457,12 @@ impl ClientMessage {
             }),
             Self::Error {
                 session_id,
+                media_session_id,
                 code,
                 message,
             } => Some(PlayerReport::Error {
                 session_id,
+                media_session_id,
                 code,
                 message,
             }),
@@ -512,6 +536,44 @@ pub enum SettingsUpdateStatus {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn media_generation_reports_preserve_ids_and_accept_legacy_messages() {
+        fn id(report: PlayerReport) -> Option<i64> {
+            match report {
+                PlayerReport::State {
+                    media_session_id, ..
+                }
+                | PlayerReport::Error {
+                    media_session_id, ..
+                }
+                | PlayerReport::ControlRequest {
+                    media_session_id, ..
+                } => media_session_id,
+                _ => panic!("unexpected report"),
+            }
+        }
+        for mut value in [
+            json!({"type":"state","sessionId":"s1","playerState":"PLAYING","currentTime":2.0}),
+            json!({"type":"error","sessionId":"s1","code":"ERROR","message":"failed"}),
+            json!({"type":"controlRequest","sessionId":"s1","control":{"command":"stop"}}),
+        ] {
+            let legacy: ClientMessage = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(id(legacy.into_report().unwrap()), None);
+            value["mediaSessionId"] = json!(42);
+            let message: ClientMessage = serde_json::from_value(value).unwrap();
+            assert_eq!(id(message.into_report().unwrap()), Some(42));
+        }
+        let payload = PlaybackMediaPayload {
+            media_session_id: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(payload).unwrap()["mediaSessionId"], 42);
+        assert!(serde_json::to_value(PlaybackMediaPayload::default())
+            .unwrap()
+            .get("mediaSessionId")
+            .is_none());
+    }
 
     #[test]
     fn load_command_serializes_camel_case_with_type_tag() {

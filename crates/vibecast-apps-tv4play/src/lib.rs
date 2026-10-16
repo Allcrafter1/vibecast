@@ -823,6 +823,7 @@ mod tests {
                     current_time: 42.0,
                     duration: Some(120.0),
                     idle_reason: None,
+                    media_recovery_attempts: 0,
                 },
             )
             .await;

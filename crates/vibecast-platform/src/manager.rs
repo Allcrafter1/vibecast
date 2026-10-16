@@ -75,6 +75,7 @@ pub(crate) struct ManagerConfig {
     pub registry: AppRegistry,
     pub installation_id: uuid::Uuid,
     pub http: reqwest::Client,
+    pub media_http: reqwest::Client,
     pub data_dir: PathBuf,
     pub model: String,
     pub volume: Volume,
@@ -87,7 +88,7 @@ pub(crate) struct ManagerConfig {
     pub local_ip: String,
     pub eureka: EurekaConfig,
     pub advertise_mdns: bool,
-    pub cert_rotation_poll: f64,
+    pub cert_rotation_poll: Duration,
     pub observer: Option<Arc<dyn PlayerObserver>>,
 }
 
@@ -122,7 +123,7 @@ impl PlayerManager {
         mut events: mpsc::Receiver<PlayerEvent>,
         shutdown: CancellationToken,
     ) {
-        let period = Duration::from_secs_f64(self.config.cert_rotation_poll.max(1.0));
+        let period = self.config.cert_rotation_poll;
         let mut ticker = tokio::time::interval(period);
         ticker.tick().await; // consume the immediate first tick
 
@@ -166,6 +167,16 @@ impl PlayerManager {
     ) {
         let player_id = registration.player_id.clone();
 
+        // A delayed registration must not tear down a newer live receiver.
+        // Disconnects already use the same connection epoch fence below.
+        if self
+            .receivers
+            .get(&player_id)
+            .is_some_and(|tracked| tracked.epoch >= epoch)
+        {
+            return;
+        }
+
         // Reconnect / duplicate id: replace the previous receiver.
         if let Some(existing) = self.receivers.remove(&player_id) {
             existing.receiver.shutdown().await;
@@ -187,6 +198,7 @@ impl PlayerManager {
             proxy: self.config.bridge.clone(),
             reports,
             http: self.config.http.clone(),
+            media_http: self.config.media_http.clone(),
             data_dir: self.config.data_dir.clone(),
             volume: self.config.volume.clone(),
             user_agent: self.config.user_agent.clone(),
