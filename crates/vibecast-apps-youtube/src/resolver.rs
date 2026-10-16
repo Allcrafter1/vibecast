@@ -161,7 +161,7 @@ impl Resolver {
         let credential = credential.filter(|credential| credential.applies_to(video_id));
         let started = std::time::Instant::now();
         if credential.is_some() {
-            let media = self
+            let mut media = self
                 .resolve_metadata(
                     video_id,
                     start_time,
@@ -170,6 +170,7 @@ impl Resolver {
                     credential,
                 )
                 .await?;
+            make_first_stream_cacheable(&mut media, capabilities.local_audio_cache);
             tracing::info!(
                 %video_id,
                 has_ctt = true,
@@ -275,6 +276,14 @@ impl Resolver {
         .await
         .map_err(|error| diagnose_http("player_metadata", error))?;
 
+        tracing::info!(
+            %video_id,
+            has_ctt = credential.is_some(),
+            client = CLIENT_NAME,
+            status = %response.playability_status.status,
+            has_streaming_data = response.streaming_data.is_some(),
+            "YouTube player authorization result"
+        );
         if response.playability_status.status != "OK" {
             return Err(ResolveError::Unplayable(
                 response
@@ -663,6 +672,12 @@ struct PlayerRequest<'a> {
     #[serde(rename = "videoId")]
     video_id: &'a str,
     context: RequestContext<'a>,
+    #[serde(rename = "racyCheckOk", skip_serializing_if = "Option::is_none")]
+    racy_check_ok: Option<bool>,
+    #[serde(rename = "contentCheckOk", skip_serializing_if = "Option::is_none")]
+    content_check_ok: Option<bool>,
+    #[serde(rename = "isMdxPlayback", skip_serializing_if = "Option::is_none")]
+    is_mdx_playback: Option<bool>,
 }
 
 impl<'a> PlayerRequest<'a> {
@@ -671,8 +686,15 @@ impl<'a> PlayerRequest<'a> {
         visitor_data: Option<&'a str>,
         credential: Option<&'a CredentialTransferToken>,
     ) -> Self {
+        let credential = credential.filter(|value| value.applies_to(video_id));
         Self {
             video_id,
+            // The sender explicitly selected this video with its account
+            // credential. Acknowledge the content interstitial and identify
+            // the remote playback; YouTube still validates the credential.
+            racy_check_ok: credential.map(|_| true),
+            content_check_ok: credential.map(|_| true),
+            is_mdx_playback: credential.map(|_| true),
             context: RequestContext {
                 client: ClientContext {
                     client_name: CLIENT_NAME,
@@ -1699,6 +1721,15 @@ mod tests {
         let anonymous =
             serde_json::to_value(PlayerRequest::new("dQw4w9WgXcQ", Some("visitor"), None)).unwrap();
         assert!(anonymous["context"].get("user").is_none());
+        for field in ["racyCheckOk", "contentCheckOk", "isMdxPlayback"] {
+            assert_eq!(authenticated[field], true);
+            assert!(anonymous.get(field).is_none());
+        }
+        let mismatched =
+            serde_json::to_value(PlayerRequest::new("different-id", None, Some(&credential)))
+                .unwrap();
+        assert!(mismatched["context"].get("user").is_none());
+        assert!(mismatched.get("racyCheckOk").is_none());
     }
 
     #[test]
@@ -2316,6 +2347,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_bound_resolution_preserves_server_denial() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"ytcfg.set({"INNERTUBE_API_KEY":"test-key"});"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "playabilityStatus": {
+                    "status": "LOGIN_REQUIRED",
+                    "reason": "This video may be inappropriate for some users."
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resolver = Resolver::with_endpoints(reqwest::Client::new(), &server.uri());
+        let credential =
+            CredentialTransferToken::new("dQw4w9WgXcQ".into(), "synthetic-credential".into());
+        let result = resolver
+            .resolve(
+                "dQw4w9WgXcQ",
+                0.0,
+                &Default::default(),
+                PreferredVideoCodec::Auto,
+                Some(&credential),
+            )
+            .await;
+        assert!(matches!(result, Err(ResolveError::Unplayable(_))));
+    }
+
+    #[tokio::test]
     async fn credential_bound_resolution_posts_ctt_and_uses_innertube_audio() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2330,6 +2398,9 @@ mod tests {
             .and(path("/youtubei/v1/player"))
             .and(body_json(serde_json::json!({
                 "videoId": "dQw4w9WgXcQ",
+                "racyCheckOk": true,
+                "contentCheckOk": true,
+                "isMdxPlayback": true,
                 "context": {
                     "client": {
                         "clientName": "ANDROID",
