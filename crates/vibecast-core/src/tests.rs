@@ -16,8 +16,9 @@ use vibecast_player_api::{LicenseHandler, ManifestHandler, Player, PlayerCommand
 use vibecast_proto::CastCodec;
 use vibecast_sdk::{
     AppContext, AppManifest, AppProvider, AppSession, AppSettingsSchema, LaunchCredentials,
-    LaunchError, LoadRequest, MediaResolveError, PlaybackMedia, PlaybackStream, PlayerCapabilities,
-    ReceiverContext, SettingDescriptor, SettingKey, SettingScope, StreamType,
+    LaunchError, LoadRequest, MediaResolveError, OutputControl, PlaybackMedia, PlaybackStream,
+    PlayerCapabilities, ReceiverContext, SenderAttachment, SettingDescriptor, SettingKey,
+    SettingScope, StreamType,
 };
 use vibecast_security::CertificateBundle;
 use vibecast_settings::{
@@ -91,6 +92,8 @@ const FAKE_SETTING: SettingKey<String> = SettingKey::new("playerValue");
 struct FakeApp {
     launched_setting: Arc<Mutex<Option<String>>>,
     exclusive_sender_takeover: bool,
+    sender_attachments: Arc<Mutex<Vec<SenderAttachment>>>,
+    output_controls: Arc<Mutex<Vec<OutputControl>>>,
 }
 
 fn fake_manifest() -> AppManifest {
@@ -134,6 +137,8 @@ impl AppProvider for FakeApp {
             Mutex::new(None),
             std::sync::atomic::AtomicBool::new(false),
             self.exclusive_sender_takeover,
+            self.sender_attachments.clone(),
+            self.output_controls.clone(),
         )))
     }
 }
@@ -145,10 +150,21 @@ struct FakeSession(
     Mutex<Option<PlaybackStream>>,
     std::sync::atomic::AtomicBool,
     bool,
+    Arc<Mutex<Vec<SenderAttachment>>>,
+    Arc<Mutex<Vec<OutputControl>>>,
 );
 
 #[async_trait]
 impl AppSession for FakeSession {
+    async fn on_sender_connected(
+        &self,
+        _ctx: &AppContext,
+        _sender_id: &str,
+        attachment: SenderAttachment,
+    ) {
+        self.4.lock().unwrap().push(attachment);
+    }
+
     async fn on_playback_update(&self, ctx: &AppContext, state: vibecast_sdk::PlaybackState) {
         if state.media_recovery_attempts > 0 {
             ctx.send_custom(
@@ -171,6 +187,10 @@ impl AppSession for FakeSession {
         namespace == FAKE_NS && data["type"] == "CLAIM"
     }
 
+    fn joins_sender_ownership(&self, namespace: &str, data: &Value) -> bool {
+        namespace == ns::MEDIA && data["type"] == "QUEUE_GET_ITEM_IDS"
+    }
+
     fn allows_sender_reconnect_grace(&self) -> bool {
         self.2.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -178,8 +198,18 @@ impl AppSession for FakeSession {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn on_output_control(&self, ctx: &AppContext, control: vibecast_sdk::OutputControl) {
-        if control == vibecast_sdk::OutputControl::Play {
+    fn handles_output_control(&self, control: &OutputControl) -> bool {
+        (self.3 && matches!(control, OutputControl::Next | OutputControl::Previous))
+            || (matches!(control, OutputControl::Play) && self.handles_play_requests())
+    }
+
+    fn supports_queue_navigation(&self) -> bool {
+        self.3
+    }
+
+    async fn on_output_control(&self, ctx: &AppContext, control: OutputControl) {
+        self.5.lock().unwrap().push(control);
+        if control == OutputControl::Play {
             let media = PlaybackMedia::new(
                 ctx.session_id.clone(),
                 vec![PlaybackStream::url(
@@ -324,6 +354,8 @@ struct Harness {
     player: Arc<FakePlayer>,
     proxy: Arc<FakeProxy>,
     launched_setting: Arc<Mutex<Option<String>>>,
+    sender_attachments: Arc<Mutex<Vec<SenderAttachment>>>,
+    output_controls: Arc<Mutex<Vec<OutputControl>>>,
     hub_abort: tokio::task::AbortHandle,
 }
 
@@ -393,18 +425,23 @@ async fn setup_with_options(
     let player = Arc::new(FakePlayer::default());
     let proxy = Arc::new(FakeProxy::default());
     let launched_setting = Arc::new(Mutex::new(None));
+    let sender_attachments = Arc::new(Mutex::new(Vec::new()));
+    let output_controls = Arc::new(Mutex::new(Vec::new()));
     let hub = DeviceHub::new(HubConfig {
         identity: DeviceIdentity::new("Living Room".into(), "Chromecast".into(), "dev-1".into()),
         registry: AppRegistry::new(vec![Arc::new(FakeApp {
             launched_setting: launched_setting.clone(),
             exclusive_sender_takeover,
+            sender_attachments: sender_attachments.clone(),
+            output_controls: output_controls.clone(),
         })])
         .expect("registry"),
         player: player.clone(),
         proxy: proxy.clone(),
         http: reqwest::Client::new(),
         media_http: reqwest::Client::new(),
-        data_dir: std::env::temp_dir().join("vibecast-core-tests"),
+        data_dir: std::env::temp_dir()
+            .join(format!("vibecast-core-tests-{}", uuid::Uuid::new_v4())),
         volume: attenuation_volume(),
         user_agent: String::new(),
         cast_device_capabilities: String::new(),
@@ -430,6 +467,8 @@ async fn setup_with_options(
         player,
         proxy,
         launched_setting,
+        sender_attachments,
+        output_controls,
         hub_abort,
     }
 }
@@ -464,6 +503,79 @@ async fn send_as(
 async fn next_json(client: &mut Framed<DuplexStream, CastCodec>) -> Value {
     let message = client.next().await.unwrap().unwrap();
     serde_json::from_str(message.payload_utf8.as_deref().unwrap()).unwrap()
+}
+
+async fn next_json_of_type(
+    client: &mut Framed<DuplexStream, CastCodec>,
+    expected_type: &str,
+) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let value = next_json(client).await;
+            if value["type"] == expected_type {
+                return value;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected_type}"))
+}
+
+async fn next_json_for_request(
+    client: &mut Framed<DuplexStream, CastCodec>,
+    request_id: i64,
+) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let value = next_json(client).await;
+            if value["requestId"] == request_id {
+                return value;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for request {request_id}"))
+}
+
+async fn connect_peer(
+    hub: &DeviceHubHandle,
+    id: u64,
+    peer: &str,
+) -> Framed<DuplexStream, CastCodec> {
+    let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+    let (events_tx, mut events_rx) = mpsc::channel::<ServerEvent>(32);
+    tokio::spawn(run_connection(
+        server_end,
+        id,
+        Arc::from(peer.to_owned()),
+        Arc::new(dummy_auth()),
+        events_tx,
+    ));
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if hub.send_server_event(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    Framed::new(client_end, CastCodec)
+}
+
+async fn wait_for_sender_attachments(
+    attachments: &Arc<Mutex<Vec<SenderAttachment>>>,
+    expected: &[SenderAttachment],
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if attachments.lock().unwrap().as_slice() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sender attachment callbacks did not reach the expected state");
 }
 
 async fn launch(client: &mut Framed<DuplexStream, CastCodec>) -> String {
@@ -1903,8 +2015,8 @@ async fn owner_disconnect_grace_expires_despite_existing_observer_and_platform_p
 }
 
 #[tokio::test]
-async fn last_subscriber_disconnect_grace_expires() {
-    retained_session_disconnect(false, DisconnectAction::Expire).await;
+async fn last_observer_disconnect_does_not_expire_while_launch_owner_is_attached() {
+    retained_session_disconnect(false, DisconnectAction::ObserverLost).await;
 }
 
 #[tokio::test]
@@ -1920,11 +2032,6 @@ async fn explicit_close_during_grace_is_immediate() {
 #[tokio::test]
 async fn explicit_owner_close_stops_even_with_an_observer() {
     retained_session_disconnect(true, DisconnectAction::OwnerClose).await;
-}
-
-#[tokio::test]
-async fn observer_disconnect_does_not_start_grace_while_owner_is_attached() {
-    retained_session_disconnect(false, DisconnectAction::ObserverLost).await;
 }
 
 #[tokio::test]
@@ -2563,6 +2670,35 @@ async fn exclusive_app_transfers_control_to_the_new_physical_sender() {
         .await;
         assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
     }
+    let volume_commands_before = harness
+        .player
+        .commands()
+        .iter()
+        .filter(|command| matches!(command, PlayerCommand::Volume { .. }))
+        .count();
+    send(
+        &mut harness.client,
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"SET_VOLUME","requestId":90,"volume":{"level":0.11}}"#,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.client.next())
+            .await
+            .is_err(),
+        "superseded owner must not receive a volume response"
+    );
+    assert_eq!(
+        harness
+            .player
+            .commands()
+            .iter()
+            .filter(|command| matches!(command, PlayerCommand::Volume { .. }))
+            .count(),
+        volume_commands_before,
+        "superseded owner must not alter output volume"
+    );
     send(
         &mut harness.client,
         ns::CONNECTION,
@@ -2621,6 +2757,687 @@ async fn exclusive_app_transfers_control_to_the_new_physical_sender() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn exclusive_owner_reconnects_on_a_new_socket_without_taking_over() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    wait_for_sender_attachments(&harness.sender_attachments, &[SenderAttachment::Initial]).await;
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"KEEP_ON_DISCONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "READY");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    drop(harness.client);
+    // Let the hub observe the physical disconnect before the replacement
+    // socket arrives. The peer host and Cast source id stay the same.
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let mut reconnected = connect_peer(&harness.hub, 2, "peer").await;
+    send(
+        &mut reconnected,
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send(
+        &mut reconnected,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut reconnected).await["type"], "MEDIA_STATUS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[SenderAttachment::Initial, SenderAttachment::Reconnected],
+    )
+    .await;
+    send(&mut reconnected, FAKE_NS, &transport, r#"{"type":"PING"}"#).await;
+    assert_eq!(next_json(&mut reconnected).await["type"], "PONG");
+    assert!(!harness
+        .player
+        .commands()
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
+
+    // Reconnect grace only covers a lost network socket. An explicit app
+    // CLOSE from the reattached owner must still terminate immediately.
+    send(
+        &mut reconnected,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CLOSE"}"#,
+    )
+    .await;
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = next_json(&mut reconnected).await;
+            if status["type"] == "RECEIVER_STATUS" {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("explicit CLOSE from the reconnected owner must stop immediately");
+    assert!(stopped["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
+}
+
+#[tokio::test]
+async fn queue_bootstrap_takes_over_but_superseded_queue_probe_cannot_take_back() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    wait_for_sender_attachments(&harness.sender_attachments, &[SenderAttachment::Initial]).await;
+
+    // iOS commonly enters an existing route through a media queue bootstrap,
+    // without the stronger app-specific ownership handshake. Reuse the same
+    // generic source id on a different peer to prove source ids alone are not
+    // mistaken for a network reconnect.
+    let mut ipad = connect_peer(&harness.hub, 2, "ipad-peer").await;
+    send(
+        &mut ipad,
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send(
+        &mut ipad,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut ipad).await["type"], "MEDIA_STATUS");
+    send(
+        &mut ipad,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":40}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut ipad).await["requestId"], 40);
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PING"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+    assert_eq!(
+        harness.sender_attachments.lock().unwrap().as_slice(),
+        &[SenderAttachment::Initial],
+        "passive CONNECT and GET_STATUS must remain observer-only"
+    );
+
+    send(
+        &mut ipad,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":41}"#,
+    )
+    .await;
+    let ended = next_json(&mut harness.client).await;
+    assert_eq!(ended["type"], "RECEIVER_STATUS");
+    assert!(ended["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(next_json(&mut harness.client).await["type"], "CLOSE");
+    assert_eq!(next_json(&mut ipad).await["type"], "QUEUE_ITEM_IDS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[SenderAttachment::Initial, SenderAttachment::Takeover],
+    )
+    .await;
+
+    // The displaced sender may auto-open its old app channel and repeat the
+    // same queue probe. That is not a fresh user takeover and must be ignored.
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":42}"#,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.client.next())
+            .await
+            .is_err(),
+        "a superseded controller's automatic queue probe must not reclaim ownership"
+    );
+    send(&mut ipad, FAKE_NS, &transport, r#"{"type":"PING"}"#).await;
+    assert_eq!(next_json(&mut ipad).await["type"], "PONG");
+
+    // A deliberate strong handshake is still allowed to take the route back,
+    // and must cancel the now-displaced iPad controller in the same way.
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"CLAIM"}"#,
+    )
+    .await;
+    let ended = next_json(&mut ipad).await;
+    assert_eq!(ended["type"], "RECEIVER_STATUS");
+    assert!(ended["status"]["applications"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(next_json(&mut ipad).await["type"], "CLOSE");
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[
+            SenderAttachment::Initial,
+            SenderAttachment::Takeover,
+            SenderAttachment::Takeover,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn displaced_controller_needs_a_fresh_app_connect_before_weak_rejoin() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    let playing = next_json(&mut harness.client).await;
+    let media_id = playing["status"][0]["mediaSessionId"].as_i64().unwrap();
+
+    let mut replacement = connect_peer(&harness.hub, 2, "replacement-peer").await;
+    send_as(
+        &mut replacement,
+        "sender-2",
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send_as(
+        &mut replacement,
+        "sender-2",
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut replacement).await["type"], "MEDIA_STATUS");
+    send_as(
+        &mut replacement,
+        "sender-2",
+        FAKE_NS,
+        &transport,
+        r#"{"type":"CLAIM"}"#,
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut harness.client).await["type"],
+        "RECEIVER_STATUS"
+    );
+    assert_eq!(next_json(&mut harness.client).await["type"], "CLOSE");
+    let _ = next_json_of_type(&mut replacement, "PONG").await;
+
+    drop(harness.client);
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let mut returned = connect_peer(&harness.hub, 3, "peer").await;
+    send(
+        &mut returned,
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+
+    // Merely opening a new physical socket is not enough. A weak queue probe
+    // must be ignored until that logical sender explicitly CONNECTs to this
+    // app transport.
+    send(
+        &mut returned,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":60}"#,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), returned.next())
+            .await
+            .is_err()
+    );
+    send(&mut replacement, FAKE_NS, &transport, r#"{"type":"PING"}"#).await;
+    let _ = next_json_of_type(&mut replacement, "PONG").await;
+
+    send(
+        &mut returned,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut returned).await["type"], "MEDIA_STATUS");
+    let before = harness.player.commands().len();
+    for (request_id, kind) in [(61, "PAUSE"), (62, "PLAY"), (63, "SEEK")] {
+        send(
+            &mut returned,
+            ns::MEDIA,
+            &transport,
+            &serde_json::json!({
+                "type": kind,
+                "requestId": request_id,
+                "mediaSessionId": media_id,
+                "currentTime": 20.0,
+            })
+            .to_string(),
+        )
+        .await;
+    }
+    send(
+        &mut returned,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"GET_STATUS","requestId":64}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut returned).await["requestId"], 64);
+    assert_eq!(
+        harness.player.commands().len(),
+        before,
+        "a freshly connected but still superseded controller must not operate current media"
+    );
+
+    // A fresh app-level CONNECT is deliberately the user-presence boundary for
+    // iOS' weak queue bootstrap. It may now retake ownership without the
+    // app-specific strong handshake, and must kick the replacement controller.
+    send(
+        &mut returned,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":65}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut replacement).await["type"], "RECEIVER_STATUS");
+    assert_eq!(next_json(&mut replacement).await["type"], "CLOSE");
+    assert_eq!(next_json(&mut returned).await["type"], "QUEUE_ITEM_IDS");
+}
+
+#[tokio::test]
+async fn reconnect_grace_starts_only_after_the_last_owner_socket_disconnects() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"KEEP_ON_DISCONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "READY");
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    let owner_source = "a4ba9c7e-dab2-4e23-8777-31dc82502f87";
+    let sdk_connect =
+        r#"{"type":"CONNECT","senderInfo":{"sdkType":2,"platform":3,"model":"iPad"}}"#;
+    let mut second_owner = connect_peer(&harness.hub, 2, "peer").await;
+    send_as(
+        &mut second_owner,
+        owner_source,
+        ns::CONNECTION,
+        "receiver-0",
+        sdk_connect,
+    )
+    .await;
+    send_as(
+        &mut second_owner,
+        owner_source,
+        ns::CONNECTION,
+        &transport,
+        sdk_connect,
+    )
+    .await;
+    assert_eq!(next_json(&mut second_owner).await["type"], "MEDIA_STATUS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[SenderAttachment::Initial, SenderAttachment::Initial],
+    )
+    .await;
+
+    let mut observer = connect_peer(&harness.hub, 3, "observer-peer").await;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+
+    drop(harness.client);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    send_as(
+        &mut second_owner,
+        owner_source,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PING"}"#,
+    )
+    .await;
+    let _ = next_json_of_type(&mut second_owner, "PONG").await;
+    assert!(!harness
+        .player
+        .commands()
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
+
+    drop(second_owner);
+    // If losing the first socket had incorrectly started the ten-second test
+    // grace, the app would already be gone here. Correct behavior measures the
+    // deadline from the loss of this final proven owner socket.
+    tokio::time::sleep(std::time::Duration::from_millis(9_200)).await;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::RECEIVER,
+        "receiver-0",
+        r#"{"type":"GET_STATUS","requestId":70}"#,
+    )
+    .await;
+    let current = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = next_json(&mut observer).await;
+            if status["requestId"] == 70 {
+                break status;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        current["status"]["applications"][0]["transportId"],
+        transport
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = next_json(&mut observer).await;
+            if status["type"] == "RECEIVER_STATUS"
+                && status["status"]["applications"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the final owner socket must start reconnect grace and eventually stop the app");
+    assert!(harness
+        .player
+        .commands()
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
+}
+
+#[tokio::test]
+async fn takeover_closes_every_socket_of_the_previous_owner_device() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    let service_source = "cbe183d7-0c46-48b8-830a-6ea872003b1b";
+    let sdk_connect = r#"{"type":"CONNECT","senderInfo":{"sdkType":2,"platform":1}}"#;
+    let mut service_socket = connect_peer(&harness.hub, 2, "peer").await;
+    send_as(
+        &mut service_socket,
+        service_source,
+        ns::CONNECTION,
+        "receiver-0",
+        sdk_connect,
+    )
+    .await;
+    send_as(
+        &mut service_socket,
+        service_source,
+        ns::CONNECTION,
+        &transport,
+        sdk_connect,
+    )
+    .await;
+    assert_eq!(next_json(&mut service_socket).await["type"], "MEDIA_STATUS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[SenderAttachment::Initial, SenderAttachment::Initial],
+    )
+    .await;
+
+    let ipad_source = "cec43ed0-6d3d-4d5c-ad69-b5467ef91910";
+    let ipad_connect = r#"{"type":"CONNECT","senderInfo":{"sdkType":2,"platform":3}}"#;
+    let mut ipad = connect_peer(&harness.hub, 3, "ipad-peer").await;
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::CONNECTION,
+        "receiver-0",
+        ipad_connect,
+    )
+    .await;
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::CONNECTION,
+        &transport,
+        ipad_connect,
+    )
+    .await;
+    assert_eq!(next_json(&mut ipad).await["type"], "MEDIA_STATUS");
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":80}"#,
+    )
+    .await;
+
+    for previous in [&mut harness.client, &mut service_socket] {
+        let ended = next_json(previous).await;
+        assert_eq!(ended["type"], "RECEIVER_STATUS");
+        assert!(ended["status"]["applications"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(next_json(previous).await["type"], "CLOSE");
+    }
+    assert_eq!(next_json(&mut ipad).await["type"], "QUEUE_ITEM_IDS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[
+            SenderAttachment::Initial,
+            SenderAttachment::Initial,
+            SenderAttachment::Takeover,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn weak_queue_takeover_requires_evidence_of_an_active_cast_sender() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "MEDIA_STATUS");
+
+    let mut observer = connect_peer(&harness.hub, 2, "observer-peer").await;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::CONNECTION,
+        "receiver-0",
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut observer).await["type"], "MEDIA_STATUS");
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":90}"#,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), observer.next())
+            .await
+            .is_err(),
+        "generic sender-0 without SDK evidence must remain a status observer"
+    );
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PING"}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut harness.client).await["type"], "PONG");
+
+    let ipad_source = "cec43ed0-6d3d-4d5c-ad69-b5467ef91910";
+    let ipad_connect =
+        r#"{"type":"CONNECT","senderInfo":{"sdkType":2,"platform":3,"model":"iPad"}}"#;
+    let mut ipad = connect_peer(&harness.hub, 3, "ipad-peer").await;
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::CONNECTION,
+        "receiver-0",
+        ipad_connect,
+    )
+    .await;
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::CONNECTION,
+        &transport,
+        ipad_connect,
+    )
+    .await;
+    assert_eq!(next_json(&mut ipad).await["type"], "MEDIA_STATUS");
+    send_as(
+        &mut ipad,
+        ipad_source,
+        ns::MEDIA,
+        &transport,
+        r#"{"type":"QUEUE_GET_ITEM_IDS","requestId":91}"#,
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut harness.client).await["type"],
+        "RECEIVER_STATUS"
+    );
+    assert_eq!(next_json(&mut harness.client).await["type"], "CLOSE");
+    assert_eq!(next_json(&mut ipad).await["type"], "QUEUE_ITEM_IDS");
+    wait_for_sender_attachments(
+        &harness.sender_attachments,
+        &[SenderAttachment::Initial, SenderAttachment::Takeover],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2938,7 +3755,6 @@ async fn secondary_controller_operates_current_media_without_claiming_ownership(
         for request in [
             serde_json::json!({"type":"PAUSE","requestId":50,"mediaSessionId":if subscribed { media_id+1 } else { media_id }}),
             serde_json::json!({"type":"PLAY","requestId":51}),
-            serde_json::json!({"type":"STOP","requestId":52,"mediaSessionId":media_id}),
             serde_json::json!({"type":"LOAD","requestId":53,"media":{"contentId":"replacement","contentType":"audio/mpeg"}}),
         ] {
             send(&mut observer, ns::MEDIA, &transport, &request.to_string()).await;
@@ -3009,6 +3825,7 @@ async fn secondary_controller_operates_current_media_without_claiming_ownership(
     .await;
     let _ = next_json(&mut harness.client).await;
     let before = harness.player.commands().len();
+    let before_controls = harness.output_controls.lock().unwrap().len();
     send(
         &mut harness.client,
         ns::MEDIA,
@@ -3020,9 +3837,210 @@ async fn secondary_controller_operates_current_media_without_claiming_ownership(
         &mut harness.client,
         ns::MEDIA,
         &transport,
+        &serde_json::json!({
+            "type": "QUEUE_UPDATE",
+            "requestId": 72,
+            "mediaSessionId": media_id,
+            "jump": 1,
+        })
+        .to_string(),
+    )
+    .await;
+    send(
+        &mut harness.client,
+        ns::MEDIA,
+        &transport,
         r#"{"type":"GET_STATUS","requestId":71}"#,
     )
     .await;
     assert_eq!(next_json(&mut harness.client).await["requestId"], 71);
     assert_eq!(harness.player.commands().len(), before);
+    assert_eq!(
+        harness.output_controls.lock().unwrap().len(),
+        before_controls
+    );
+}
+
+#[tokio::test]
+async fn home_assistant_observer_controls_transport_and_real_app_queue_without_takeover() {
+    let mut harness = setup_exclusive().await;
+    let transport = launch(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        ns::CONNECTION,
+        &transport,
+        r#"{"type":"CONNECT"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PUSH_MEDIA"}"#,
+    )
+    .await;
+    let _ = next_json(&mut harness.client).await;
+    let status = next_json(&mut harness.client).await;
+    let media_id = status["status"][0]["mediaSessionId"].as_i64().unwrap();
+    wait_for_sender_attachments(&harness.sender_attachments, &[SenderAttachment::Initial]).await;
+
+    let mut observer = connect_peer(&harness.hub, 2, "ha-observer").await;
+    let connect = r#"{"type":"CONNECT","userAgent":"PyChromecast/14"}"#;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::CONNECTION,
+        "receiver-0",
+        connect,
+    )
+    .await;
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::CONNECTION,
+        &transport,
+        connect,
+    )
+    .await;
+    let observer_status = next_json(&mut observer).await;
+    assert_eq!(observer_status["type"], "MEDIA_STATUS");
+    assert_eq!(observer_status["status"][0]["mediaSessionId"], media_id);
+    let commands = observer_status["status"][0]["supportedMediaCommands"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        commands & vibecast_messages::media_command::QUEUE_NAVIGATION,
+        vibecast_messages::media_command::QUEUE_NAVIGATION
+    );
+
+    send_as(
+        &mut observer,
+        "sender-0",
+        ns::MEDIA,
+        &transport,
+        &serde_json::json!({
+            "type": "QUEUE_UPDATE",
+            "requestId": 79,
+            "mediaSessionId": media_id,
+            "jump": 2,
+        })
+        .to_string(),
+    )
+    .await;
+    let invalid = next_json_for_request(&mut observer, 79).await;
+    assert_eq!(invalid["type"], "INVALID_REQUEST");
+    assert!(harness.output_controls.lock().unwrap().is_empty());
+
+    for (request_id, jump, expected) in [
+        (80, 1, OutputControl::Next),
+        (81, -1, OutputControl::Previous),
+    ] {
+        send_as(
+            &mut observer,
+            "sender-0",
+            ns::MEDIA,
+            &transport,
+            &serde_json::json!({
+                "type": "QUEUE_UPDATE",
+                "requestId": request_id,
+                "mediaSessionId": media_id,
+                "jump": jump,
+            })
+            .to_string(),
+        )
+        .await;
+        let response = next_json_for_request(&mut observer, request_id).await;
+        assert_eq!(response["type"], "MEDIA_STATUS");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if harness.output_controls.lock().unwrap().last() == Some(&expected) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue navigation did not reach the active app");
+    }
+
+    for (request_id, volume, expected_level, expected_muted) in [
+        (
+            82,
+            serde_json::json!({"level": 0.35, "muted": false}),
+            0.35,
+            false,
+        ),
+        (83, serde_json::json!({"muted": true}), 0.35, true),
+    ] {
+        send_as(
+            &mut observer,
+            "sender-0",
+            ns::RECEIVER,
+            "receiver-0",
+            &serde_json::json!({
+                "type": "SET_VOLUME",
+                "requestId": request_id,
+                "volume": volume,
+            })
+            .to_string(),
+        )
+        .await;
+        let response = next_json_for_request(&mut observer, request_id).await;
+        assert_eq!(response["status"]["volume"]["level"], expected_level);
+        assert_eq!(response["status"]["volume"]["muted"], expected_muted);
+    }
+
+    for (request_id, command, expected_state) in [
+        (84, "PAUSE", "PAUSED"),
+        (85, "PLAY", "PLAYING"),
+        (86, "STOP", "IDLE"),
+    ] {
+        send_as(
+            &mut observer,
+            "sender-0",
+            ns::MEDIA,
+            &transport,
+            &serde_json::json!({
+                "type": command,
+                "requestId": request_id,
+                "mediaSessionId": media_id,
+            })
+            .to_string(),
+        )
+        .await;
+        let response = next_json_for_request(&mut observer, request_id).await;
+        assert_eq!(response["status"][0]["playerState"], expected_state);
+    }
+
+    // Status/control integration is not an ownership handshake: the original
+    // sender remains attached and can still use its app namespace.
+    assert_eq!(
+        harness.sender_attachments.lock().unwrap().as_slice(),
+        &[SenderAttachment::Initial]
+    );
+    send(
+        &mut harness.client,
+        FAKE_NS,
+        &transport,
+        r#"{"type":"PING"}"#,
+    )
+    .await;
+    assert_eq!(
+        next_json_of_type(&mut harness.client, "PONG").await["echo"],
+        "PING"
+    );
+
+    let commands = harness.player.commands();
+    assert!(commands.iter().any(|command| matches!(command,
+        PlayerCommand::Volume { level, muted, .. } if *level == 0.35 && *muted)));
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Pause { .. })));
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Play { .. })));
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, PlayerCommand::Stop { .. })));
 }

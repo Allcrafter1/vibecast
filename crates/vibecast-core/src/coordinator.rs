@@ -22,6 +22,7 @@ pub(crate) struct Coordinator {
     pub current_media: Option<MediaInfo>,
     pub playback_media: Option<PlaybackMedia>,
     pub volume: Volume,
+    supports_queue_navigation: bool,
 }
 
 impl Coordinator {
@@ -53,7 +54,7 @@ impl Coordinator {
         true
     }
 
-    pub(crate) fn new(volume: Volume) -> Self {
+    pub(crate) fn new(volume: Volume, supports_queue_navigation: bool) -> Self {
         Self {
             media_session_id: 1,
             player_state: PlayerState::Idle,
@@ -62,6 +63,7 @@ impl Coordinator {
             current_media: None,
             playback_media: None,
             volume,
+            supports_queue_navigation,
         }
     }
 
@@ -110,6 +112,9 @@ impl Coordinator {
             .is_some_and(|media| media.stream_type == StreamType::Live)
         {
             commands &= !media_command::SEEK;
+        }
+        if is_active && self.supports_queue_navigation {
+            commands |= media_command::QUEUE_NAVIGATION;
         }
         let playback_rate = if self.player_state == PlayerState::Playing {
             1.0
@@ -262,7 +267,7 @@ mod tests {
 
     #[test]
     fn artwork_replaces_only_matching_active_image_without_clock_changes() {
-        let mut c = Coordinator::new(Volume::default());
+        let mut c = Coordinator::new(Volume::default(), false);
         c.current_media = Some(
             serde_json::from_value(serde_json::json!({
                 "contentId": "song", "contentType": "audio/mpeg", "streamType": "BUFFERED",
@@ -333,7 +338,7 @@ mod tests {
 
     #[test]
     fn live_status_does_not_advertise_seek() {
-        let mut coordinator = Coordinator::new(Volume::default());
+        let mut coordinator = Coordinator::new(Volume::default(), false);
         coordinator.player_state = PlayerState::Playing;
         let media: MediaInfo = serde_json::from_value(serde_json::json!({
             "contentId": "https://example.test/radio", "contentType": "audio/mpeg",
@@ -350,6 +355,37 @@ mod tests {
         coordinator.current_media.as_mut().unwrap().stream_type = StreamType::Buffered;
         assert_ne!(
             coordinator.media_status().unwrap().supported_media_commands & media_command::SEEK,
+            0
+        );
+    }
+
+    #[test]
+    fn queue_navigation_is_advertised_only_for_capable_active_sessions() {
+        let media: MediaInfo = serde_json::from_value(serde_json::json!({
+            "contentId": "song", "contentType": "audio/mp4", "streamType": "BUFFERED"
+        }))
+        .unwrap();
+        let mut plain = Coordinator::new(Volume::default(), false);
+        plain.current_media = Some(media.clone());
+        plain.player_state = PlayerState::Playing;
+        assert_eq!(
+            plain.media_status().unwrap().supported_media_commands
+                & media_command::QUEUE_NAVIGATION,
+            0
+        );
+
+        let mut queued = Coordinator::new(Volume::default(), true);
+        queued.current_media = Some(media);
+        queued.player_state = PlayerState::Playing;
+        assert_eq!(
+            queued.media_status().unwrap().supported_media_commands
+                & media_command::QUEUE_NAVIGATION,
+            media_command::QUEUE_NAVIGATION
+        );
+        queued.player_state = PlayerState::Idle;
+        assert_eq!(
+            queued.media_status().unwrap().supported_media_commands
+                & media_command::QUEUE_NAVIGATION,
             0
         );
     }

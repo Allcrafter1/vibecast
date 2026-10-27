@@ -154,7 +154,12 @@ impl AppSession for Tv4Session {
         }
     }
 
-    async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
+    async fn on_sender_connected(
+        &self,
+        ctx: &AppContext,
+        _sender_id: &str,
+        _attachment: vibecast_sdk::SenderAttachment,
+    ) {
         self.broadcast_snapshot(ctx).await;
     }
 

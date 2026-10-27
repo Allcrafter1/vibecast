@@ -4,6 +4,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -14,7 +18,9 @@ use tokio::sync::{mpsc, watch};
 use url::Url;
 use vibecast_sdk::{IdleReason, OutputControl, PlaybackState, PlayerState, ReceiverContext};
 
-use crate::CredentialTransferToken;
+use crate::{
+    CommittedContext, CredentialTransferToken, PlaylistParams, ResolutionFailureClass, WorkerEvent,
+};
 
 const LOUNGE_BASE: &str = "https://www.youtube.com/api/lounge";
 const MUSIC_LOUNGE_BASE: &str = "https://music.youtube.com/api/lounge";
@@ -58,12 +64,15 @@ pub(crate) enum LoungeCommand {
         current_index: usize,
         current_time: f64,
         list_id: Option<String>,
+        params: Option<PlaylistParams>,
         credential: Option<CredentialTransferToken>,
     },
     UpdatePlaylist {
         video_ids: Vec<String>,
         list_id: Option<String>,
+        params: Option<PlaylistParams>,
     },
+    RemoteDevices(Vec<String>),
     Play,
     Pause,
     Stop,
@@ -90,6 +99,7 @@ pub(crate) struct LoungeConnection {
     screen_id: String,
     device_id: String,
     discovery_device_id: String,
+    ownership_epoch: Arc<AtomicU64>,
     current: CurrentMedia,
 }
 
@@ -101,7 +111,10 @@ pub(crate) struct LoungeIdentity {
 
 pub(crate) enum LoungeRunExit {
     Stopped,
-    Takeover(tokio::sync::oneshot::Sender<()>),
+    Takeover {
+        ready: tokio::sync::oneshot::Sender<()>,
+        ownership_epoch: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -131,7 +144,10 @@ struct CurrentMedia {
     video_id: Option<String>,
     credential: Option<CredentialTransferToken>,
     list_id: Option<String>,
+    params: Option<PlaylistParams>,
     current_index: usize,
+    ownership_epoch: u64,
+    selection_serial: u64,
     next_pending: bool,
     state: Option<PlaybackState>,
 }
@@ -145,9 +161,60 @@ struct LoadRecovery {
     reloading: bool,
     failed: bool,
     paused: bool,
+    resolution_terminal: bool,
 }
 
 impl CurrentMedia {
+    fn commit_worker_context(&mut self, context: CommittedContext) -> bool {
+        let CommittedContext {
+            ownership_epoch,
+            selection_serial,
+            video_id,
+            index,
+            list_id,
+            params,
+            credential,
+        } = context;
+        if self.ownership_epoch != ownership_epoch
+            || self.selection_serial != selection_serial
+            || self.video_id.as_deref() != Some(video_id.as_str())
+            || self.current_index != index
+        {
+            return false;
+        }
+        if self.list_id.is_some() && list_id.is_some() && self.list_id != list_id {
+            return false;
+        }
+        let list_id = list_id.or_else(|| self.list_id.clone());
+        let params = params.or_else(|| self.params.clone());
+        let changed =
+            self.list_id != list_id || self.params != params || self.credential != credential;
+        self.list_id = list_id;
+        self.params = params;
+        self.credential = credential;
+        changed
+    }
+
+    fn mark_resolution_failed(
+        &mut self,
+        ownership_epoch: u64,
+        selection_serial: u64,
+        video_id: &str,
+        class: ResolutionFailureClass,
+    ) {
+        if self.ownership_epoch != ownership_epoch
+            || self.selection_serial != selection_serial
+            || self.video_id.as_deref() != Some(video_id)
+            || class == ResolutionFailureClass::Transient
+        {
+            return;
+        }
+        self.recovery.enabled = false;
+        self.recovery.failed = true;
+        self.recovery.reloading = false;
+        self.recovery.resolution_terminal = true;
+    }
+
     fn reload_command(&self, autoplay: bool) -> Option<LoungeCommand> {
         Some(LoungeCommand::ReloadCurrent {
             video_id: self.video_id.clone()?,
@@ -189,7 +256,9 @@ impl CurrentMedia {
                 return None;
             }
             self.awaiting_load = false;
-            if state.idle_reason == Some(IdleReason::Cancelled) && self.recovery.enabled {
+            if state.idle_reason == Some(IdleReason::Cancelled)
+                && (self.recovery.enabled || self.recovery.resolution_terminal)
+            {
                 // The command worker stopped the old decoder after resolution
                 // failed. Recover the requested position, not the old decoder's.
                 state = self.state.clone()?;
@@ -249,6 +318,10 @@ impl CurrentMedia {
                 current_index: index,
                 current_time: 0.0,
                 list_id: self.list_id.clone(),
+                // Opaque player params are item-specific. The wrapped item
+                // needs context from its own navigation endpoint (or none),
+                // never the last item's params.
+                params: None,
                 credential: None,
             }
         } else {
@@ -278,21 +351,25 @@ impl CurrentMedia {
                 if let LoungeCommand::SetPlaylist {
                     ref video_ids,
                     ref list_id,
-                    ref credential,
                     ..
                 } = command
                 {
                     if self.video_id.is_some()
-                        && self.video_id.as_ref() == video_ids.get(self.current_index)
+                        && self
+                            .video_id
+                            .as_ref()
+                            .is_some_and(|active| video_ids.iter().any(|video| video == active))
                         && self.list_id.is_some()
                         && self.list_id == *list_id
-                        && self.credential == *credential
                     {
                         tracing::debug!(video_id = ?self.video_id, index = self.current_index,
                             "preserving selection across VIDEO_ADDED queue enrichment");
                         return Incoming::Command(LoungeCommand::UpdatePlaylist {
                             video_ids: video_ids.clone(),
                             list_id: list_id.clone(),
+                            // VIDEO_ADDED describes the added item. Its CTT and
+                            // params must never replace the active item's context.
+                            params: self.params.clone(),
                         });
                     }
                 }
@@ -306,6 +383,7 @@ impl CurrentMedia {
             current_index,
             current_time,
             ref list_id,
+            ref params,
             ref credential,
         }) = incoming
         {
@@ -318,11 +396,13 @@ impl CurrentMedia {
                     .as_ref()
                     .is_some_and(|s| s.current_time == current_time)
                 && self.credential == *credential
+                && self.params == *params
             {
                 tracing::debug!("coalesced pending YouTube selection into queue update");
                 return Incoming::Command(LoungeCommand::UpdatePlaylist {
                     video_ids: video_ids.clone(),
                     list_id: list_id.clone(),
+                    params: params.clone(),
                 });
             }
         }
@@ -350,6 +430,11 @@ pub(crate) enum LoungeError {
 }
 
 impl LoungeConnection {
+    pub(crate) fn set_ownership_epoch(&mut self, epoch: u64) {
+        self.current.ownership_epoch = epoch;
+        self.ownership_epoch.store(epoch, Ordering::Release);
+    }
+
     pub(crate) fn with_volume(mut self, rx: watch::Receiver<(f64, bool)>) -> Self {
         self.current.volume = Some(*rx.borrow());
         self.volume_rx = Some(rx);
@@ -440,6 +525,7 @@ impl LoungeConnection {
             screen_id: identity.screen_id,
             device_id: identity.device_id,
             discovery_device_id: cast_cloud_device_id(&receiver.device_id),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia::default(),
         })
     }
@@ -456,6 +542,7 @@ impl LoungeConnection {
         command_tx: &mpsc::Sender<LoungeCommand>,
         playback_rx: &mut mpsc::Receiver<PlaybackState>,
         output_control_rx: &mut mpsc::Receiver<OutputControl>,
+        worker_event_rx: &mut mpsc::Receiver<WorkerEvent>,
         cancel: &mut watch::Receiver<bool>,
         takeover_rx: &mut mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     ) -> LoungeRunExit {
@@ -467,12 +554,22 @@ impl LoungeConnection {
             // Also cancel while run_bound awaits feedback HTTP or a full
             // command channel, outside its inner event-loop select.
             let mut cancellation = cancel.clone();
-            let bound = self.run_bound(command_tx, playback_rx, output_control_rx, cancel);
+            let ownership_epoch = self.ownership_epoch.clone();
+            let bound = self.run_bound_with_events(
+                command_tx,
+                playback_rx,
+                output_control_rx,
+                worker_event_rx,
+                cancel,
+            );
             let result = tokio::select! {
                 result = bound => result,
                 _ = cancellation.changed() => return LoungeRunExit::Stopped,
                 request = takeover_rx.recv() => {
-                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
+                    return request.map_or(LoungeRunExit::Stopped, |ready| LoungeRunExit::Takeover {
+                        ready,
+                        ownership_epoch: ownership_epoch.load(Ordering::Acquire),
+                    });
                 }
             };
             match result {
@@ -480,24 +577,56 @@ impl LoungeConnection {
                 Err(error) => tracing::warn!(%error, "YouTube Lounge session interrupted"),
             }
 
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                request = takeover_rx.recv() => {
-                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
-                }
-                result = cancel.changed() => {
-                    if result.is_err() || *cancel.borrow() {
-                        return LoungeRunExit::Stopped;
+            // Local controls must remain usable while the Lounge long poll is
+            // reconnecting. In particular, Stop must cancel the queue worker
+            // immediately rather than wait behind a network backoff. Feedback
+            // is sent after the bind is healthy again via the initial
+            // now-playing snapshot.
+            let reconnect_delay = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(reconnect_delay);
+            loop {
+                tokio::select! {
+                    _ = &mut reconnect_delay => break,
+                    control = output_control_rx.recv() => {
+                        let Some(control) = control else { return LoungeRunExit::Stopped; };
+                        if self.apply_output_control(control, command_tx).await.is_err() {
+                            return LoungeRunExit::Stopped;
+                        }
+                    }
+                    request = takeover_rx.recv() => {
+                        return request.map_or(LoungeRunExit::Stopped, |ready| LoungeRunExit::Takeover {
+                            ready,
+                            ownership_epoch: ownership_epoch.load(Ordering::Acquire),
+                        });
+                    }
+                    result = cancel.changed() => {
+                        if result.is_err() || *cancel.borrow() {
+                            return LoungeRunExit::Stopped;
+                        }
                     }
                 }
             }
 
-            let rebind = initial_bind(&self.http, &self.bind_url);
-            let result = tokio::select! {
-                result = rebind => result,
-                _ = cancel.changed() => return LoungeRunExit::Stopped,
-                request = takeover_rx.recv() => {
-                    return request.map_or(LoungeRunExit::Stopped, LoungeRunExit::Takeover);
+            let http = self.http.clone();
+            let bind_url = self.bind_url.clone();
+            let rebind = initial_bind(&http, &bind_url);
+            tokio::pin!(rebind);
+            let result = loop {
+                tokio::select! {
+                    result = &mut rebind => break result,
+                    control = output_control_rx.recv() => {
+                        let Some(control) = control else { return LoungeRunExit::Stopped; };
+                        if self.apply_output_control(control, command_tx).await.is_err() {
+                            return LoungeRunExit::Stopped;
+                        }
+                    }
+                    _ = cancel.changed() => return LoungeRunExit::Stopped,
+                    request = takeover_rx.recv() => {
+                        return request.map_or(LoungeRunExit::Stopped, |ready| LoungeRunExit::Takeover {
+                            ready,
+                            ownership_epoch: ownership_epoch.load(Ordering::Acquire),
+                        });
+                    }
                 }
             };
             match result {
@@ -509,14 +638,20 @@ impl LoungeConnection {
         }
     }
 
-    async fn run_bound(
+    async fn run_bound_with_events(
         &mut self,
         command_tx: &mpsc::Sender<LoungeCommand>,
         playback_rx: &mut mpsc::Receiver<PlaybackState>,
         output_control_rx: &mut mpsc::Receiver<OutputControl>,
+        worker_event_rx: &mut mpsc::Receiver<WorkerEvent>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(), LoungeError> {
-        self.post(Outbound::NowPlaying).await?;
+        if !self
+            .post_while_accepting_controls(Outbound::NowPlaying, command_tx, output_control_rx)
+            .await?
+        {
+            return Ok(());
+        }
 
         loop {
             // Keep the long poll alive while playback reports arrive. Dropping
@@ -528,26 +663,57 @@ impl LoungeConnection {
             tokio::pin!(poll);
             loop {
                 tokio::select! {
+                    biased;
+                    event = worker_event_rx.recv() => {
+                        let Some(event) = event else { return Ok(()); };
+                        match event {
+                            WorkerEvent::ContextCommitted(context) => {
+                                if self.current.commit_worker_context(context) {
+                                    // Propagate context learned by /next to all
+                                    // attached senders immediately.
+                                    if !self.post_while_accepting_controls(
+                                        Outbound::NowPlaying,
+                                        command_tx,
+                                        output_control_rx,
+                                    ).await? {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            WorkerEvent::ResolutionFailed {
+                                ownership_epoch, selection_serial, video_id, class, acknowledged,
+                            } => {
+                                self.current.mark_resolution_failed(
+                                    ownership_epoch, selection_serial, &video_id, class,
+                                );
+                                let _ = acknowledged.send(());
+                            }
+                        }
+                    }
                     volume = volume_change(&mut self.volume_rx) => {
                         self.current.volume = Some(volume);
-                        self.post(Outbound::Volume).await?;
+                        if !self.post_while_accepting_controls(
+                            Outbound::Volume,
+                            command_tx,
+                            output_control_rx,
+                        ).await? {
+                            return Ok(());
+                        }
                     }
                     control = output_control_rx.recv() => {
                         let Some(control) = control else { return Ok(()); };
-                        let command = match control {
-                            OutputControl::Play => LoungeCommand::Play,
-                            OutputControl::Next => self.current.next_command(false),
-                            OutputControl::Previous => LoungeCommand::Previous,
+                        let outbound = match self.apply_output_control(control, command_tx).await {
+                            Ok(outbound) => outbound,
+                            Err(()) => return Ok(()),
                         };
-                        let incoming = self.current.coalesce_pending_selection(Incoming::Command(command));
-                        let outbound = self.handle_internal(&incoming);
-                        if let Incoming::Command(command) = incoming {
-                            if command_tx.send(command).await.is_err() {
+                        if let Some(outbound) = outbound {
+                            if !self.post_while_accepting_controls(
+                                outbound,
+                                command_tx,
+                                output_control_rx,
+                            ).await? {
                                 return Ok(());
                             }
-                        }
-                        if let Some(outbound) = outbound {
-                            self.post(outbound).await?;
                         }
                     }
                     result = cancel.changed() => {
@@ -571,8 +737,22 @@ impl LoungeConnection {
                             if command_tx.send(command).await.is_err() { return Ok(()); }
                             outbound
                         } else { None };
-                        self.post(Outbound::State(state)).await?;
-                        if let Some(outbound) = advancement { self.post(outbound).await?; }
+                        if !self.post_while_accepting_controls(
+                            Outbound::State(state),
+                            command_tx,
+                            output_control_rx,
+                        ).await? {
+                            return Ok(());
+                        }
+                        if let Some(outbound) = advancement {
+                            if !self.post_while_accepting_controls(
+                                outbound,
+                                command_tx,
+                                output_control_rx,
+                            ).await? {
+                                return Ok(());
+                            }
+                        }
                     }
                     result = &mut poll => {
                         let batch = match result {
@@ -585,13 +765,13 @@ impl LoungeConnection {
                         for incoming in batch.messages {
                             let queue_addition = matches!(&incoming, Incoming::QueueAddition(_));
                             let incoming = self.current.coalesce_pending_selection(incoming);
-                            let outbound = self.handle_internal(&incoming)
-                                .or_else(|| queue_addition.then_some(Outbound::NowPlaying));
-                            if let Incoming::Command(command) = incoming {
-                                if command_tx.send(command).await.is_err() {
+                            if let Incoming::Command(command) = &incoming {
+                                if command_tx.send(command.clone()).await.is_err() {
                                     return Ok(());
                                 }
                             }
+                            let outbound = self.handle_internal(&incoming)
+                                .or_else(|| queue_addition.then_some(Outbound::NowPlaying));
                             if let Some(outbound) = outbound {
                                 feedback.push(outbound);
                             }
@@ -599,13 +779,101 @@ impl LoungeConnection {
                         // The whole batch is acknowledged: deliver all commands
                         // before a feedback failure can interrupt the connection.
                         for outbound in feedback {
-                            self.post(outbound).await?;
+                            if !self.post_while_accepting_controls(
+                                outbound,
+                                command_tx,
+                                output_control_rx,
+                            ).await? {
+                                return Ok(());
+                            }
                         }
                         break;
                     }
                 }
             }
         }
+    }
+
+    /// Deliver a local/Cast control to the queue worker and update the Lounge
+    /// model without depending on a healthy Lounge HTTP connection. Network
+    /// feedback is deliberately left to the caller.
+    async fn apply_output_control(
+        &mut self,
+        control: OutputControl,
+        command_tx: &mpsc::Sender<LoungeCommand>,
+    ) -> Result<Option<Outbound>, ()> {
+        let command = match control {
+            OutputControl::Play => LoungeCommand::Play,
+            OutputControl::Pause => LoungeCommand::Pause,
+            OutputControl::Stop => LoungeCommand::Stop,
+            OutputControl::Seek(position) => LoungeCommand::Seek(position),
+            OutputControl::Next => self.current.next_command(false),
+            OutputControl::Previous => LoungeCommand::Previous,
+        };
+        let incoming = self
+            .current
+            .coalesce_pending_selection(Incoming::Command(command));
+        if let Incoming::Command(command) = &incoming {
+            command_tx.send(command.clone()).await.map_err(|_| ())?;
+        }
+        // Mutate Lounge state only after the worker accepted the command. An
+        // interrupted Stop must not advance the ownership epoch on one side.
+        Ok(self.handle_internal(&incoming))
+    }
+
+    /// Send feedback without allowing a slow/broken Lounge HTTP request to
+    /// stall local transport controls. Any control-generated feedback is
+    /// coalesced behind the in-flight request and reflects the latest state.
+    async fn post_while_accepting_controls(
+        &mut self,
+        outbound: Outbound,
+        command_tx: &mpsc::Sender<LoungeCommand>,
+        output_control_rx: &mut mpsc::Receiver<OutputControl>,
+    ) -> Result<bool, LoungeError> {
+        let mut pending = Some(outbound);
+        while let Some(outbound) = pending.take() {
+            let request = self.prepare_post(outbound);
+            let sending = send_post(request);
+            tokio::pin!(sending);
+            loop {
+                tokio::select! {
+                    result = &mut sending => {
+                        result?;
+                        break;
+                    }
+                    control = output_control_rx.recv() => {
+                        let Some(control) = control else { return Ok(false); };
+                        let Ok(feedback) = self.apply_output_control(control, command_tx).await
+                        else {
+                            return Ok(false);
+                        };
+                        if let Some(outbound) = feedback {
+                            pending = Some(outbound);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    async fn run_bound(
+        &mut self,
+        command_tx: &mpsc::Sender<LoungeCommand>,
+        playback_rx: &mut mpsc::Receiver<PlaybackState>,
+        output_control_rx: &mut mpsc::Receiver<OutputControl>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), LoungeError> {
+        let (_worker_tx, mut worker_rx) = mpsc::channel(1);
+        self.run_bound_with_events(
+            command_tx,
+            playback_rx,
+            output_control_rx,
+            &mut worker_rx,
+            cancel,
+        )
+        .await
     }
 
     fn handle_internal(&mut self, incoming: &Incoming) -> Option<Outbound> {
@@ -641,6 +909,11 @@ impl LoungeConnection {
                 self.current.recovery = LoadRecovery::default();
                 self.current.awaiting_load = false;
                 self.current.credential = None;
+                self.current.params = None;
+                self.current.ownership_epoch = self.current.ownership_epoch.wrapping_add(1);
+                self.ownership_epoch
+                    .store(self.current.ownership_epoch, Ordering::Release);
+                self.current.selection_serial = 0;
                 if let Some(state) = self.current.state.as_mut() {
                     state.player_state = PlayerState::Idle;
                     state.idle_reason = Some(IdleReason::Cancelled);
@@ -676,6 +949,7 @@ impl LoungeConnection {
             }
             Incoming::GetLoopMode => Some(Outbound::LoopMode),
             Incoming::Command(LoungeCommand::RepeatCurrent) => {
+                self.current.selection_serial = self.current.selection_serial.wrapping_add(1);
                 self.current.awaiting_load = true;
                 self.current.next_pending = false;
                 self.current.state = Some(PlaybackState {
@@ -692,14 +966,17 @@ impl LoungeConnection {
                 current_index,
                 current_time,
                 list_id,
+                params,
                 credential,
             }) => {
+                self.current.selection_serial = self.current.selection_serial.wrapping_add(1);
                 self.current.video_ids.clone_from(video_ids);
                 self.current.awaiting_load = true;
                 self.current.video_id = video_ids.get(*current_index).cloned();
                 self.current.credential.clone_from(credential);
                 self.current.current_index = *current_index;
                 self.current.list_id.clone_from(list_id);
+                self.current.params.clone_from(params);
                 self.current.next_pending = false;
                 self.current.state = Some(PlaybackState {
                     media_recovery_attempts: 0,
@@ -710,7 +987,11 @@ impl LoungeConnection {
                 });
                 Some(Outbound::NowPlaying)
             }
-            Incoming::Command(LoungeCommand::UpdatePlaylist { video_ids, list_id }) => {
+            Incoming::Command(LoungeCommand::UpdatePlaylist {
+                video_ids,
+                list_id,
+                params,
+            }) => {
                 self.current.current_index = super::retained_selection_index(
                     self.current.video_id.as_deref(),
                     self.current.current_index,
@@ -718,9 +999,13 @@ impl LoungeConnection {
                 );
                 self.current.video_ids.clone_from(video_ids);
                 self.current.list_id.clone_from(list_id);
+                if params.is_some() {
+                    self.current.params.clone_from(params);
+                }
                 if self.current.next_pending
                     && self.current.current_index + 1 < self.current.video_ids.len()
                 {
+                    self.current.selection_serial = self.current.selection_serial.wrapping_add(1);
                     self.current.current_index += 1;
                     self.current.video_id = self
                         .current
@@ -728,6 +1013,7 @@ impl LoungeConnection {
                         .get(self.current.current_index)
                         .cloned();
                     self.current.credential = None;
+                    self.current.params = None;
                     self.current.next_pending = false;
                     self.current.stopped = false;
                     self.current.recovery = LoadRecovery {
@@ -756,8 +1042,10 @@ impl LoungeConnection {
                     idle_reason: None,
                 });
                 if self.current.current_index + 1 < self.current.video_ids.len() {
+                    self.current.selection_serial = self.current.selection_serial.wrapping_add(1);
                     self.current.current_index += 1;
                     self.current.credential = None;
+                    self.current.params = None;
                     self.current.video_id = self
                         .current
                         .video_ids
@@ -774,9 +1062,11 @@ impl LoungeConnection {
                     return None;
                 }
                 self.current.awaiting_load = true;
+                self.current.selection_serial = self.current.selection_serial.wrapping_add(1);
                 self.current.next_pending = false;
                 self.current.current_index = self.current.current_index.saturating_sub(1);
                 self.current.credential = None;
+                self.current.params = None;
                 self.current.video_id = self
                     .current
                     .video_ids
@@ -791,6 +1081,7 @@ impl LoungeConnection {
                 });
                 Some(Outbound::NowPlaying)
             }
+            Incoming::Command(LoungeCommand::RemoteDevices(_)) => None,
             Incoming::GetNowPlaying => Some(Outbound::NowPlaying),
             Incoming::GetPlaybackSpeed => Some(Outbound::PlaybackSpeed),
             Incoming::GetVolume => Some(Outbound::Volume),
@@ -799,7 +1090,7 @@ impl LoungeConnection {
         }
     }
 
-    async fn post(&mut self, outbound: Outbound) -> Result<(), LoungeError> {
+    fn prepare_post(&mut self, outbound: Outbound) -> reqwest::RequestBuilder {
         self.bound.rid += 1;
         let mut url = self.bind_url.clone();
         append_bound_query(&mut url, &self.bound, self.bound.rid.to_string().as_str());
@@ -822,13 +1113,17 @@ impl LoungeConnection {
             .header("User-Agent", USER_AGENT)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        Ok(())
     }
+
+    #[cfg(test)]
+    async fn post(&mut self, outbound: Outbound) -> Result<(), LoungeError> {
+        send_post(self.prepare_post(outbound)).await
+    }
+}
+
+async fn send_post(request: reqwest::RequestBuilder) -> Result<(), LoungeError> {
+    request.send().await?.error_for_status()?.bytes().await?;
+    Ok(())
 }
 
 async fn generate_lounge_identity(
@@ -996,6 +1291,15 @@ impl Outbound {
                 }
                 if let Some(list_id) = &current.list_id {
                     form.append_pair("req0_listId", list_id);
+                }
+                if let (Some(video_id), Some(credential)) = (&current.video_id, &current.credential)
+                {
+                    if credential.applies_to(video_id) {
+                        form.append_pair("req0_ctt", credential.value());
+                    }
+                }
+                if let Some(params) = &current.params {
+                    form.append_pair("req0_params", params.value());
                 }
                 form.append_pair("req0_currentIndex", &current.current_index.to_string());
                 form.append_pair("req1__sc", "onLoopModeChanged")
@@ -1261,6 +1565,7 @@ fn selection_diagnostics(message: &[Value], incoming: &Incoming) -> Value {
         // Presence only: credential transfer tokens are secrets and must never
         // be written to logs, even at debug level.
         "hasCtt": params.get("ctt").and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
+        "hasParams": params.get("params").and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
         "eventVideoId": event_id,
         "eventType": event_type,
         "eventVideoCount": event.as_ref().and_then(|v| v.get("videoIds"))
@@ -1351,6 +1656,48 @@ mod selection_diagnostic_tests {
             Incoming::Command(LoungeCommand::SetPlaylist { .. })
         ));
     }
+
+    #[test]
+    fn queue_addition_never_replaces_the_active_item_context() {
+        let current = CurrentMedia {
+            video_ids: vec!["active".into(), "next".into()],
+            video_id: Some("active".into()),
+            current_index: 0,
+            list_id: Some("queue".into()),
+            params: PlaylistParams::new("active+params&private".into()),
+            credential: Some(CredentialTransferToken::new(
+                "active".into(),
+                "active-token".into(),
+            )),
+            ..Default::default()
+        };
+        let incoming = parse_message(&[
+            serde_json::json!("setPlaylist"),
+            serde_json::json!({
+                "videoId": "added",
+                "videoIds": "added,active,next",
+                "currentIndex": "0",
+                "listId": "queue",
+                "params": "added-params",
+                "ctt": "added-token",
+                "eventDetails": serde_json::json!({
+                    "eventType": "VIDEO_ADDED",
+                    "videoId": "added"
+                }).to_string()
+            }),
+        ]);
+
+        let Incoming::Command(LoungeCommand::UpdatePlaylist {
+            video_ids, params, ..
+        }) = current.coalesce_pending_selection(incoming)
+        else {
+            panic!("queue addition must not become a new selection");
+        };
+        assert_eq!(video_ids, ["added", "active", "next"]);
+        assert_eq!(params, current.params);
+        assert_eq!(current.credential.as_ref().unwrap().value(), "active-token");
+    }
+
     #[test]
     fn reproduced_additions_preserve_state_and_feedback_until_explicit_selection() {
         let mut connection = LoungeConnection {
@@ -1367,6 +1714,7 @@ mod selection_diagnostic_tests {
             screen_id: "test".into(),
             device_id: "test".into(),
             discovery_device_id: "test".into(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia::default(),
         };
         // Sanitized reconstruction of Controls-16: each addition inserts at
@@ -1447,6 +1795,7 @@ mod selection_diagnostic_tests {
             screen_id: "test".into(),
             device_id: "test".into(),
             discovery_device_id: "test".into(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia {
                 video_ids: vec!["a".into(), "b".into(), "c".into()],
                 video_id: Some("b".into()),
@@ -1520,21 +1869,20 @@ mod selection_diagnostic_tests {
     }
 
     #[test]
-    fn additions_without_matching_active_queue_keep_previous_semantics() {
+    fn additions_require_the_same_queue_and_retain_a_moved_active_item() {
         let current = CurrentMedia {
             video_id: Some("z".into()),
             list_id: Some("queue".into()),
             ..Default::default()
         };
-        for incoming in [
-            event("VIDEO_ADDED", "z,a", 1, "other"),
-            event("VIDEO_ADDED", "a,z", 0, "queue"),
-        ] {
-            assert!(matches!(
-                current.coalesce_pending_selection(incoming),
-                Incoming::Command(LoungeCommand::SetPlaylist { .. })
-            ));
-        }
+        assert!(matches!(
+            current.coalesce_pending_selection(event("VIDEO_ADDED", "z,a", 1, "other")),
+            Incoming::Command(LoungeCommand::SetPlaylist { .. })
+        ));
+        assert!(matches!(
+            current.coalesce_pending_selection(event("VIDEO_ADDED", "a,z", 0, "queue")),
+            Incoming::Command(LoungeCommand::UpdatePlaylist { .. })
+        ));
         assert!(matches!(
             CurrentMedia::default().coalesce_pending_selection(event(
                 "VIDEO_ADDED",
@@ -1589,6 +1937,39 @@ mod selection_diagnostic_tests {
             assert!(!details.to_string().contains("private-"));
         }
     }
+
+    #[test]
+    fn playlist_params_are_preserved_but_redacted() {
+        let parsed = parse_message(&[
+            serde_json::json!("setPlaylist"),
+            serde_json::json!({
+                "videoId": "a", "videoIds": "a,b", "currentIndex": "0",
+                "params": "opaque-private-params"
+            }),
+        ]);
+        let Incoming::Command(LoungeCommand::SetPlaylist { params, .. }) = parsed else {
+            panic!("setPlaylist was not parsed");
+        };
+        let params = params.unwrap();
+        assert_eq!(params.value(), "opaque-private-params");
+        assert!(!format!("{params:?}").contains("opaque-private-params"));
+    }
+
+    #[test]
+    fn lounge_status_keeps_only_bounded_remote_control_ids() {
+        let devices = serde_json::json!([
+            {"id":"phone", "type":"REMOTE_CONTROL", "name":"private"},
+            {"id":"speaker", "type":"LOUNGE_SCREEN"},
+            {"id":"desktop", "type":"REMOTE_CONTROL"},
+            {"id":"phone", "type":"REMOTE_CONTROL"},
+            {"id":"", "type":"REMOTE_CONTROL"}
+        ])
+        .to_string();
+        assert_eq!(
+            parse_remote_devices(Some(&serde_json::json!({"devices": devices}))).unwrap(),
+            ["desktop", "phone"]
+        );
+    }
 }
 
 fn parse_message(message: &[Value]) -> Incoming {
@@ -1604,6 +1985,7 @@ fn parse_message(message: &[Value]) -> Incoming {
         "stopVideo" | "stop" => Some(LoungeCommand::Stop),
         "next" => Some(LoungeCommand::Next),
         "previous" => Some(LoungeCommand::Previous),
+        "loungeStatus" => parse_remote_devices(params).map(LoungeCommand::RemoteDevices),
         "seekTo" => params
             .and_then(|value| value.get("newTime"))
             .and_then(value_as_f64)
@@ -1689,6 +2071,11 @@ fn parse_set_playlist(params: Option<&Value>) -> Option<LoungeCommand> {
             .get("listId")
             .and_then(Value::as_str)
             .map(str::to_string),
+        params: params
+            .get("params")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(PlaylistParams::new),
         credential,
     })
 }
@@ -1702,7 +2089,38 @@ fn parse_update_playlist(params: Option<&Value>) -> Option<LoungeCommand> {
             .get("listId")
             .and_then(Value::as_str)
             .map(str::to_string),
+        params: params
+            .get("params")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(PlaylistParams::new),
     })
+}
+
+fn parse_remote_devices(params: Option<&Value>) -> Option<Vec<String>> {
+    let devices = params?
+        .get("devices")?
+        .as_str()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())?;
+    let mut ids = Vec::new();
+    for device in devices.as_array()?.iter().take(32) {
+        if device.get("type").and_then(Value::as_str) != Some("REMOTE_CONTROL") {
+            continue;
+        }
+        let Some(id) = device
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+        else {
+            continue;
+        };
+        if ids.len() < 16 && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids.sort_unstable();
+    Some(ids)
 }
 
 fn parse_video_ids(params: &Value) -> Vec<String> {
@@ -2216,6 +2634,103 @@ mod tests {
     }
 
     #[test]
+    fn now_playing_round_trips_only_the_matching_item_context() {
+        let mut current = CurrentMedia {
+            video_id: Some("selected".into()),
+            list_id: Some("queue".into()),
+            params: PlaylistParams::new("opaque+value&x=y%25".into()),
+            credential: Some(CredentialTransferToken::new(
+                "selected".into(),
+                "token+value&x=y%25".into(),
+            )),
+            ..Default::default()
+        };
+        let fields = |current: &CurrentMedia| {
+            url::form_urlencoded::parse(
+                Outbound::NowPlaying
+                    .form_body(0, current, "device", "lounge")
+                    .as_bytes(),
+            )
+            .into_owned()
+            .collect::<std::collections::HashMap<String, String>>()
+        };
+        let values = fields(&current);
+        assert_eq!(values["req0_ctt"], "token+value&x=y%25");
+        assert_eq!(values["req0_params"], "opaque+value&x=y%25");
+
+        current.credential = Some(CredentialTransferToken::new(
+            "different".into(),
+            "must-not-leak".into(),
+        ));
+        let values = fields(&current);
+        assert!(!values.contains_key("req0_ctt"));
+        assert_eq!(values["req0_params"], "opaque+value&x=y%25");
+    }
+
+    #[test]
+    fn committed_navigation_context_is_advertised_and_reused_for_recovery() {
+        let credential = CredentialTransferToken::new("selected".into(), "fresh-token".into());
+        let params = PlaylistParams::new("fresh-params".into()).unwrap();
+        let playing = PlaybackState {
+            media_recovery_attempts: 0,
+            player_state: PlayerState::Playing,
+            current_time: 42.5,
+            duration: Some(230.0),
+            idle_reason: None,
+        };
+        let mut current = CurrentMedia {
+            recovery: LoadRecovery {
+                enabled: true,
+                ..Default::default()
+            },
+            video_ids: vec!["first".into(), "selected".into()],
+            video_id: Some("selected".into()),
+            list_id: Some("queue".into()),
+            current_index: 1,
+            ownership_epoch: 4,
+            selection_serial: 7,
+            state: Some(playing.clone()),
+            ..Default::default()
+        };
+
+        assert!(current.commit_worker_context(CommittedContext {
+            ownership_epoch: 4,
+            selection_serial: 7,
+            video_id: "selected".into(),
+            index: 1,
+            list_id: Some("queue".into()),
+            params: Some(params),
+            credential: Some(credential.clone()),
+        }));
+        let values = url::form_urlencoded::parse(
+            Outbound::NowPlaying
+                .form_body(0, &current, "device", "lounge")
+                .as_bytes(),
+        )
+        .into_owned()
+        .collect::<std::collections::HashMap<String, String>>();
+        assert_eq!(values["req0_ctt"], "fresh-token");
+        assert_eq!(values["req0_params"], "fresh-params");
+
+        let failure = PlaybackState {
+            player_state: PlayerState::Idle,
+            idle_reason: Some(IdleReason::Error),
+            ..playing
+        };
+        let (_, command) = current.accept_state(failure).unwrap();
+        assert_eq!(
+            command,
+            Some(LoungeCommand::ReloadCurrent {
+                video_id: "selected".into(),
+                current_time: 42.5,
+                autoplay: true,
+                retries_used: 1,
+                credential: Some(credential),
+            })
+        );
+    }
+
+    #[test]
     fn repeat_capability_and_sender_modes_round_trip() {
         let receiver = ReceiverContext::new("Test", "Model", "device", PathBuf::new());
         let url = build_bind_url(
@@ -2319,6 +2834,11 @@ mod tests {
         let mut current = CurrentMedia {
             loop_mode: LoopMode::All,
             video_ids: vec!["a".into(), "b".into()],
+            params: PlaylistParams::new("last-item-params".into()),
+            credential: Some(CredentialTransferToken::new(
+                "b".into(),
+                "last-item-token".into(),
+            )),
             ..Default::default()
         };
         assert_eq!(current.next_command(true), LoungeCommand::Next);
@@ -2329,6 +2849,8 @@ mod tests {
                 LoungeCommand::SetPlaylist {
                     current_index: 0,
                     current_time: 0.0,
+                    params: None,
+                    credential: None,
                     ..
                 }
             ));
@@ -2372,12 +2894,13 @@ mod tests {
                 current_index: 0,
                 current_time: position,
                 list_id: Some("new-queue".into()),
+                params: None,
                 credential: None,
             })
         };
         assert!(
             matches!(current.coalesce_pending_selection(selection("a", 0.0)),
-            Incoming::Command(LoungeCommand::UpdatePlaylist { video_ids, list_id })
+            Incoming::Command(LoungeCommand::UpdatePlaylist { video_ids, list_id, .. })
                 if video_ids == ["a", "next"] && list_id.as_deref() == Some("new-queue"))
         );
         for command in [selection("b", 0.0), selection("a", 42.0)] {
@@ -2391,6 +2914,46 @@ mod tests {
             current.coalesce_pending_selection(selection("a", 0.0)),
             Incoming::Command(LoungeCommand::SetPlaylist { .. })
         ));
+    }
+
+    #[test]
+    fn stale_worker_event_cannot_overwrite_new_same_video_selection() {
+        let fresh = CredentialTransferToken::new("a".into(), "fresh-token".into());
+        let mut current = CurrentMedia {
+            recovery: LoadRecovery {
+                enabled: true,
+                ..Default::default()
+            },
+            video_ids: vec!["a".into()],
+            video_id: Some("a".into()),
+            credential: Some(fresh.clone()),
+            current_index: 0,
+            ownership_epoch: 1,
+            selection_serial: 1,
+            ..Default::default()
+        };
+        current.commit_worker_context(CommittedContext {
+            ownership_epoch: 0,
+            selection_serial: 1,
+            video_id: "a".into(),
+            index: 0,
+            list_id: None,
+            params: None,
+            credential: None,
+        });
+        current.mark_resolution_failed(0, 1, "a", ResolutionFailureClass::CredentialsRequired);
+        current.commit_worker_context(CommittedContext {
+            ownership_epoch: 1,
+            selection_serial: 0,
+            video_id: "a".into(),
+            index: 0,
+            list_id: None,
+            params: None,
+            credential: None,
+        });
+        assert_eq!(current.credential, Some(fresh));
+        assert!(current.recovery.enabled);
+        assert!(!current.recovery.resolution_terminal);
     }
     use std::path::PathBuf;
     use wiremock::matchers::{method, path};
@@ -2533,6 +3096,7 @@ mod tests {
             .handle_internal(&Incoming::Command(LoungeCommand::UpdatePlaylist {
                 video_ids: vec!["b".into(), "a".into()],
                 list_id: None,
+                params: None,
             }))
             .is_none());
         assert_eq!(connection.current.current_index, 0);
@@ -2556,6 +3120,7 @@ mod tests {
             screen_id: "screen".into(),
             device_id: "device".into(),
             discovery_device_id: "cast".into(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia {
                 video_ids: vec!["a".into()],
                 video_id: Some("a".into()),
@@ -2673,6 +3238,7 @@ mod tests {
         connection.handle_internal(&Incoming::Command(LoungeCommand::UpdatePlaylist {
             video_ids: vec!["a".into(), "b".into()],
             list_id: None,
+            params: None,
         }));
         assert_eq!(connection.current.video_id.as_deref(), Some("b"));
         assert!(connection.current.awaiting_load);
@@ -2695,6 +3261,7 @@ mod tests {
         connection.handle_internal(&Incoming::Command(LoungeCommand::UpdatePlaylist {
             video_ids: vec!["a".into(), "b".into()],
             list_id: None,
+            params: None,
         }));
         assert_eq!(connection.current.video_id.as_deref(), Some("a"));
         assert!(!connection.current.awaiting_load);
@@ -2710,6 +3277,7 @@ mod tests {
                 current_index: 0,
                 current_time: 0.0,
                 list_id: None,
+                params: None,
                 credential: None,
             }))
             .unwrap();
@@ -2735,6 +3303,7 @@ mod tests {
         let (_playback_tx, mut playback_rx) = mpsc::channel(8);
         let (_control_tx, mut control_rx) = mpsc::channel(8);
         let (_takeover_tx, mut takeover_rx) = mpsc::channel(8);
+        let (_worker_tx, mut worker_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             connection
@@ -2742,6 +3311,7 @@ mod tests {
                     &command_tx,
                     &mut playback_rx,
                     &mut control_rx,
+                    &mut worker_rx,
                     &mut cancel_rx,
                     &mut takeover_rx,
                 )
@@ -2756,6 +3326,129 @@ mod tests {
         .unwrap();
         // YouTubeSession owns the only cancellation Sender.
         drop(cancel_tx);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            LoungeRunExit::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn output_control_reaches_queue_worker_during_reconnect_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let connection = regression_connection(&server);
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        let (_playback_tx, mut playback_rx) = mpsc::channel(8);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let (_takeover_tx, mut takeover_rx) = mpsc::channel(8);
+        let (_worker_tx, mut worker_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            connection
+                .run(
+                    &command_tx,
+                    &mut playback_rx,
+                    &mut control_rx,
+                    &mut worker_rx,
+                    &mut cancel_rx,
+                    &mut takeover_rx,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method.as_str() == "GET")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        control_tx.send(OutputControl::Stop).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+                .await
+                .expect("Stop waited for Lounge rebind")
+                .unwrap(),
+            LoungeCommand::Stop
+        );
+
+        cancel_tx.send(true).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            LoungeRunExit::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn output_control_reaches_queue_worker_while_feedback_post_is_stalled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+
+        let connection = regression_connection(&server);
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        let (_playback_tx, mut playback_rx) = mpsc::channel(8);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let (_takeover_tx, mut takeover_rx) = mpsc::channel(8);
+        let (_worker_tx, mut worker_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            connection
+                .run(
+                    &command_tx,
+                    &mut playback_rx,
+                    &mut control_rx,
+                    &mut worker_rx,
+                    &mut cancel_rx,
+                    &mut takeover_rx,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        control_tx.send(OutputControl::Stop).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+                .await
+                .expect("Stop waited for stalled Lounge feedback")
+                .unwrap(),
+            LoungeCommand::Stop
+        );
+
+        cancel_tx.send(true).unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), task)
                 .await
@@ -2837,6 +3530,7 @@ mod tests {
             screen_id: "screen".into(),
             device_id: "device".into(),
             discovery_device_id: "cast".into(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: retryable_media(),
         };
         let (command_tx, mut command_rx) = mpsc::channel(8);
@@ -2991,6 +3685,7 @@ mod tests {
             screen_id: "screen".into(),
             device_id: "device".into(),
             discovery_device_id: "cast".into(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia {
                 video_ids: vec!["a".into(), "b".into()],
                 video_id: Some("b".into()),
@@ -3066,6 +3761,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(command, LoungeCommand::Next);
+        for (control, expected) in [
+            (OutputControl::Pause, LoungeCommand::Pause),
+            (OutputControl::Seek(7.0), LoungeCommand::Seek(7.0)),
+            (OutputControl::Stop, LoungeCommand::Stop),
+        ] {
+            control_tx.send(control).await.unwrap();
+            let command = tokio::time::timeout(Duration::from_secs(2), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(command, expected);
+        }
         cancel_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -3111,6 +3818,7 @@ mod tests {
             screen_id: "screen-id".to_string(),
             device_id: "lounge-device".to_string(),
             discovery_device_id: "CAST-ID".to_string(),
+            ownership_epoch: Arc::new(AtomicU64::new(0)),
             current: CurrentMedia::default(),
         };
         let (command_tx, _command_rx) = mpsc::channel(1);

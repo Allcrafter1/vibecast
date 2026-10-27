@@ -21,6 +21,11 @@ use crate::CredentialTransferToken;
 const CLIENT_NAME: &str = "ANDROID";
 const CLIENT_VERSION: &str = "20.10.38";
 const CLIENT_USER_AGENT: &str = "com.google.android.youtube/20.10.38";
+const TV_CLIENT_NAME: &str = "TVHTML5";
+const TV_CLIENT_VERSION: &str = "7.20230405.08.01";
+const TV_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; WOW64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.142 Safari/537.36; \
+    SMART-TV; Tizen 4.0,gzip(gfe)";
 
 pub(crate) const PREFERRED_VIDEO_CODEC_KEY: SettingKey<String> =
     SettingKey::new("preferred_video_codec");
@@ -32,6 +37,48 @@ pub(crate) enum PreferredVideoCodec {
     Av1,
     Vp9,
     H264,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct NavigationItem {
+    pub(crate) video_id: String,
+    pub(crate) list_id: Option<String>,
+    pub(crate) index: Option<usize>,
+    pub(crate) params: Option<String>,
+    pub(crate) credential: Option<CredentialTransferToken>,
+}
+
+impl std::fmt::Debug for NavigationItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NavigationItem")
+            .field("video_id", &self.video_id)
+            .field("list_id", &self.list_id)
+            .field("index", &self.index)
+            .field("has_params", &self.params.is_some())
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NavigationNeighbors {
+    pub(crate) previous: Option<NavigationItem>,
+    pub(crate) next: Option<NavigationItem>,
+}
+
+pub(crate) struct NavigationRequest<'a> {
+    pub(crate) video_id: &'a str,
+    pub(crate) list_id: Option<&'a str>,
+    pub(crate) index: usize,
+    pub(crate) params: Option<&'a str>,
+    pub(crate) credential: Option<&'a CredentialTransferToken>,
+    pub(crate) remote_device_ids: &'a [String],
+}
+
+#[derive(Clone)]
+struct InnertubeBootstrap {
+    api_key: String,
+    visitor_data: Option<String>,
 }
 
 impl PreferredVideoCodec {
@@ -59,6 +106,7 @@ impl PreferredVideoCodec {
 pub(crate) struct Resolver {
     http: reqwest::Client,
     endpoints: Endpoints,
+    bootstrap: std::sync::Arc<tokio::sync::Mutex<Option<InnertubeBootstrap>>>,
     #[cfg(test)]
     test_requests: Option<
         tokio::sync::mpsc::UnboundedSender<(
@@ -69,12 +117,20 @@ pub(crate) struct Resolver {
     #[cfg(test)]
     test_contexts:
         Option<tokio::sync::mpsc::UnboundedSender<(String, Option<CredentialTransferToken>)>>,
+    #[cfg(test)]
+    test_navigation: Option<
+        tokio::sync::mpsc::UnboundedSender<(
+            String,
+            tokio::sync::oneshot::Sender<Result<NavigationNeighbors, ResolveError>>,
+        )>,
+    >,
 }
 
 #[derive(Clone)]
 struct Endpoints {
     watch: String,
     player: String,
+    next: String,
 }
 
 impl Default for Endpoints {
@@ -82,6 +138,7 @@ impl Default for Endpoints {
         Self {
             watch: "https://www.youtube.com/watch".to_string(),
             player: "https://www.youtube.com/youtubei/v1/player".to_string(),
+            next: "https://www.youtube.com/youtubei/v1/next".to_string(),
         }
     }
 }
@@ -115,14 +172,36 @@ impl Resolver {
         resolver.test_contexts = Some(context_tx);
         (resolver, requests, contexts)
     }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_with_navigation() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<(
+            String,
+            tokio::sync::oneshot::Sender<Result<PlaybackMedia, ResolveError>>,
+        )>,
+        tokio::sync::mpsc::UnboundedReceiver<(String, Option<CredentialTransferToken>)>,
+        tokio::sync::mpsc::UnboundedReceiver<(
+            String,
+            tokio::sync::oneshot::Sender<Result<NavigationNeighbors, ResolveError>>,
+        )>,
+    ) {
+        let (mut resolver, requests, contexts) = Self::controlled_with_contexts();
+        let (navigation_tx, navigation) = tokio::sync::mpsc::unbounded_channel();
+        resolver.test_navigation = Some(navigation_tx);
+        (resolver, requests, contexts, navigation)
+    }
     pub(crate) fn new(http: reqwest::Client) -> Self {
         Self {
             http,
             endpoints: Endpoints::default(),
+            bootstrap: Default::default(),
             #[cfg(test)]
             test_requests: None,
             #[cfg(test)]
             test_contexts: None,
+            #[cfg(test)]
+            test_navigation: None,
         }
     }
 
@@ -133,9 +212,12 @@ impl Resolver {
             endpoints: Endpoints {
                 watch: format!("{base}/watch"),
                 player: format!("{base}/youtubei/v1/player"),
+                next: format!("{base}/youtubei/v1/next"),
             },
+            bootstrap: Default::default(),
             test_requests: None,
             test_contexts: None,
+            test_navigation: None,
         }
     }
 
@@ -203,7 +285,12 @@ impl Resolver {
             "YouTube parallel resolution completed");
         match (media, audio) {
             (Ok(mut media), Some(audio)) => {
-                media.streams = vec![audio.playback_stream(capabilities.local_audio_cache)];
+                if let Some(stream) = audio.playback_stream(capabilities.local_audio_cache) {
+                    media.streams = vec![stream];
+                } else {
+                    tracing::warn!(%video_id, "using InnerTube audio because external request context cannot be forwarded");
+                    make_first_stream_cacheable(&mut media, capabilities.local_audio_cache);
+                }
                 Ok(media)
             }
             // InnerTube often already supplied a directly playable adaptive
@@ -220,20 +307,22 @@ impl Resolver {
             // prevents a successful Cast selection from being stopped.
             (Err(error), Some(audio)) => {
                 tracing::warn!(%video_id, %error, "using external YouTube fallback metadata");
-                Ok(audio.into_media(video_id, start_time, capabilities.local_audio_cache))
+                audio
+                    .into_media(video_id, start_time, capabilities.local_audio_cache)
+                    .ok_or(error)
             }
             (Err(error), None) => Err(error),
         }
     }
 
-    async fn resolve_metadata(
+    async fn innertube_bootstrap(
         &self,
         video_id: &str,
-        start_time: f64,
-        capabilities: &PlayerCapabilities,
-        preferred_video_codec: PreferredVideoCodec,
-        credential: Option<&CredentialTransferToken>,
-    ) -> Result<PlaybackMedia, ResolveError> {
+    ) -> Result<InnertubeBootstrap, ResolveError> {
+        let mut cached = self.bootstrap.lock().await;
+        if let Some(bootstrap) = cached.as_ref() {
+            return Ok(bootstrap.clone());
+        }
         let mut watch_url = Url::parse(&self.endpoints.watch)
             .map_err(|_| ResolveError::Protocol("invalid watch endpoint"))?;
         watch_url.query_pairs_mut().append_pair("v", video_id);
@@ -247,24 +336,88 @@ impl Resolver {
                 .await
         }
         .await
-        .map_err(|error| diagnose_http("watch_metadata", error))?;
+        .map_err(|error| diagnose_http("watch_bootstrap", error))?;
+        let bootstrap = InnertubeBootstrap {
+            api_key: extract_config_string(&html, "INNERTUBE_API_KEY").ok_or(
+                ResolveError::Protocol("watch page omitted InnerTube API key"),
+            )?,
+            visitor_data: extract_config_string(&html, "VISITOR_DATA")
+                .or_else(|| extract_config_string(&html, "visitorData")),
+        };
+        *cached = Some(bootstrap.clone());
+        Ok(bootstrap)
+    }
 
-        let api_key = extract_config_string(&html, "INNERTUBE_API_KEY").ok_or(
-            ResolveError::Protocol("watch page omitted InnerTube API key"),
-        )?;
-        let visitor_data = extract_config_string(&html, "VISITOR_DATA")
-            .or_else(|| extract_config_string(&html, "visitorData"));
+    /// Resolve YouTube's exact previous/next MDX endpoints. Returned CTTs are
+    /// bound to the endpoint video id and are never persisted.
+    pub(crate) async fn resolve_neighbors(
+        &self,
+        request: NavigationRequest<'_>,
+    ) -> Result<NavigationNeighbors, ResolveError> {
+        #[cfg(test)]
+        {
+            if let Some(requests) = &self.test_navigation {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                requests.send((request.video_id.to_owned(), tx)).unwrap();
+                return rx.await.unwrap();
+            }
+            if self.test_requests.is_some() {
+                return Ok(NavigationNeighbors::default());
+            }
+        }
+        let bootstrap = self.innertube_bootstrap(request.video_id).await?;
+        let mut next_url = Url::parse(&self.endpoints.next)
+            .map_err(|_| ResolveError::Protocol("invalid next endpoint"))?;
+        next_url
+            .query_pairs_mut()
+            .append_pair("key", &bootstrap.api_key);
+        let body = next_request_body(&request, bootstrap.visitor_data.as_deref());
+        let response: serde_json::Value = async {
+            self.http
+                .post(next_url)
+                .header("User-Agent", TV_USER_AGENT)
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        }
+        .await
+        .map_err(|error| diagnose_http("next_navigation", error))?;
+        let neighbors = parse_navigation_neighbors(&response);
+        tracing::info!(
+            video_id = request.video_id,
+            has_ctt = request.credential.is_some(),
+            has_previous = neighbors.previous.is_some(),
+            has_next = neighbors.next.is_some(),
+            "YouTube navigation context resolved"
+        );
+        Ok(neighbors)
+    }
+
+    async fn resolve_metadata(
+        &self,
+        video_id: &str,
+        start_time: f64,
+        capabilities: &PlayerCapabilities,
+        preferred_video_codec: PreferredVideoCodec,
+        credential: Option<&CredentialTransferToken>,
+    ) -> Result<PlaybackMedia, ResolveError> {
+        let bootstrap = self.innertube_bootstrap(video_id).await?;
 
         let mut player_url = Url::parse(&self.endpoints.player)
             .map_err(|_| ResolveError::Protocol("invalid player endpoint"))?;
-        player_url.query_pairs_mut().append_pair("key", &api_key);
+        player_url
+            .query_pairs_mut()
+            .append_pair("key", &bootstrap.api_key);
         let response: PlayerResponse = async {
             self.http
                 .post(player_url)
                 .header("User-Agent", CLIENT_USER_AGENT)
                 .json(&PlayerRequest::new(
                     video_id,
-                    visitor_data.as_deref(),
+                    bootstrap.visitor_data.as_deref(),
                     credential,
                 ))
                 .send()
@@ -285,39 +438,193 @@ impl Resolver {
             "YouTube player authorization result"
         );
         if response.playability_status.status != "OK" {
-            return Err(ResolveError::Unplayable(
-                response
-                    .playability_status
-                    .reason
-                    .unwrap_or(response.playability_status.status),
-            ));
+            let status = response.playability_status.status;
+            let reason = response
+                .playability_status
+                .reason
+                .unwrap_or_else(|| status.clone());
+            if status == "LOGIN_REQUIRED" && credential.is_none() {
+                return Err(ResolveError::CredentialsRequired(reason));
+            }
+            return Err(ResolveError::Unplayable { status, reason });
         }
 
         playback_media(response, start_time, capabilities, preferred_video_codec)
     }
 }
 
-#[derive(Debug)]
+fn next_request_body(
+    request: &NavigationRequest<'_>,
+    visitor_data: Option<&str>,
+) -> serde_json::Value {
+    let mut client = serde_json::json!({
+        "clientName": TV_CLIENT_NAME,
+        "clientVersion": TV_CLIENT_VERSION,
+        "hl": "en",
+        "gl": "US"
+    });
+    if let Some(visitor_data) = visitor_data {
+        client["visitorData"] = serde_json::Value::String(visitor_data.to_owned());
+    }
+    let mut context = serde_json::json!({ "client": client });
+    if let Some(credential) = request
+        .credential
+        .filter(|credential| credential.applies_to(request.video_id))
+    {
+        context["user"] = serde_json::json!({
+            "enableSafetyMode": false,
+            "lockedSafetyMode": false,
+            "credentialTransferTokens": [{
+                "scope": "VIDEO",
+                "token": credential.value()
+            }]
+        });
+    }
+    let devices: Vec<_> = request
+        .remote_device_ids
+        .iter()
+        .take(16)
+        .map(|id| serde_json::json!({ "deviceId": id }))
+        .collect();
+    let mut body = serde_json::json!({
+        "context": context,
+        "videoId": request.video_id,
+        "playlistIndex": request.index,
+        "enableMdxAutoplay": true,
+        "isMdxPlayback": true,
+        "mdxContext": {
+            "mdxReceiverContext": { "mdxConnectedDevices": devices }
+        }
+    });
+    if let Some(list_id) = request.list_id.filter(|value| !value.is_empty()) {
+        body["playlistId"] = serde_json::Value::String(list_id.to_owned());
+    }
+    if let Some(params) = request.params.filter(|value| !value.is_empty()) {
+        body["params"] = serde_json::Value::String(params.to_owned());
+    }
+    body
+}
+
+fn parse_navigation_neighbors(response: &serde_json::Value) -> NavigationNeighbors {
+    let Some(set) =
+        response.pointer("/contents/singleColumnWatchNextResults/autoplay/autoplay/sets/0")
+    else {
+        return NavigationNeighbors::default();
+    };
+    let previous = set
+        .pointer("/previousVideoRenderer/autoplayEndpointRenderer/endpoint")
+        .and_then(parse_navigation_item);
+    let next = set
+        .pointer("/nextVideoRenderer/autoplayEndpointRenderer/endpoint")
+        .and_then(parse_navigation_item)
+        .or_else(|| {
+            set.pointer("/autoplayVideoRenderer/mdxAutoplayVideoRenderer/navigationEndpoint")
+                .and_then(parse_navigation_item)
+        });
+    NavigationNeighbors { previous, next }
+}
+
+fn parse_navigation_item(endpoint: &serde_json::Value) -> Option<NavigationItem> {
+    let watch = endpoint.get("watchEndpoint").unwrap_or(endpoint);
+    let video_id = watch.get("videoId")?.as_str()?.trim().to_owned();
+    if video_id.is_empty() {
+        return None;
+    }
+    let index = watch.get("index").and_then(|value| {
+        value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .or_else(|| value.as_str()?.parse().ok())
+    });
+    let credential = watch
+        .pointer(
+            "/watchEndpointSupportedAuthorizationTokenConfig/videoAuthorizationToken/credentialTransferTokens/0",
+        )
+        .filter(|token| {
+            token
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|scope| scope == "VIDEO")
+        })
+        .and_then(|token| token.get("token"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| CredentialTransferToken::new(video_id.clone(), token.to_owned()));
+    Some(NavigationItem {
+        video_id,
+        list_id: watch
+            .get("playlistId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        index,
+        params: watch
+            .get("params")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        credential,
+    })
+}
+
 struct ExternalMedia {
     url: String,
     content_type: String,
+    request_headers: reqwest::header::HeaderMap,
+    protocol: Option<String>,
+    format_id: Option<String>,
     title: Option<String>,
     subtitle: Option<String>,
     thumbnail: Option<String>,
     duration: Option<f64>,
 }
 
+impl std::fmt::Debug for ExternalMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self
+            .request_headers
+            .keys()
+            .map(reqwest::header::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("ExternalMedia")
+            .field("content_type", &self.content_type)
+            .field("protocol", &self.protocol)
+            .field("format_id", &self.format_id)
+            .field("request_header_names", &header_names)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExternalMedia {
-    fn playback_stream(&self, local_audio_cache: bool) -> PlaybackStream {
-        if local_audio_cache && cacheable_audio_type(&self.content_type) {
-            PlaybackStream::cached_url(&self.url, &self.content_type)
+    fn playback_stream(&self, local_audio_cache: bool) -> Option<PlaybackStream> {
+        if local_audio_cache && cacheable_progressive_type(&self.content_type) {
+            let stream = PlaybackStream::cached_url(&self.url, &self.content_type);
+            if let vibecast_sdk::StreamSource::CachedUrl { cache, .. } = &stream.source {
+                if let Err(error) = cache.set_request_headers(self.request_headers.clone()) {
+                    tracing::warn!(%error, "rejected external media request context");
+                }
+            }
+            Some(stream)
         } else {
-            PlaybackStream::url(&self.url, &self.content_type)
+            if !self.request_headers.is_empty() {
+                tracing::warn!(
+                    local_audio_cache,
+                    "rejecting external media whose request context cannot be forwarded"
+                );
+                return None;
+            }
+            Some(PlaybackStream::url(&self.url, &self.content_type))
         }
     }
 
-    fn into_media(self, video_id: &str, start_time: f64, local_audio_cache: bool) -> PlaybackMedia {
-        let stream = self.playback_stream(local_audio_cache);
+    fn into_media(
+        self,
+        video_id: &str,
+        start_time: f64,
+        local_audio_cache: bool,
+    ) -> Option<PlaybackMedia> {
+        let stream = self.playback_stream(local_audio_cache)?;
         let images = self
             .thumbnail
             .map(|url| {
@@ -328,7 +635,7 @@ impl ExternalMedia {
                 }]
             })
             .unwrap_or_default();
-        PlaybackMedia {
+        Some(PlaybackMedia {
             session_id: String::new(),
             streams: vec![stream],
             stream_type: StreamType::Buffered,
@@ -341,12 +648,15 @@ impl ExternalMedia {
             autoplay: true,
             start_time: start_time.max(0.0),
             custom_data: None,
-        }
+        })
     }
 }
 
-fn cacheable_audio_type(content_type: &str) -> bool {
-    content_type.starts_with("audio/") || content_type == "application/octet-stream"
+fn cacheable_progressive_type(content_type: &str) -> bool {
+    content_type.starts_with("audio/")
+        || content_type.starts_with("video/mp4")
+        || content_type.starts_with("video/webm")
+        || content_type == "application/octet-stream"
 }
 
 fn make_first_stream_cacheable(media: &mut PlaybackMedia, local_audio_cache: bool) {
@@ -356,13 +666,20 @@ fn make_first_stream_cacheable(media: &mut PlaybackMedia, local_audio_cache: boo
     let Some(stream) = media.streams.first_mut() else {
         return;
     };
-    if !cacheable_audio_type(&stream.content_type) {
+    if !cacheable_progressive_type(&stream.content_type) {
         return;
     }
     if let vibecast_sdk::StreamSource::Url(url) = &stream.source {
+        let cache = vibecast_sdk::MediaCacheHint::default();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(CLIENT_USER_AGENT),
+        );
+        let _ = cache.set_request_headers(headers);
         stream.source = vibecast_sdk::StreamSource::CachedUrl {
             url: url.clone(),
-            cache: Default::default(),
+            cache,
         };
     }
 }
@@ -376,94 +693,200 @@ async fn external_audio_url_with_program(
     program: &std::ffi::OsStr,
 ) -> Option<ExternalMedia> {
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
-    let mut command = tokio::process::Command::new(program);
-    command.args([
-        "--no-warnings",
-        "--no-playlist",
-        // A listed format may still return HTTP 403. Let the upstream
-        // extractor probe candidates before handing a URL to the player.
-        "--check-formats",
-        "-f",
-        "ba",
-        "--get-url",
-        &watch_url,
-    ]);
-    let output = checked_process_output(command, std::time::Duration::from_secs(35)).await?;
-    if output.status.success() {
-        if let Some(url) = String::from_utf8(output.stdout)
-            .ok()?
-            .lines()
-            .find(|line| line.starts_with("https://"))
-        {
-            return Some(ExternalMedia {
-                content_type: if url.contains("/manifest/") {
-                    "application/vnd.apple.mpegurl".to_owned()
-                } else {
-                    "application/octet-stream".to_owned()
-                },
-                url: url.to_owned(),
-                title: None,
-                subtitle: None,
-                thumbnail: None,
-                duration: None,
-            });
-        }
+    if let Some(media) = run_external_audio_recipe(program, &watch_url, None, "ba").await {
+        return Some(media);
     }
 
     // Under guest-session/watch-page throttling the MWEB player can still
     // return its progressive MP4. This is intentionally a fallback: normal
     // operation keeps the much smaller audio-only rendition and its RAM cache.
     tracing::warn!(%video_id, "trying YouTube mobile-web playback fallback");
+    run_external_audio_recipe(
+        program,
+        &watch_url,
+        Some("youtube:player_client=mweb"),
+        "ba/b",
+    )
+    .await
+}
+
+async fn run_external_audio_recipe(
+    program: &std::ffi::OsStr,
+    watch_url: &str,
+    extractor_args: Option<&str>,
+    format: &str,
+) -> Option<ExternalMedia> {
     let mut command = tokio::process::Command::new(program);
     command.args([
+        "--ignore-config",
         "--no-warnings",
         "--no-playlist",
-        // The fallback can list URLs that immediately return HTTP 403 too.
-        // Preserve extraction failure instead of triggering a player/reload loop.
+        // Probe the selected format before returning its signed URL, but emit
+        // the complete recipe instead of discarding headers and protocol.
         "--check-formats",
-        "--extractor-args",
-        "youtube:player_client=mweb",
-        "-f",
-        "ba/b",
-        "--print",
-        "%(url)j",
-        "--print",
-        "%(title)j",
-        "--print",
-        "%(duration)j",
-        "--print",
-        "%(channel)j",
-        "--print",
-        "%(thumbnail)j",
-        &watch_url,
+        "--skip-download",
+        "--dump-single-json",
     ]);
+    if let Some(extractor_args) = extractor_args {
+        command.args(["--extractor-args", extractor_args]);
+    }
+    command.args(["-f", format, watch_url]);
     let output = checked_process_output(command, std::time::Duration::from_secs(35)).await?;
     if !output.status.success() {
         return None;
     }
-    let output = String::from_utf8(output.stdout).ok()?;
-    let mut lines = output.lines();
-    let url: String = serde_json::from_str(lines.next()?).ok()?;
-    let title = serde_json::from_str(lines.next()?).ok();
-    let duration = serde_json::from_str(lines.next()?).ok();
-    let subtitle = serde_json::from_str(lines.next()?).ok();
-    let thumbnail = serde_json::from_str(lines.next()?).ok();
-    let content_type = Url::parse(&url)
-        .ok()
-        .and_then(|url| {
-            url.query_pairs()
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    external_media_from_info(&info)
+}
+
+fn external_media_from_info(info: &serde_json::Value) -> Option<ExternalMedia> {
+    let selected = info
+        .get("requested_downloads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|formats| (formats.len() == 1).then(|| &formats[0]))
+        .unwrap_or(info);
+    let url = selected
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| info.get("url").and_then(serde_json::Value::as_str))?
+        .to_owned();
+    let parsed_url = Url::parse(&url).ok()?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return None;
+    }
+    let protocol = selected
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| info.get("protocol").and_then(serde_json::Value::as_str))
+        .map(str::to_owned);
+    let hls = protocol
+        .as_deref()
+        .is_some_and(|value| matches!(value, "m3u8" | "m3u8_native"))
+        || url.contains("/manifest/");
+    // Preserve the previous HLS fallback, but reject extractor-specific
+    // transports that neither the receiver proxy nor the player can fetch.
+    if protocol
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "http" | "https" | "m3u8" | "m3u8_native"))
+    {
+        return None;
+    }
+    let mut request_headers = reqwest::header::HeaderMap::new();
+    if let Some(headers) = selected
+        .get("http_headers")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| {
+            info.get("http_headers")
+                .and_then(serde_json::Value::as_object)
+        })
+    {
+        if headers.len() > 32 {
+            return None;
+        }
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+            // These fields are generated by the bounded cache request itself.
+            // Ignoring extractor copies cannot remove authentication context.
+            if cache_owned_recipe_header(&name) {
+                continue;
+            }
+            let value = value.as_str()?;
+            if !supported_recipe_header(&name) || value.len() > 8192 {
+                return None;
+            }
+            let value = reqwest::header::HeaderValue::from_str(value).ok()?;
+            request_headers.insert(name, value);
+        }
+    }
+    // Validate before the recipe can reach the cache. Reject the whole
+    // context rather than silently dropping a potentially required header.
+    let validation = vibecast_sdk::MediaCacheHint::default();
+    validation
+        .set_request_headers(request_headers.clone())
+        .ok()?;
+    let has_video = selected
+        .get("vcodec")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|codec| !codec.is_empty() && codec != "none");
+    let content_type = hls
+        .then(|| "application/vnd.apple.mpegurl".to_owned())
+        .or_else(|| {
+            parsed_url
+                .query_pairs()
                 .find(|(name, _)| name == "mime")
                 .map(|(_, value)| value.into_owned())
         })
-        .unwrap_or_else(|| "video/mp4".to_owned());
+        .or_else(|| {
+            selected
+                .get("ext")
+                .and_then(serde_json::Value::as_str)
+                .map(|ext| match (ext, has_video) {
+                    ("mp4", true) => "video/mp4",
+                    ("webm", true) => "video/webm",
+                    ("m4a" | "mp4", false) => "audio/mp4",
+                    ("webm", false) => "audio/webm",
+                    ("opus" | "ogg", _) => "audio/ogg",
+                    ("mp3", _) => "audio/mpeg",
+                    _ => "application/octet-stream",
+                })
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
     Some(ExternalMedia {
         url,
         content_type,
-        title,
-        subtitle,
-        thumbnail,
-        duration,
+        request_headers,
+        protocol,
+        format_id: selected
+            .get("format_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        title: info
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        subtitle: info
+            .get("channel")
+            .or_else(|| info.get("uploader"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        thumbnail: info
+            .get("thumbnail")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        duration: info.get("duration").and_then(serde_json::Value::as_f64),
     })
+}
+
+fn supported_recipe_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "accept-language"
+            | "cookie"
+            | "origin"
+            | "referer"
+            | "sec-fetch-dest"
+            | "sec-fetch-mode"
+            | "sec-fetch-site"
+            | "user-agent"
+    )
+}
+
+fn cache_owned_recipe_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "range"
+            | "if-range"
+            | "accept-encoding"
+            | "content-length"
+            | "connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "trailer"
+            | "te"
+    )
 }
 
 // A cancelled resolver must terminate the owned process group before the next
@@ -508,7 +931,7 @@ case " $* " in *player_client=mweb*) ;; *) exit 1 ;; esac
 case " $* " in
   *broken*) case " $* " in *--check-formats*) exit 1 ;; esac ;;
 esac
-printf '%s\n' '"https://media.example/audio?mime=audio%2Fmp4"' '"Title"' '180' '"Artist"' '"https://img.example/cover.jpg"'
+printf '%s\n' '{"url":"https://media.example/audio?mime=audio%2Fmp4","protocol":"https","format_id":"140","ext":"m4a","http_headers":{"User-Agent":"test-agent"},"title":"Title","duration":180,"channel":"Artist","thumbnail":"https://img.example/cover.jpg"}'
 "#).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let rejected = external_audio_url_with_program("broken", path.as_os_str()).await;
@@ -653,8 +1076,10 @@ pub(crate) enum ResolveError {
     Http(#[from] reqwest::Error),
     #[error("YouTube protocol error: {0}")]
     Protocol(&'static str),
-    #[error("video is unavailable: {0}")]
-    Unplayable(String),
+    #[error("video requires sender credentials: {0}")]
+    CredentialsRequired(String),
+    #[error("video is unavailable ({status}): {reason}")]
+    Unplayable { status: String, reason: String },
     #[error("no compatible video stream is available")]
     NoCompatibleStream,
 }
@@ -1750,16 +2175,193 @@ mod tests {
     use vibecast_sdk::{Resolution, StreamSource};
 
     #[test]
-    fn mobile_web_fallback_preserves_metadata_without_caching_video_bytes() {
+    fn next_request_carries_mdx_playlist_context_and_current_ctt() {
+        let credential = CredentialTransferToken::new("current".into(), "secret-ctt".into());
+        let body = next_request_body(
+            &NavigationRequest {
+                video_id: "current",
+                list_id: Some("playlist"),
+                index: 4,
+                params: Some("opaque-params"),
+                credential: Some(&credential),
+                remote_device_ids: &["phone".into(), "desktop".into()],
+            },
+            Some("visitor"),
+        );
+        assert_eq!(body["context"]["client"]["clientName"], TV_CLIENT_NAME);
+        assert_eq!(body["videoId"], "current");
+        assert_eq!(body["playlistId"], "playlist");
+        assert_eq!(body["playlistIndex"], 4);
+        assert_eq!(body["params"], "opaque-params");
+        assert_eq!(
+            body["context"]["user"]["credentialTransferTokens"][0]["token"],
+            "secret-ctt"
+        );
+        assert_eq!(
+            body["mdxContext"]["mdxReceiverContext"]["mdxConnectedDevices"][1]["deviceId"],
+            "desktop"
+        );
+    }
+
+    #[test]
+    fn navigation_parser_binds_each_ctt_to_its_endpoint_video() {
+        let endpoint = |id: &str, index: usize, token: &str| {
+            serde_json::json!({
+                "watchEndpoint": {
+                    "videoId": id,
+                    "playlistId": "playlist",
+                    "index": index,
+                    "params": format!("params-{id}"),
+                    "watchEndpointSupportedAuthorizationTokenConfig": {
+                        "videoAuthorizationToken": {
+                            "credentialTransferTokens": [{
+                                "scope": "VIDEO", "token": token
+                            }]
+                        }
+                    }
+                }
+            })
+        };
+        let response = serde_json::json!({
+            "contents": { "singleColumnWatchNextResults": {
+                "autoplay": { "autoplay": { "sets": [{
+                    "previousVideoRenderer": { "autoplayEndpointRenderer": {
+                        "endpoint": endpoint("previous", 3, "previous-token")
+                    }},
+                    "nextVideoRenderer": { "autoplayEndpointRenderer": {
+                        "endpoint": endpoint("next", 5, "next-token")
+                    }}
+                }]}}
+            }}
+        });
+        let parsed = parse_navigation_neighbors(&response);
+        let previous = parsed.previous.unwrap();
+        let next = parsed.next.unwrap();
+        assert_eq!(previous.index, Some(3));
+        assert_eq!(next.index, Some(5));
+        assert!(previous.credential.unwrap().applies_to("previous"));
+        let next_credential = next.credential.unwrap();
+        assert!(next_credential.applies_to("next"));
+        assert_eq!(next_credential.value(), "next-token");
+    }
+
+    #[test]
+    fn navigation_debug_redacts_opaque_item_context() {
+        let item = NavigationItem {
+            video_id: "video".into(),
+            list_id: Some("queue".into()),
+            index: Some(2),
+            params: Some("private-player-params".into()),
+            credential: Some(CredentialTransferToken::new(
+                "video".into(),
+                "private-ctt".into(),
+            )),
+        };
+        let debug = format!("{item:?}");
+        assert!(debug.contains("has_params: true"));
+        assert!(!debug.contains("private-player-params"));
+        assert!(!debug.contains("private-ctt"));
+    }
+
+    #[test]
+    fn external_recipe_preserves_allowlisted_headers_without_exposing_values() {
+        let info = serde_json::json!({
+            "title": "Song",
+            "channel": "Artist",
+            "requested_downloads": [{
+                "url": "https://media.example/audio?mime=audio%2Fwebm",
+                "protocol": "https",
+                "format_id": "251",
+                "ext": "webm",
+                "http_headers": {
+                    "User-Agent": "private-agent",
+                    "Referer": "https://www.youtube.com/",
+                    "Cookie": "private-cookie",
+                    "Range": "bytes=999-"
+                }
+            }]
+        });
+        let media = external_media_from_info(&info).unwrap();
+        assert_eq!(media.content_type, "audio/webm");
+        assert_eq!(media.format_id.as_deref(), Some("251"));
+        assert_eq!(
+            media.request_headers[reqwest::header::USER_AGENT],
+            "private-agent"
+        );
+        assert!(!media.request_headers.contains_key(reqwest::header::RANGE));
+        let debug = format!("{media:?}");
+        assert!(debug.contains("user-agent"));
+        assert!(!debug.contains("private-agent"));
+        assert!(!debug.contains("private-cookie"));
+    }
+
+    #[test]
+    fn external_recipe_rejects_unforwardable_or_malformed_context() {
+        let recipe = |headers| {
+            serde_json::json!({
+                "url": "https://media.example/audio?mime=audio%2Fwebm",
+                "protocol": "https",
+                "ext": "webm",
+                "http_headers": headers
+            })
+        };
+        assert!(external_media_from_info(&recipe(serde_json::json!({
+            "X-Future-Required-Header": "required-value"
+        })))
+        .is_none());
+        assert!(external_media_from_info(&recipe(serde_json::json!({
+            "User-Agent": "line one\nline two"
+        })))
+        .is_none());
+    }
+
+    #[test]
+    fn external_recipe_uses_top_level_values_when_selected_fields_are_null() {
+        let info = serde_json::json!({
+            "url": "https://media.example/audio?mime=audio%2Fmp4",
+            "protocol": "https",
+            "http_headers": {"User-Agent": "top-level-agent"},
+            "ext": "m4a",
+            "requested_downloads": [{
+                "url": null,
+                "protocol": null,
+                "http_headers": null,
+                "ext": "m4a"
+            }]
+        });
+        let media = external_media_from_info(&info).unwrap();
+        assert_eq!(media.url, "https://media.example/audio?mime=audio%2Fmp4");
+        assert_eq!(media.protocol.as_deref(), Some("https"));
+        assert_eq!(
+            media.request_headers[reqwest::header::USER_AGENT],
+            "top-level-agent"
+        );
+    }
+
+    #[test]
+    fn parameterized_progressive_video_is_cacheable() {
+        assert!(cacheable_progressive_type(
+            "video/mp4; codecs=\"mp4a.40.2\""
+        ));
+        assert!(cacheable_progressive_type("video/webm; codecs=\"opus\""));
+        assert!(!cacheable_progressive_type("application/vnd.apple.mpegurl"));
+    }
+
+    #[test]
+    fn mobile_web_fallback_preserves_metadata_through_bounded_local_proxy() {
         let media = ExternalMedia {
             url: "https://media.example/fallback.mp4".into(),
             content_type: "video/mp4".into(),
+            request_headers: Default::default(),
+            protocol: Some("https".into()),
+            format_id: None,
             title: Some("Fallback title".into()),
             subtitle: Some("Fallback artist".into()),
             thumbnail: Some("https://img.example/fallback.jpg".into()),
             duration: Some(161.0),
         }
-        .into_media("p7EIUR3cZDo", 12.5, true);
+        .into_media("p7EIUR3cZDo", 12.5, true)
+        .unwrap();
 
         assert_eq!(media.content_id.as_deref(), Some("p7EIUR3cZDo"));
         assert_eq!(media.title.as_deref(), Some("Fallback title"));
@@ -1767,7 +2369,36 @@ mod tests {
         assert_eq!(media.duration, Some(161.0));
         assert_eq!(media.start_time, 12.5);
         assert_eq!(media.images[0].url, "https://img.example/fallback.jpg");
-        assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
+        assert!(matches!(
+            media.streams[0].source,
+            StreamSource::CachedUrl { .. }
+        ));
+    }
+
+    #[test]
+    fn external_context_is_not_silently_dropped_without_a_capable_proxy() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::REFERER,
+            reqwest::header::HeaderValue::from_static("https://www.youtube.com/"),
+        );
+        let media = |content_type: &str| ExternalMedia {
+            url: "https://media.example/object".into(),
+            content_type: content_type.into(),
+            request_headers: headers.clone(),
+            protocol: Some("https".into()),
+            format_id: None,
+            title: None,
+            subtitle: None,
+            thumbnail: None,
+            duration: None,
+        };
+
+        assert!(media("audio/mp4").playback_stream(false).is_none());
+        assert!(media("application/vnd.apple.mpegurl")
+            .playback_stream(true)
+            .is_none());
+        assert!(media("audio/mp4").playback_stream(true).is_some());
     }
 
     #[test]
@@ -1775,12 +2406,16 @@ mod tests {
         let mut media = ExternalMedia {
             url: "https://media.example/playlist.m3u8".into(),
             content_type: "application/vnd.apple.mpegurl".into(),
+            request_headers: Default::default(),
+            protocol: None,
+            format_id: None,
             title: None,
             subtitle: None,
             thumbnail: None,
             duration: None,
         }
-        .into_media("dQw4w9WgXcQ", 0.0, true);
+        .into_media("dQw4w9WgXcQ", 0.0, true)
+        .unwrap();
         assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
         make_first_stream_cacheable(&mut media, true);
         assert!(matches!(media.streams[0].source, StreamSource::Url(_)));
@@ -1791,12 +2426,16 @@ mod tests {
         let media = ExternalMedia {
             url: "https://media.example/audio.webm".into(),
             content_type: "audio/webm".into(),
+            request_headers: Default::default(),
+            protocol: Some("https".into()),
+            format_id: Some("251".into()),
             title: None,
             subtitle: None,
             thumbnail: None,
             duration: None,
         }
-        .into_media("dQw4w9WgXcQ", 0.0, true);
+        .into_media("dQw4w9WgXcQ", 0.0, true)
+        .unwrap();
 
         assert!(matches!(
             media.streams[0].source,
@@ -2380,7 +3019,7 @@ mod tests {
                 Some(&credential),
             )
             .await;
-        assert!(matches!(result, Err(ResolveError::Unplayable(_))));
+        assert!(matches!(result, Err(ResolveError::Unplayable { .. })));
     }
 
     #[tokio::test]

@@ -1021,6 +1021,8 @@ async fn manifest_handler(
             "content-length",
             "content-range",
             "accept-ranges",
+            "etag",
+            "last-modified",
             "cache-control",
             "location",
         ] {
@@ -2294,6 +2296,8 @@ mod tests {
                 ("content-type", "audio/mp4"),
                 ("content-range", "bytes 3-5/10"),
                 ("accept-ranges", "bytes"),
+                ("etag", "\"cache-object\""),
+                ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
             ] {
                 response_headers.insert(
                     http::HeaderName::from_static(name),
@@ -2328,6 +2332,8 @@ mod tests {
             assert_eq!(headers["content-length"], "3");
             assert_eq!(headers["content-type"], "audio/mp4");
             assert_eq!(headers["content-range"], "bytes 3-5/10");
+            assert_eq!(headers["etag"], "\"cache-object\"");
+            assert_eq!(headers["last-modified"], "Wed, 21 Oct 2015 07:28:00 GMT");
             assert_eq!(
                 body,
                 if method == Method::HEAD {

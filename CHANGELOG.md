@@ -1,5 +1,55 @@
 # Changelog
 
+## Cast Audio Receiver Lab 0.7.0-dev1 — 2026-10-27
+
+- Preserve YouTube playback and Lounge state across a lost Cast control socket
+  for up to 60 seconds. Reconnect identity now uses the sender source together
+  with its network host and SDK metadata, and supports the parallel sockets
+  used by mobile Cast SDKs. Explicit app CLOSE, receiver STOP and replacement
+  remain immediate.
+- Recognize the iOS media-queue bootstrap as a guarded ownership request when
+  it does not send `getMdxSessionStatus`. A real device takeover still removes
+  and closes every proven connection of the previous controller, while passive
+  CONNECT/GET_STATUS observers and delayed queue probes cannot seize or retain
+  media control.
+- Resolve the exact previous/next YouTube Music queue endpoints through
+  InnerTube `/next` and keep CTT plus opaque player parameters bound to the
+  video that supplied them. One-title prefetch now uses that derived context
+  when available. A failed anonymous prefetch cannot poison a later regular
+  selection carrying fresh CTT context.
+- Preserve newer sender parameters when an exact prefetched next title is
+  selected, reuse the prepared media at the requested start position, and
+  carry the effective context into Lounge `nowPlaying` feedback and bounded
+  playback recovery. Queue additions, reorders and sender takeovers no longer
+  let stale item context select or overwrite another title.
+- Treat yt-dlp output as an in-memory download recipe: URL, media type and a
+  strict allowlist of required request headers travel together through the
+  local audio proxy and refresh path. Cookie/CTT values remain redacted and are
+  not persisted. Header-dependent media is rejected if no capable local proxy
+  is available instead of being played with silently incomplete context.
+- Keep progressive audio loading demand-driven with bounded range requests.
+  Range-ignoring or oversized origins are proxied locally, including request
+  context and an idle-body timeout, rather than redirected or eagerly retained.
+- Keep automatic recovery limited to two fresh-media rounds per selection,
+  preserve position and pause state, and isolate terminal failures to the
+  affected title. Stop, disconnect and a newer selection still cancel obsolete
+  resolution work.
+- Expose queue navigation to Cast controllers and Home Assistant. Cast
+  `QUEUE_UPDATE` next/previous requests now pass through the YouTube Lounge
+  state machine, so they operate on the real YouTube Music queue rather than a
+  local decoder shortcut. Play, pause, stop and seek use the same app-owned
+  control path; receiver volume and mute remain synchronized with the output.
+  Passive Home Assistant control does not claim sender ownership, while a
+  displaced sender remains unable to control the session or global volume.
+  Local controls continue to reach the queue/player during Lounge feedback
+  stalls, reconnect backoff and rebind instead of waiting behind the network.
+- Desktop/laptop, iPad and mobile sender acceptance passed on the test receiver,
+  including queue navigation, seek, repeat-one, age-restricted playback,
+  controller takeover and network reconnection. This revision is published as
+  the frontend source for Cast Audio Receiver Lab `0.7.0-dev1`; product images
+  and installation guidance remain in that project. See
+  `docs/youtube-audio-resolution.md`.
+
 ## Audio receiver fork — 2026-09-26
 
 - Reuse the current resolved stream for repeat-one EOF, avoiding another

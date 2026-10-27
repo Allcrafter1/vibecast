@@ -13,7 +13,7 @@ use vibecast_sdk::MediaCacheHint;
 pub(crate) const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 const BLOCK: usize = 128 * 1024;
-const UPSTREAM_RANGE: usize = 10 * 1024 * 1024;
+const UPSTREAM_RANGE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -139,8 +139,11 @@ impl AudioCache {
                             attempt = shared.hint.recovery_attempts(),
                             "refreshing failed audio source before decoder buffer drains"
                         );
-                        if let Ok(Some(next)) =
-                            tokio::time::timeout(Duration::from_secs(30), refresh.refresh()).await
+                        if let Ok(Some(next)) = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            refresh.refresh_with_context(),
+                        )
+                        .await
                         {
                             refreshed = Some(next);
                         }
@@ -155,7 +158,21 @@ impl AudioCache {
                         "resuming cached audio with refreshed source"
                     );
                     drop(data);
-                    url = next;
+                    if shared
+                        .hint
+                        .set_request_headers(next.request_headers())
+                        .is_err()
+                    {
+                        tracing::warn!("refreshed audio request context was rejected");
+                        let mut data = shared.data.lock().unwrap();
+                        data.phase = Phase::Failed;
+                        data.blocks = Vec::new();
+                        data.wanted.clear();
+                        shared.hint.invalidate();
+                        shared.changed.send_replace(());
+                        return;
+                    }
+                    url = next.url;
                     continue;
                 }
                 let mut data = shared.data.lock().unwrap();
@@ -192,18 +209,7 @@ impl AudioCache {
             }
         };
         if phase == Phase::Bypass {
-            let mut response = empty(307);
-            let data = self.shared.data.lock().unwrap();
-            if let Some(location) = data
-                .bypass_url
-                .as_ref()
-                .and_then(|url| HeaderValue::from_str(url).ok())
-            {
-                response.headers.insert(header::LOCATION, location);
-            } else {
-                response.status = 502;
-            }
-            return response;
+            return self.proxy_bypass(method, headers, permit).await;
         }
         if matches!(phase, Phase::Failed | Phase::Cancelled) {
             return empty(502);
@@ -250,6 +256,79 @@ impl AudioCache {
             }));
         }
         response
+    }
+
+    async fn proxy_bypass(
+        &self,
+        method: Method,
+        client_headers: HeaderMap,
+        permit: OwnedSemaphorePermit,
+    ) -> CachedMediaResponse {
+        if !matches!(method, Method::GET | Method::HEAD) {
+            return empty(405);
+        }
+        let Some(url) = self.shared.data.lock().unwrap().bypass_url.clone() else {
+            return empty(502);
+        };
+        let mut headers = self.hint.request_headers();
+        for name in [
+            header::HOST,
+            header::RANGE,
+            header::ACCEPT_ENCODING,
+            header::CONTENT_LENGTH,
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::UPGRADE,
+            header::TRAILER,
+            header::TE,
+        ] {
+            headers.remove(name);
+        }
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        if let Some(range) = client_headers.get(header::RANGE) {
+            headers.insert(header::RANGE, range.clone());
+        }
+        if let Some(if_range) = client_headers.get(header::IF_RANGE) {
+            headers.insert(header::IF_RANGE, if_range.clone());
+        }
+        let request = self.http.request(method.clone(), url).headers(headers);
+        let response = match tokio::time::timeout(Duration::from_secs(15), request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let _ = transport_failure("bypass_response_headers", &error);
+                return empty(502);
+            }
+            Err(_) => return empty(504),
+        };
+        let status = response.status().as_u16();
+        let mut response_headers = HeaderMap::new();
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::ETAG,
+            header::LAST_MODIFIED,
+            header::CACHE_CONTROL,
+        ] {
+            if let Some(value) = response.headers().get(&name) {
+                response_headers.insert(name, value.clone());
+            }
+        }
+        CachedMediaResponse {
+            status,
+            headers: response_headers,
+            body: (method != Method::HEAD).then(|| {
+                Box::new(ProxiedBody {
+                    response,
+                    idle_timeout: self.idle_timeout,
+                    _permit: permit,
+                }) as Box<dyn CachedMediaBody>
+            }),
+        }
     }
 }
 
@@ -319,10 +398,32 @@ async fn download(
         };
         shared.data.lock().unwrap().resume_index = index;
         let response_started = std::time::Instant::now();
-        let request = http
-            .get(url)
-            .header(header::ACCEPT_ENCODING, "identity")
-            .header(header::RANGE, format!("bytes={start}-{}", end - 1));
+        let mut headers = shared.hint.request_headers();
+        // Cache framing always wins over extractor-provided values. The SDK
+        // rejects these names already; removing them here keeps the transport
+        // boundary safe if that validation is ever relaxed.
+        for name in [
+            header::HOST,
+            header::RANGE,
+            header::ACCEPT_ENCODING,
+            header::CONTENT_LENGTH,
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::UPGRADE,
+            header::TRAILER,
+            header::TE,
+        ] {
+            headers.remove(name);
+        }
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        headers.insert(
+            header::RANGE,
+            HeaderValue::from_str(&format!("bytes={start}-{}", end - 1)).unwrap(),
+        );
+        let request = http.get(url).headers(headers);
         let mut response = tokio::time::timeout(Duration::from_secs(15), request.send())
             .await
             .map_err(|_| fetch_failure("response_headers_timeout"))?
@@ -613,6 +714,31 @@ struct Reader {
     _permit: OwnedSemaphorePermit,
 }
 
+struct ProxiedBody {
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    _permit: OwnedSemaphorePermit,
+}
+
+#[async_trait]
+impl CachedMediaBody for ProxiedBody {
+    async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        match tokio::time::timeout(self.idle_timeout, self.response.chunk()).await {
+            Ok(Ok(chunk)) => Ok(chunk.map(|bytes| bytes.to_vec())),
+            Ok(Err(error)) => {
+                // reqwest errors may embed the signed origin URL. Keep it out
+                // of the body error propagated through Hyper and diagnostics.
+                transport_failure("bypass_body", &error);
+                Err(std::io::Error::other("proxied audio response failed"))
+            }
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxied audio response stalled",
+            )),
+        }
+    }
+}
+
 #[async_trait]
 impl CachedMediaBody for Reader {
     async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
@@ -814,6 +940,7 @@ mod tests {
         url: String,
         count: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<(usize, usize)>>>,
+        requests: Arc<Mutex<Vec<String>>>,
         release: watch::Sender<bool>,
         task: JoinHandle<()>,
     }
@@ -839,6 +966,8 @@ mod tests {
         let observed = count.clone();
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let observed_ranges = ranges.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed_requests = requests.clone();
         let (release, rx) = watch::channel(false);
         let payload = payload.to_vec();
         let task = tokio::spawn(async move {
@@ -851,11 +980,13 @@ mod tests {
                         let mut rx = rx.clone();
                         let observed = observed.clone();
                         let observed_ranges = observed_ranges.clone();
+                        let observed_requests = observed_requests.clone();
                         children.spawn(async move {
                             let mut request = vec![0; 8192];
                             let n = socket.read(&mut request).await.unwrap();
                             observed.fetch_add(1, Ordering::SeqCst);
                             let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                            observed_requests.lock().unwrap().push(request.clone());
                             let range = request.lines().find_map(|l| l.strip_prefix("range: "));
                             let (status, length, content_range, payload) = if status == 200 && declared.is_some() && supports_range {
                                 let total = declared.unwrap();
@@ -883,6 +1014,7 @@ mod tests {
             url,
             count,
             ranges,
+            requests,
             release,
             task,
         }
@@ -910,6 +1042,40 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn origin_requests_preserve_validated_context_and_cache_framing() {
+        let origin = origin(b"abcdefghij", Some(10), 200).await;
+        origin.release.send(true).unwrap();
+        let hint = MediaCacheHint::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Recipe-Agent/1.0"),
+        );
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://www.youtube.com/"),
+        );
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=in-memory-only"),
+        );
+        hint.set_request_headers(headers).unwrap();
+        let cache = AudioCache::new(reqwest::Client::new(), origin.url.clone(), hint);
+
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            b"abcdefghij"
+        );
+        let requests = origin.requests.lock().unwrap();
+        let request = requests.first().expect("origin request");
+        assert!(request.contains("user-agent: recipe-agent/1.0\r\n"));
+        assert!(request.contains("referer: https://www.youtube.com/\r\n"));
+        assert!(request.contains("cookie: session=in-memory-only\r\n"));
+        assert!(request.contains("accept-encoding: identity\r\n"));
+        assert!(request.contains(&format!("range: bytes=0-{}\r\n", UPSTREAM_RANGE - 1)));
     }
 
     #[tokio::test]
@@ -999,11 +1165,32 @@ mod tests {
                 MediaCacheHint::default(),
             );
             let response = open(&cache, None, Method::GET).await;
-            assert_eq!(response.status, 307);
-            assert_eq!(response.headers[header::LOCATION], origin.url);
+            // The deliberately permissive test origin answers 206 even to a
+            // full request when it knows a length; the bypass must preserve
+            // the upstream status rather than fabricate a redirect.
+            assert!(matches!(response.status, 200 | 206));
+            origin.release.send(true).unwrap();
+            if length.is_none() {
+                assert_eq!(read_all(response).await, b"abcdefghij");
+            }
             assert!(cache.shared.data.lock().unwrap().blocks.is_empty());
             assert!(!cache.hint.is_complete());
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_bypass_body_releases_with_a_timeout() {
+        let origin = origin(b"abcdefghij", None, 200).await;
+        let mut cache = AudioCache::new(
+            reqwest::Client::new(),
+            origin.url.clone(),
+            MediaCacheHint::default(),
+        );
+        cache.idle_timeout = Duration::from_millis(30);
+        let mut body = open(&cache, None, Method::GET).await.body.unwrap();
+        assert_eq!(body.next_chunk().await.unwrap(), Some(b"abcde".to_vec()));
+        let error = body.next_chunk().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -1304,6 +1491,62 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ContextRefresh {
+        url: String,
+        headers: HeaderMap,
+    }
+
+    #[async_trait]
+    impl vibecast_sdk::MediaSourceRefresh for ContextRefresh {
+        async fn refresh(&self) -> Option<String> {
+            Some(self.url.clone())
+        }
+
+        async fn refresh_with_context(&self) -> Option<vibecast_sdk::RefreshedMediaSource> {
+            vibecast_sdk::RefreshedMediaSource::new(self.url.clone())
+                .with_request_headers(self.headers.clone())
+                .ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_switches_url_and_request_headers_together() {
+        let rejected = origin(b"", Some(0), 403).await;
+        let payload = b"fresh-audio";
+        let fresh = origin(payload, Some(payload.len()), 200).await;
+        fresh.release.send(true).unwrap();
+        let hint = MediaCacheHint::default();
+        let mut initial_headers = HeaderMap::new();
+        initial_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("initial-agent"),
+        );
+        hint.set_request_headers(initial_headers).unwrap();
+        let mut refreshed_headers = HeaderMap::new();
+        refreshed_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("refreshed-agent"),
+        );
+        refreshed_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=refreshed"),
+        );
+        hint.set_refresh(Arc::new(ContextRefresh {
+            url: fresh.url.clone(),
+            headers: refreshed_headers,
+        }));
+        let cache = AudioCache::new(reqwest::Client::new(), rejected.url.clone(), hint);
+        assert_eq!(
+            read_all(open(&cache, None, Method::GET).await).await,
+            payload
+        );
+        assert!(rejected.requests.lock().unwrap()[0].contains("user-agent: initial-agent"));
+        let requests = fresh.requests.lock().unwrap();
+        assert!(requests[0].contains("user-agent: refreshed-agent"));
+        assert!(requests[0].contains("cookie: session=refreshed"));
+    }
+
     #[tokio::test]
     async fn refresh_preserves_reader_and_partial_bytes_before_decoder_eof() {
         let payload: Vec<u8> = (0..BLOCK * 3 + 19).map(|i| (i % 251) as u8).collect();
@@ -1499,8 +1742,9 @@ mod tests {
         }));
         let cache = AudioCache::new(reqwest::Client::new(), rejected.url.clone(), hint);
         let response = open(&cache, None, Method::GET).await;
-        assert_eq!(response.status, 307);
-        assert_eq!(response.headers[header::LOCATION], fresh.url);
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_some());
+        assert_eq!(fresh.count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1553,15 +1797,29 @@ mod tests {
     #[tokio::test]
     async fn origin_ignoring_ranges_bypasses_instead_of_eager_download() {
         let origin = origin_with_ranges(b"abcdefghij", Some(10), 200, false).await;
-        let cache = AudioCache::new(
-            reqwest::Client::new(),
-            origin.url.clone(),
-            MediaCacheHint::default(),
+        let hint = MediaCacheHint::default();
+        let mut source_headers = HeaderMap::new();
+        source_headers.insert(header::USER_AGENT, HeaderValue::from_static("recipe-agent"));
+        source_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=memory-only"),
         );
+        hint.set_request_headers(source_headers).unwrap();
+        let cache = AudioCache::new(reqwest::Client::new(), origin.url.clone(), hint);
         let response = open(&cache, None, Method::GET).await;
-        assert_eq!(response.status, 307);
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_some());
         assert!(cache.shared.data.lock().unwrap().blocks.is_empty());
         assert!(!cache.hint.is_complete());
+        assert_eq!(origin.count.load(Ordering::SeqCst), 2);
+        let requests = origin.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("user-agent: recipe-agent")));
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("cookie: session=memory-only")));
     }
 
     #[tokio::test]

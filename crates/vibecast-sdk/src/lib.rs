@@ -93,7 +93,7 @@ pub use error::{LaunchError, MediaResolveCode, MediaResolveError};
 pub use license::{LicenseForwarder, LicenseRequest, LicenseResponse, LicenseRoute};
 pub use types::{
     DrmInfo, DrmSystem, LaunchCredentials, MediaCacheHint, MediaSourceRefresh, OutputControl,
-    PlaybackMedia, PlaybackState, PlaybackStream, StreamSource,
+    PlaybackMedia, PlaybackState, PlaybackStream, RefreshedMediaSource, StreamSource,
 };
 
 // Re-export the Cast protocol types apps need so they depend on this crate only.
@@ -125,6 +125,23 @@ pub enum MessageDisposition {
     Handled,
     /// The app did not handle the message.
     Unhandled,
+}
+
+/// Why a sender became the active controller for an app session.
+///
+/// The runtime, rather than the app, owns transport identity and reconnect
+/// deadlines. Apps can therefore keep protocol state on a network reconnect
+/// while still resetting it for a genuine controller takeover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderAttachment {
+    /// An app channel attached without an ownership transition. This includes
+    /// the launch connection and additional sockets of the same controller.
+    Initial,
+    /// The owner's transport returned or was replaced without changing the
+    /// logical controller or app session.
+    Reconnected,
+    /// A different controller explicitly claimed the running app session.
+    Takeover,
 }
 
 /// Static app identity and its typed settings schema.
@@ -232,8 +249,14 @@ pub trait AppSession: Send + Sync {
         MessageDisposition::Unhandled
     }
 
-    /// Called when a sender connects to this app transport.
-    async fn on_sender_connected(&self, _ctx: &AppContext, _sender_id: &str) {}
+    /// Called when a sender becomes the active controller for this app.
+    async fn on_sender_connected(
+        &self,
+        _ctx: &AppContext,
+        _sender_id: &str,
+        _attachment: SenderAttachment,
+    ) {
+    }
 
     /// Whether a physical sender connection takes exclusive ownership from
     /// the previous connection. Multiple logical sender ids on that same
@@ -245,6 +268,14 @@ pub trait AppSession: Send + Sync {
     /// Whether this app message starts an active sender handshake. Merely
     /// subscribing to a transport (e.g. a status observer) never claims it.
     fn claims_sender_ownership(&self, _namespace: &str, _data: &Value) -> bool {
+        false
+    }
+
+    /// Whether this read-side protocol bootstrap represents a sender joining
+    /// the running app. The runtime applies additional detached/superseded
+    /// checks before granting ownership; ordinary CONNECT and GET_STATUS never
+    /// claim a session.
+    fn joins_sender_ownership(&self, _namespace: &str, _data: &Value) -> bool {
         false
     }
 
@@ -272,14 +303,27 @@ pub trait AppSession: Send + Sync {
         false
     }
 
-    /// Allow the runtime's bounded (10-second) reconnect grace after a lost
+    /// Whether this control must pass through the app's own state machine.
+    /// App-originated playback commands bypass this hook to avoid feedback
+    /// loops when the app drives the canonical player controller.
+    fn handles_output_control(&self, control: &OutputControl) -> bool {
+        matches!(control, OutputControl::Play) && self.handles_play_requests()
+    }
+
+    /// Whether the app owns a queue that can be navigated through
+    /// `QUEUE_UPDATE` next/previous requests.
+    fn supports_queue_navigation(&self) -> bool {
+        false
+    }
+
+    /// Allow the runtime's bounded reconnect grace after a lost
     /// physical Cast connection. The app is stopped if no sender reattaches to
     /// its transport. Explicit STOP/CLOSE and replacement remain immediate.
     fn allows_sender_reconnect_grace(&self) -> bool {
         false
     }
 
-    /// User control forwarded to the app (including opted-in Play requests).
+    /// User control forwarded to the app.
     async fn on_output_control(&self, _ctx: &AppContext, _control: OutputControl) {}
 
     /// Called before the session is torn down.

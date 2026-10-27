@@ -10,8 +10,9 @@ on which this project depends.
 The maintained project branch is **`cast-audio-receiver`**. The `main` branch
 retains the upstream snapshot; upstream releases, Homebrew packages and container
 images are **not builds of this fork**. Product releases and deployment guidance
-belong in the linked main project. If that repository is still private, its
-public release has not yet been completed.
+belong in the linked main project. The accepted resolver, reconnect and Home
+Assistant control work in this branch is shipped by Cast Audio Receiver Lab
+`0.7.0-dev1`.
 
 ## What this repository does
 
@@ -77,14 +78,30 @@ build treated those subscriptions as takeovers, causing two observers to
 repeatedly eject each other and preventing playback.
 
 The corrected implementation claims ownership on the app-specific
-`getMdxSessionStatus` handshake (or a new `LAUNCH`). Observer status requests
-remain available; observer reconnects and closes cannot take over or stop
-the owner. On takeover, the old controller is closed, its Lounge connection
-is replaced and pending playback resolution is stopped. The new controller
-receives a fresh screen identity. The desktop `previous` command is now parsed.
+`getMdxSessionStatus` handshake (or a new `LAUNCH`). iOS senders that join an
+existing route without that handshake can also claim it through their guarded
+media-queue bootstrap after a fresh SDK-like app connection. Ordinary
+CONNECT/GET_STATUS observers remain passive. On takeover, every proven socket
+of the old controller is closed, its Lounge connection is replaced and pending
+playback resolution is stopped. The new controller receives a fresh screen
+identity. The desktop `previous` command is now parsed.
 The displaced sender also receives a targeted `receiver-0` status with its
 application removed before its app channels close, so the browser can end its
 Cast route. This notification is not broadcast to the incoming controller.
+
+An unplanned loss of all sockets belonging to the active controller now starts
+a 60-second reconnect grace. A matching mobile sender can replace its TCP
+connection without rotating the Lounge screen, clearing the queue or stopping
+audio; multiple SDK sockets from the same controller are tracked together.
+Status observers neither start nor extend this grace. Explicit CLOSE/STOP and
+a genuine takeover remain terminal for the displaced controller.
+
+The advertised media capabilities also expose play, pause, stop, seek, volume,
+mute and queue navigation to Home Assistant's Google Cast integration.
+Next/Previous are translated from Cast `QUEUE_UPDATE` requests into the active
+YouTube Lounge session and therefore navigate the real YouTube Music queue.
+These observer controls do not take sender ownership or rotate the Lounge
+identity; the existing mobile/desktop takeover rules remain authoritative.
 
 When a new `LAUNCH` replaces a running application, receiver status now also
 announces the old application's removal before the correlated new launch
@@ -116,6 +133,13 @@ takeover in both directions have now passed device acceptance. Previous and
 owner-stop semantics have regression coverage; automated tests alone do not
 establish every sender interaction.
 
+The CTT-aware prefetch and download-recipe design shipped with Cast Audio
+Receiver Lab `0.7.0-dev1` is documented in
+[YouTube audio resolution and device acceptance](docs/youtube-audio-resolution.md).
+The `/next` request shape was also checked against patrickkfkan's
+[`yt-cast-receiver`](https://github.com/patrickkfkan/yt-cast-receiver) as a
+behavioural reference; no implementation source was imported.
+
 ## Origin and licence
 
 The audio work starts from upstream commit
@@ -125,5 +149,7 @@ Git history preserves that origin and the subsequent integration changes.
 This fork retains Vibecast's **MIT licence** and copyright notice: see
 [`LICENSE`](LICENSE). The Chromium Cast envelope schema retains its
 [BSD notice](crates/vibecast-proto/proto/LICENSE); other third-party files retain
-their own notices. The separate Python/product repository uses GPL-3.0-or-later;
-that does not relicense Vibecast or imply endorsement by upstream authors.
+their own notices. Original files in the separate Python/product repository use
+MPL-2.0 from `0.6.0-dev22`; its earlier releases through `0.6.0-dev21` remain
+available under GPL-3.0-or-later. Neither licence relicenses Vibecast or implies
+endorsement by upstream authors.

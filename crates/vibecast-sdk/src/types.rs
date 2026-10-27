@@ -72,22 +72,99 @@ impl StreamSource {
 
 /// Shared cache identity/status and optional source refresh contract; no media bytes.
 /// Only a fully downloaded entry is safe to replay after its source URL expires.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MediaCacheHint(std::sync::Arc<MediaCacheState>);
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct MediaCacheState {
     status: std::sync::atomic::AtomicU8,
     recovery_attempts: std::sync::atomic::AtomicU8,
     refresh: std::sync::Mutex<Option<std::sync::Arc<dyn MediaSourceRefresh>>>,
+    request_headers: std::sync::Mutex<http::HeaderMap>,
+}
+
+impl std::fmt::Debug for MediaCacheHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers = self.0.request_headers.lock().unwrap();
+        let mut names = headers
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        f.debug_struct("MediaCacheHint")
+            .field(
+                "status",
+                &self.0.status.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .field(
+                "recovery_attempts",
+                &self
+                    .0
+                    .recovery_attempts
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .field("request_header_names", &names)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Refresh an expired progressive URL without replacing the playing object.
 /// Implementations must only return the same immutable byte representation;
 /// changing formats would corrupt readers already consuming the cached bytes.
+#[derive(Clone)]
+pub struct RefreshedMediaSource {
+    pub url: String,
+    request_headers: http::HeaderMap,
+}
+
+impl RefreshedMediaSource {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            request_headers: http::HeaderMap::new(),
+        }
+    }
+
+    pub fn with_request_headers(mut self, headers: http::HeaderMap) -> Result<Self, &'static str> {
+        if headers.keys().any(|name| !allowed_media_header(name)) {
+            return Err("unsupported media request header");
+        }
+        self.request_headers = headers;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn request_headers(&self) -> http::HeaderMap {
+        self.request_headers.clone()
+    }
+}
+
+impl std::fmt::Debug for RefreshedMediaSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self
+            .request_headers
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        f.debug_struct("RefreshedMediaSource")
+            .field("url", &"[REDACTED]")
+            .field("request_header_names", &names)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait MediaSourceRefresh: Send + Sync + std::fmt::Debug {
+    /// Legacy URL-only refresh hook retained for app SDK compatibility.
     async fn refresh(&self) -> Option<String>;
+
+    /// Refresh URL and request context atomically. Existing implementations
+    /// automatically retain their URL-only behavior.
+    async fn refresh_with_context(&self) -> Option<RefreshedMediaSource> {
+        self.refresh().await.map(RefreshedMediaSource::new)
+    }
 }
 
 impl PartialEq for MediaCacheHint {
@@ -121,6 +198,25 @@ impl MediaCacheHint {
         self.0.refresh.lock().unwrap().clone()
     }
 
+    /// Attach the origin request headers required by this exact media object.
+    ///
+    /// Values stay in memory and are deliberately omitted from [`Debug`]. The
+    /// small allowlist prevents an extractor from overriding cache-owned range
+    /// framing or injecting hop-by-hop headers into origin requests.
+    pub fn set_request_headers(&self, headers: http::HeaderMap) -> Result<(), &'static str> {
+        if headers.keys().any(|name| !allowed_media_header(name)) {
+            return Err("unsupported media request header");
+        }
+        *self.0.request_headers.lock().unwrap() = headers;
+        Ok(())
+    }
+
+    /// Return a snapshot of the validated origin request headers.
+    #[must_use]
+    pub fn request_headers(&self) -> http::HeaderMap {
+        self.0.request_headers.lock().unwrap().clone()
+    }
+
     pub fn recovery_attempts(&self) -> u8 {
         self.0
             .recovery_attempts
@@ -135,6 +231,7 @@ impl MediaCacheHint {
     }
 
     /// Reserve one of at most two automatic recovery rounds for this selection.
+    #[allow(deprecated)] // `try_update` would raise the workspace MSRV above 1.87.
     pub fn try_recovery(&self) -> bool {
         self.0
             .recovery_attempts
@@ -145,6 +242,21 @@ impl MediaCacheHint {
             )
             .is_ok()
     }
+}
+
+fn allowed_media_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "accept-language"
+            | "cookie"
+            | "origin"
+            | "referer"
+            | "sec-fetch-dest"
+            | "sec-fetch-mode"
+            | "sec-fetch-site"
+            | "user-agent"
+    )
 }
 
 /// A single playable stream candidate with optional DRM.
@@ -271,9 +383,12 @@ pub struct PlaybackState {
 }
 
 /// User control forwarded to an app from Cast or a physical output device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputControl {
     Play,
+    Pause,
+    Stop,
+    Seek(f64),
     Next,
     Previous,
 }
@@ -285,4 +400,49 @@ pub struct LaunchCredentials {
     pub credentials: Option<String>,
     /// Credentials type discriminator.
     pub credentials_type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_cache_headers_are_allowlisted_and_debug_is_redacted() {
+        let hint = MediaCacheHint::default();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("secret-agent-value"),
+        );
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("session=secret-cookie-value"),
+        );
+        hint.set_request_headers(headers.clone()).unwrap();
+
+        assert_eq!(hint.request_headers(), headers);
+        let debug = format!("{hint:?}");
+        assert!(debug.contains("user-agent"));
+        assert!(debug.contains("cookie"));
+        assert!(!debug.contains("secret-agent-value"));
+        assert!(!debug.contains("secret-cookie-value"));
+
+        for blocked in [
+            http::header::HOST,
+            http::header::RANGE,
+            http::header::ACCEPT_ENCODING,
+            http::header::CONTENT_LENGTH,
+            http::header::CONNECTION,
+            http::header::TRANSFER_ENCODING,
+            http::header::AUTHORIZATION,
+        ] {
+            let mut rejected = http::HeaderMap::new();
+            rejected.insert(blocked, http::HeaderValue::from_static("forbidden"));
+            assert_eq!(
+                hint.set_request_headers(rejected),
+                Err("unsupported media request header")
+            );
+            assert_eq!(hint.request_headers(), headers);
+        }
+    }
 }

@@ -373,7 +373,12 @@ impl AppSession for ViaplaySession {
         MessageDisposition::Handled
     }
 
-    async fn on_sender_connected(&self, ctx: &AppContext, _sender_id: &str) {
+    async fn on_sender_connected(
+        &self,
+        ctx: &AppContext,
+        _sender_id: &str,
+        _attachment: vibecast_sdk::SenderAttachment,
+    ) {
         let status = {
             let state = self.state.lock().await;
             let player_state = state

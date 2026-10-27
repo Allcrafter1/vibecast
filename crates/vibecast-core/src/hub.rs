@@ -20,18 +20,19 @@ use uuid::Uuid;
 
 use vibecast_cast::{namespace as ns, ConnectionHandle, ServerEvent};
 use vibecast_messages::{
-    extract_request_id, ApplicationStatus, CastNamespace, ConnectionMessage, DeviceInfoResponse,
-    GetDeviceInfoRequest, IdleReason, InvalidRequestResponse, LaunchErrorResponse, LaunchRequest,
-    LoadFailedResponse, LoadRequest, MediaInvalidRequestResponse, MediaRequest,
-    MultizoneGetStatusRequest, MultizoneStatusResponse, PlayerState, QueueItemIdsResponse,
-    ReceiverRequest, ReceiverStatus, ReceiverStatusResponse, SetupRequest, SetupResponse, Volume,
+    extract_request_id, ApplicationStatus, CastNamespace, ConnectRequest, ConnectionMessage,
+    DeviceInfoResponse, GetDeviceInfoRequest, IdleReason, InvalidRequestResponse,
+    LaunchErrorResponse, LaunchRequest, LoadFailedResponse, LoadRequest,
+    MediaInvalidRequestResponse, MediaRequest, MultizoneGetStatusRequest, MultizoneStatusResponse,
+    PlayerState, QueueItemIdsResponse, ReceiverRequest, ReceiverStatus, ReceiverStatusResponse,
+    SetupRequest, SetupResponse, Volume,
 };
 use vibecast_player_api::{Player, PlayerCommand, PlayerControlRequest, PlayerReport};
 use vibecast_proto::CastMessage;
 use vibecast_sdk::{
     AppContext, AppSession, LaunchCredentials, MediaResolveError, MessageDisposition,
     NoopSenderChannel, OutputControl, PlaybackController, PlaybackMedia, PlaybackState,
-    PlayerCapabilities, ReceiverContext, SenderChannel,
+    PlayerCapabilities, ReceiverContext, SenderAttachment, SenderChannel,
 };
 use vibecast_settings::PlayerSettings;
 
@@ -42,7 +43,16 @@ use crate::registry::AppRegistry;
 use vibecast_player_api::ProxyRegistrar;
 
 const RECEIVER_0: &str = "receiver-0";
+#[cfg(not(test))]
+const SENDER_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+// Keep the established real-time expiry tests bounded; production uses the
+// longer mobile-network grace above.
+#[cfg(test)]
 const SENDER_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(not(test))]
+const WEAK_REJOIN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const WEAK_REJOIN_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A per-callback [`SenderChannel`] that writes custom-namespace app messages
 /// directly to the relevant connection(s), never through the hub mailbox (which
@@ -225,8 +235,12 @@ enum AppJob {
         level: f64,
         muted: bool,
     },
-    /// A sender connected to the app transport.
-    SenderConnected { ctx: AppContext, sender_id: String },
+    /// A sender became the active app controller.
+    SenderConnected {
+        ctx: AppContext,
+        sender_id: String,
+        attachment: SenderAttachment,
+    },
     /// A custom-namespace message arrived.
     Message {
         ctx: AppContext,
@@ -254,8 +268,12 @@ async fn run_app_session(app: Arc<dyn AppSession>, mut jobs: mpsc::Receiver<AppJ
             AppJob::VolumeUpdate { ctx, level, muted } => {
                 app.on_volume_update(&ctx, level, muted).await
             }
-            AppJob::SenderConnected { ctx, sender_id } => {
-                app.on_sender_connected(&ctx, &sender_id).await;
+            AppJob::SenderConnected {
+                ctx,
+                sender_id,
+                attachment,
+            } => {
+                app.on_sender_connected(&ctx, &sender_id, attachment).await;
             }
             AppJob::Message {
                 ctx,
@@ -282,6 +300,53 @@ struct PendingLoadControls {
     position: Option<f64>,
 }
 
+/// A logical Cast sender observed on one network host. The TCP source port and
+/// connection id change during a mobile network reconnect; neither belongs in
+/// the durable identity used during the bounded grace period.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SenderFingerprint {
+    peer_host: String,
+    source_id: String,
+}
+
+/// Non-sensitive CONNECT facts used to distinguish an active Cast SDK sender
+/// from status-only integrations. Raw user-agent strings are deliberately not
+/// retained.
+#[derive(Clone, Copy, Debug, Default)]
+struct SenderConnectProfile {
+    has_sdk_metadata: bool,
+    known_observer: bool,
+}
+
+impl SenderConnectProfile {
+    fn from_request(request: &ConnectRequest) -> Self {
+        let user_agent = request.user_agent.as_deref().unwrap_or_default();
+        let user_agent = user_agent.to_ascii_lowercase();
+        Self {
+            has_sdk_metadata: request.sender_info.is_some(),
+            known_observer: user_agent.contains("pychromecast")
+                || user_agent.contains("home-assistant")
+                || user_agent.contains("home assistant"),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.has_sdk_metadata |= other.has_sdk_metadata;
+        self.known_observer |= other.known_observer;
+    }
+}
+
+fn peer_host(peer: &str) -> String {
+    peer.parse::<std::net::SocketAddr>()
+        .map(|address| match address.ip() {
+            std::net::IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map_or_else(|| ip.to_string(), |ip| ip.to_string()),
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+        })
+        .unwrap_or_else(|_| peer.to_owned())
+}
+
 /// A running app session registered as a Cast transport (id == transport id).
 struct Session {
     failed_cache_eof: bool,
@@ -295,6 +360,22 @@ struct Session {
     /// Displaced owners remain revoked if their app channel auto-reconnects.
     /// Other subscribed connections may control the current media as observers.
     superseded_senders: HashSet<u64>,
+    /// One physical Cast controller can use multiple simultaneous sockets
+    /// (notably Android's app and Play-services channels). They jointly own the
+    /// session and reconnect grace starts only after the last one disappears.
+    owner_connections: HashSet<u64>,
+    /// Source ids belonging to the active controller. Kept while its physical
+    /// socket is detached so the controller can migrate to a new connection.
+    owner_sender_fingerprints: HashSet<SenderFingerprint>,
+    /// Fingerprints and hosts displaced by a takeover. They prevent a sender
+    /// from retaining observer media controls after reconnecting. Ownership is
+    /// restored only by a fresh guarded join, an app handshake or LAUNCH.
+    superseded_sender_fingerprints: HashSet<SenderFingerprint>,
+    superseded_peer_hosts: HashSet<String>,
+    /// Suppress delayed queue probes immediately after a controller was
+    /// displaced. A new socket can weakly join again after this short fence;
+    /// strong app handshakes and LAUNCH remain immediate.
+    weak_rejoin_after: HashMap<String, tokio::time::Instant>,
     audio_cache: Option<Arc<crate::audio_cache::AudioCache>>,
     app_id: String,
     app_key: String,
@@ -378,9 +459,10 @@ pub struct DeviceHub {
     subscriptions: HashMap<(u64, String), String>,
     // Platform and app channels coexist for the same Cast sender ID.
     platform_subscriptions: HashSet<(u64, String)>,
+    /// CONNECT classification by physical connection and logical source.
+    sender_connect_profiles: HashMap<(u64, String), SenderConnectProfile>,
     /// session id (== transport id) -> session.
     sessions: HashMap<String, Session>,
-    session_owners: HashMap<String, u64>,
     sender_disconnect_deadlines: HashMap<String, tokio::time::Instant>,
     self_tx: mpsc::Sender<HubEvent>,
     events: Option<mpsc::Receiver<HubEvent>>,
@@ -425,8 +507,8 @@ impl DeviceHub {
             connections: HashMap::new(),
             subscriptions: HashMap::new(),
             platform_subscriptions: HashSet::new(),
+            sender_connect_profiles: HashMap::new(),
             sessions: HashMap::new(),
-            session_owners: HashMap::new(),
             sender_disconnect_deadlines: HashMap::new(),
             self_tx: tx,
             events: Some(rx),
@@ -487,32 +569,27 @@ impl DeviceHub {
                 self.connections.insert(handle.id(), handle);
             }
             HubEvent::Server(ServerEvent::Disconnected { id, .. }) => {
-                for session in self.sessions.values_mut() {
-                    session.superseded_senders.remove(&id);
-                }
                 let owned: HashSet<String> = self
-                    .session_owners
+                    .sessions
                     .iter()
-                    .filter(|(_, owner)| **owner == id)
+                    .filter(|(_, session)| session.owner_connections.contains(&id))
                     .map(|(session, _)| session.clone())
                     .collect();
-                let mut affected_sessions: HashSet<String> = self
-                    .subscriptions
-                    .iter()
-                    .filter(|((conn, _), _)| *conn == id)
-                    .map(|(_, transport)| transport.clone())
-                    .collect();
-                affected_sessions.extend(owned.iter().cloned());
-                self.session_owners.retain(|_, owner| *owner != id);
+                for session in self.sessions.values_mut() {
+                    session.owner_connections.remove(&id);
+                    session.superseded_senders.remove(&id);
+                }
                 self.subscriptions.retain(|(conn, _), _| *conn != id);
                 self.platform_subscriptions.retain(|(conn, _)| *conn != id);
+                self.sender_connect_profiles
+                    .retain(|(conn, _), _| *conn != id);
                 self.connections.remove(&id);
-                for session_id in affected_sessions {
-                    let still_subscribed = self
-                        .subscriptions
-                        .values()
-                        .any(|transport| transport == &session_id);
-                    if !owned.contains(&session_id) && still_subscribed {
+                for session_id in owned {
+                    if self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|session| !session.owner_connections.is_empty())
+                    {
                         continue;
                     }
                     if self
@@ -521,13 +598,18 @@ impl DeviceHub {
                         .is_some_and(|s| s.app.allows_sender_reconnect_grace())
                     {
                         // Additional disappearing sockets must not extend an
-                        // existing deadline. Platform discovery is not control.
+                        // existing deadline. Observer/discovery connections are
+                        // never owners and therefore cannot start one either.
                         self.sender_disconnect_deadlines
                             .entry(session_id.clone())
                             .or_insert_with(|| {
                                 tokio::time::Instant::now() + SENDER_RECONNECT_GRACE
                             });
-                        tracing::info!(%session_id, grace_seconds = 10, "waiting for sender reconnect");
+                        tracing::info!(
+                            %session_id,
+                            grace_seconds = SENDER_RECONNECT_GRACE.as_secs(),
+                            "waiting for sender reconnect"
+                        );
                         continue;
                     }
                     tracing::info!(%session_id, "stopping app after sender transport disconnect");
@@ -572,7 +654,8 @@ impl DeviceHub {
         let source = message.source_id.clone();
         match message.namespace.as_str() {
             ns::CONNECTION => match serde_json::from_value::<ConnectionMessage>(payload) {
-                Ok(ConnectionMessage::Connect(_)) => {
+                Ok(ConnectionMessage::Connect(request)) => {
+                    self.record_sender_connect_profile(conn_id, &source, &request);
                     self.platform_subscriptions.insert((conn_id, source));
                 }
                 _ => {
@@ -653,6 +736,13 @@ impl DeviceHub {
                     .await;
             }
             ReceiverRequest::SetVolume(r) => {
+                if self.sender_is_superseded(conn_id, source) {
+                    tracing::debug!(
+                        conn_id,
+                        "ignoring receiver SET_VOLUME from superseded sender"
+                    );
+                    return;
+                }
                 self.volume.apply_update(&r.volume);
                 for (id, session) in &mut self.sessions {
                     session.coordinator.volume = self.volume.clone();
@@ -718,7 +808,6 @@ impl DeviceHub {
         }
 
         let session_id = Uuid::new_v4().to_string();
-        self.session_owners.insert(session_id.clone(), conn_id);
         let (credentials, credentials_type) = request.resolved_credentials();
         let app_key = manifest.app_key;
         let data_dir = self.data_dir.join("apps").join(app_key);
@@ -802,6 +891,11 @@ impl DeviceHub {
         // app never blocks the hub mailbox.
         let (jobs_tx, jobs_rx) = mpsc::channel(32);
         let callback_task = tokio::spawn(run_app_session(app.clone(), jobs_rx));
+        let owner_sender_fingerprints = self
+            .sender_fingerprint(conn_id, source)
+            .into_iter()
+            .collect();
+        let supports_queue_navigation = app.supports_queue_navigation();
 
         let session = Session {
             failed_cache_eof: false,
@@ -812,6 +906,11 @@ impl DeviceHub {
             callback_task,
             proxy: self.proxy.clone(),
             superseded_senders: HashSet::new(),
+            owner_connections: HashSet::from([conn_id]),
+            owner_sender_fingerprints,
+            superseded_sender_fingerprints: HashSet::new(),
+            superseded_peer_hosts: HashSet::new(),
+            weak_rejoin_after: HashMap::new(),
             audio_cache: None,
             app_id: request.app_id.clone(),
             app_key: app_key.to_string(),
@@ -821,7 +920,7 @@ impl DeviceHub {
             namespaces,
             app,
             ctx,
-            coordinator: Coordinator::new(self.volume.clone()),
+            coordinator: Coordinator::new(self.volume.clone(), supports_queue_navigation),
             jobs: jobs_tx,
         };
         self.sessions.insert(session_id, session);
@@ -833,7 +932,6 @@ impl DeviceHub {
 
     async fn stop_session(&mut self, session_id: &str) {
         self.sender_disconnect_deadlines.remove(session_id);
-        self.session_owners.remove(session_id);
         let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
@@ -939,22 +1037,47 @@ impl DeviceHub {
 
         match message.namespace.as_str() {
             ns::CONNECTION => match serde_json::from_value::<ConnectionMessage>(payload) {
-                Ok(ConnectionMessage::Connect(_)) => {
+                Ok(ConnectionMessage::Connect(request)) => {
                     let exclusive = self
                         .sessions
                         .get(&transport)
                         .is_some_and(|session| session.app.exclusive_sender_takeover());
+                    self.record_sender_connect_profile(conn_id, &source, &request);
                     self.subscriptions
                         .insert((conn_id, source.clone()), transport.clone());
-                    if !exclusive
-                        && self
-                            .sender_disconnect_deadlines
-                            .remove(&transport)
-                            .is_some()
+                    tracing::debug!(
+                        session_id = %transport,
+                        conn_id,
+                        source_id = %source,
+                        user_agent = ?request.user_agent,
+                        sdk_type = ?request.sender_info.as_ref().and_then(|info| info.sdk_type),
+                        platform = ?request.sender_info.as_ref().and_then(|info| info.platform),
+                        "sender connected to app transport"
+                    );
+                    let attachment = if exclusive {
+                        if self
+                            .sessions
+                            .get(&transport)
+                            .is_some_and(|session| session.owner_connections.contains(&conn_id))
+                        {
+                            self.record_owner_sender(&transport, conn_id, &source);
+                            Some(SenderAttachment::Initial)
+                        } else {
+                            self.try_attach_owner_sender(&transport, conn_id, &source)
+                        }
+                    } else if self
+                        .sender_disconnect_deadlines
+                        .remove(&transport)
+                        .is_some()
                     {
-                        self.session_owners.insert(transport.clone(), conn_id);
+                        if let Some(session) = self.sessions.get_mut(&transport) {
+                            session.owner_connections.insert(conn_id);
+                        }
                         tracing::info!(session_id = %transport, "sender reattached within reconnect grace");
-                    }
+                        Some(SenderAttachment::Reconnected)
+                    } else {
+                        Some(SenderAttachment::Initial)
+                    };
                     let (ctx, response, jobs) = match self.sessions.get(&transport) {
                         Some(session) => (
                             self.callback_context(session, Some((conn_id, source.clone()))),
@@ -965,15 +1088,16 @@ impl DeviceHub {
                     };
                     self.send_to(conn_id, &transport, &source, ns::MEDIA, &response)
                         .await;
-                    if !self.sender_may_control(&transport, conn_id) {
+                    let Some(attachment) = attachment else {
                         return;
-                    }
+                    };
                     self.enqueue_app_job(
                         &transport,
                         jobs,
                         AppJob::SenderConnected {
                             ctx,
                             sender_id: source,
+                            attachment,
                         },
                     )
                     .await;
@@ -987,7 +1111,10 @@ impl DeviceHub {
                         .subscriptions
                         .values()
                         .any(|target| target == &transport);
-                    let grace_owner_left = self.session_owners.get(&transport) == Some(&conn_id)
+                    let grace_owner_left = self
+                        .sessions
+                        .get(&transport)
+                        .is_some_and(|session| session.owner_connections.contains(&conn_id))
                         && self
                             .sessions
                             .get(&transport)
@@ -1006,6 +1133,24 @@ impl DeviceHub {
                 }
             },
             ns::MEDIA => {
+                let (strong_claim, join_claim) = self
+                    .sessions
+                    .get(&transport)
+                    .map(|session| {
+                        (
+                            session.app.exclusive_sender_takeover()
+                                && session.app.claims_sender_ownership(ns::MEDIA, &payload),
+                            session.app.exclusive_sender_takeover()
+                                && session.app.joins_sender_ownership(ns::MEDIA, &payload),
+                        )
+                    })
+                    .unwrap_or_default();
+                if !self.sender_may_control(&transport, conn_id)
+                    && (strong_claim
+                        || (join_claim && self.sender_may_join(&transport, conn_id, &source)))
+                {
+                    self.claim_sender(&transport, conn_id, &source).await;
+                }
                 if payload["type"] != "GET_STATUS"
                     && !self.sender_may_control(&transport, conn_id)
                     && !self.observer_may_control_media(&transport, conn_id, &source, &payload)
@@ -1077,6 +1222,7 @@ impl DeviceHub {
             MediaRequest::Seek(r) => Some((r.media_session_id, r.request_id)),
             MediaRequest::Stop(r) => Some((r.media_session_id, r.request_id)),
             MediaRequest::SetVolume(r) => Some((r.media_session_id, r.request_id)),
+            MediaRequest::QueueUpdate(r) => Some((r.media_session_id, r.request_id)),
             _ => None,
         };
         if let Some((media_id, request_id)) = target {
@@ -1118,7 +1264,7 @@ impl DeviceHub {
             }
             MediaRequest::Pause(r) => {
                 tracing::debug!(session_id = %transport, request_id = r.request_id, "PAUSE");
-                self.pause(transport, r.request_id).await;
+                self.request_pause(transport, r.request_id).await;
             }
             MediaRequest::Seek(r) => {
                 let position = r.current_time;
@@ -1139,11 +1285,11 @@ impl DeviceHub {
                     return;
                 }
                 tracing::debug!(session_id = %transport, request_id = r.request_id, position, "SEEK");
-                self.seek(transport, r.request_id, position).await;
+                self.request_seek(transport, r.request_id, position).await;
             }
             MediaRequest::Stop(r) => {
                 tracing::debug!(session_id = %transport, request_id = r.request_id, "STOP");
-                self.stop_playback(transport, r.request_id).await;
+                self.request_stop(transport, r.request_id).await;
             }
             MediaRequest::SetVolume(r) => {
                 let (level, muted) = match self.sessions.get_mut(transport) {
@@ -1197,6 +1343,36 @@ impl DeviceHub {
                 self.send_to(conn_id, transport, source, ns::MEDIA, &response)
                     .await;
             }
+            MediaRequest::QueueUpdate(r) => {
+                let control = match r.jump {
+                    1 => OutputControl::Next,
+                    -1 => OutputControl::Previous,
+                    _ => {
+                        let response = MediaInvalidRequestResponse::new(
+                            r.request_id,
+                            "Queue jump must be 1 or -1",
+                        );
+                        self.send_to(conn_id, transport, source, ns::MEDIA, &response)
+                            .await;
+                        return;
+                    }
+                };
+                if !self
+                    .sessions
+                    .get(transport)
+                    .is_some_and(|session| session.app.supports_queue_navigation())
+                    || !self
+                        .forward_output_control(transport, r.request_id, control)
+                        .await
+                {
+                    let response = MediaInvalidRequestResponse::new(
+                        r.request_id,
+                        "Queue navigation is not supported",
+                    );
+                    self.send_to(conn_id, transport, source, ns::MEDIA, &response)
+                        .await;
+                }
+            }
             MediaRequest::QueueLoad(r) => {
                 if self
                     .sessions
@@ -1246,27 +1422,84 @@ impl DeviceHub {
             self.play(session_id, request_id).await;
             return;
         }
-        if let Some(session) = self.sessions.get(session_id) {
-            if session.app.handles_play_requests() {
-                let jobs = session.jobs.clone();
-                let ctx = session.ctx.clone();
-                // Acknowledge the actual state, not optimistic PLAYING for an
-                // empty decoder. The app will load fresh media when necessary.
-                let response = session.coordinator.status_response(request_id);
-                self.broadcast(session_id, ns::MEDIA, &response).await;
-                self.enqueue_app_job(
-                    session_id,
-                    jobs,
-                    AppJob::OutputControl {
-                        ctx,
-                        control: OutputControl::Play,
-                    },
-                )
-                .await;
-                return;
-            }
+        if self
+            .forward_output_control(session_id, request_id, OutputControl::Play)
+            .await
+        {
+            return;
         }
         self.play(session_id, request_id).await;
+    }
+
+    async fn request_pause(&mut self, session_id: &str, request_id: i64) {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|s| s.pending_load_controls.is_some())
+        {
+            self.pause(session_id, request_id).await;
+            return;
+        }
+        if self
+            .forward_output_control(session_id, request_id, OutputControl::Pause)
+            .await
+        {
+            return;
+        }
+        self.pause(session_id, request_id).await;
+    }
+
+    async fn request_seek(&mut self, session_id: &str, request_id: i64, position: f64) {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|s| s.pending_load_controls.is_some())
+        {
+            self.seek(session_id, request_id, position).await;
+            return;
+        }
+        if self
+            .forward_output_control(session_id, request_id, OutputControl::Seek(position))
+            .await
+        {
+            return;
+        }
+        self.seek(session_id, request_id, position).await;
+    }
+
+    async fn request_stop(&mut self, session_id: &str, request_id: i64) {
+        if self
+            .forward_output_control(session_id, request_id, OutputControl::Stop)
+            .await
+        {
+            return;
+        }
+        self.stop_playback(session_id, request_id).await;
+    }
+
+    /// Give an app-owned control path the command while immediately
+    /// acknowledging the sender's request with the current canonical state.
+    async fn forward_output_control(
+        &mut self,
+        session_id: &str,
+        request_id: i64,
+        control: OutputControl,
+    ) -> bool {
+        let Some((jobs, ctx, response)) = self.sessions.get(session_id).and_then(|session| {
+            session.app.handles_output_control(&control).then(|| {
+                (
+                    session.jobs.clone(),
+                    session.ctx.clone(),
+                    session.coordinator.status_response(request_id),
+                )
+            })
+        }) else {
+            return false;
+        };
+        self.broadcast(session_id, ns::MEDIA, &response).await;
+        self.enqueue_app_job(session_id, jobs, AppJob::OutputControl { ctx, control })
+            .await;
+        true
     }
 
     async fn play(&mut self, session_id: &str, request_id: i64) {
@@ -1842,10 +2075,10 @@ impl DeviceHub {
     async fn on_output_control(&mut self, session_id: &str, control: PlayerControlRequest) {
         match control {
             PlayerControlRequest::Play => self.request_play(session_id, 0).await,
-            PlayerControlRequest::Pause => self.pause(session_id, 0).await,
-            PlayerControlRequest::Stop => self.stop_playback(session_id, 0).await,
+            PlayerControlRequest::Pause => self.request_pause(session_id, 0).await,
+            PlayerControlRequest::Stop => self.request_stop(session_id, 0).await,
             PlayerControlRequest::Seek { position } if position.is_finite() => {
-                self.seek(session_id, 0, position.max(0.0)).await
+                self.request_seek(session_id, 0, position.max(0.0)).await
             }
             PlayerControlRequest::Seek { .. } => {}
             PlayerControlRequest::Volume { level, muted } if level.is_finite() => {
@@ -1862,14 +2095,7 @@ impl DeviceHub {
                 } else {
                     OutputControl::Previous
                 };
-                if let Some((jobs, ctx)) = self
-                    .sessions
-                    .get(session_id)
-                    .map(|session| (session.jobs.clone(), session.ctx.clone()))
-                {
-                    self.enqueue_app_job(session_id, jobs, AppJob::OutputControl { ctx, control })
-                        .await;
-                }
+                self.forward_output_control(session_id, 0, control).await;
             }
         }
     }
@@ -1945,26 +2171,258 @@ impl DeviceHub {
 
     // -- helpers ------------------------------------------------------------
 
-    async fn claim_sender(&mut self, transport: &str, conn_id: u64, source: &str) {
-        let previous_owner = self.session_owners.insert(transport.to_owned(), conn_id);
+    fn record_sender_connect_profile(
+        &mut self,
+        conn_id: u64,
+        source: &str,
+        request: &ConnectRequest,
+    ) {
+        self.sender_connect_profiles
+            .entry((conn_id, source.to_owned()))
+            .or_default()
+            .merge(SenderConnectProfile::from_request(request));
+    }
+
+    fn sender_is_active_controller(&self, conn_id: u64, source: &str) -> bool {
+        let Some(profile) = self
+            .sender_connect_profiles
+            .get(&(conn_id, source.to_owned()))
+        else {
+            return false;
+        };
+        if profile.known_observer {
+            return false;
+        }
+        profile.has_sdk_metadata
+            || Uuid::parse_str(source).is_ok()
+            || source.starts_with("com.google.android.apps.")
+            || (source.starts_with("sender-") && source != "sender-0")
+    }
+
+    fn sender_is_compatible_owner_connection(&self, conn_id: u64, source: &str) -> bool {
+        let profile = self
+            .sender_connect_profiles
+            .get(&(conn_id, source.to_owned()));
+        profile.is_some_and(|profile| !profile.known_observer && profile.has_sdk_metadata)
+            || Uuid::parse_str(source).is_ok()
+            || source.starts_with("com.google.android.apps.")
+    }
+
+    fn sender_fingerprint(&self, conn_id: u64, source: &str) -> Option<SenderFingerprint> {
+        let handle = self.connections.get(&conn_id)?;
+        Some(SenderFingerprint {
+            peer_host: peer_host(handle.peer()),
+            source_id: source.to_owned(),
+        })
+    }
+
+    fn connection_fingerprints(
+        &self,
+        transport: &str,
+        conn_id: u64,
+        source: &str,
+    ) -> HashSet<SenderFingerprint> {
+        let Some(handle) = self.connections.get(&conn_id) else {
+            return HashSet::new();
+        };
+        let peer_host = peer_host(handle.peer());
+        let mut sources: HashSet<String> = self
+            .subscriptions
+            .iter()
+            .filter(|((connection, _), target)| {
+                *connection == conn_id && target.as_str() == transport
+            })
+            .map(|((_, sender), _)| sender.clone())
+            .collect();
+        sources.extend(
+            self.platform_subscriptions
+                .iter()
+                .filter(|(connection, _)| *connection == conn_id)
+                .map(|(_, sender)| sender.clone()),
+        );
+        sources.insert(source.to_owned());
+        sources
+            .into_iter()
+            .map(|source_id| SenderFingerprint {
+                peer_host: peer_host.clone(),
+                source_id,
+            })
+            .collect()
+    }
+
+    fn record_owner_sender(&mut self, transport: &str, conn_id: u64, source: &str) {
+        let Some(fingerprint) = self.sender_fingerprint(conn_id, source) else {
+            return;
+        };
         if let Some(session) = self.sessions.get_mut(transport) {
-            if let Some(previous) = previous_owner.filter(|previous| *previous != conn_id) {
-                session.superseded_senders.insert(previous);
-            }
+            session.superseded_sender_fingerprints.remove(&fingerprint);
+            session.superseded_peer_hosts.remove(&fingerprint.peer_host);
+            session.weak_rejoin_after.remove(&fingerprint.peer_host);
+            session.owner_sender_fingerprints.insert(fingerprint);
             session.superseded_senders.remove(&conn_id);
         }
+    }
+
+    /// Attach another socket belonging to the same physical controller. This
+    /// covers both a replacement TCP connection and official SDKs that use
+    /// parallel app/service sockets. Neither case is an app takeover: Lounge
+    /// identity, queue and decoder state remain untouched.
+    fn try_attach_owner_sender(
+        &mut self,
+        transport: &str,
+        conn_id: u64,
+        source: &str,
+    ) -> Option<SenderAttachment> {
+        let Some(fingerprint) = self.sender_fingerprint(conn_id, source) else {
+            return None;
+        };
+        let compatible_connection = self.sender_is_compatible_owner_connection(conn_id, source);
+        let exact_identity = self.sessions.get(transport).is_some_and(|session| {
+            session.owner_sender_fingerprints.contains(&fingerprint)
+                || (Uuid::parse_str(source).is_ok()
+                    && session
+                        .owner_sender_fingerprints
+                        .iter()
+                        .any(|owner| owner.source_id == source))
+        });
+        let matches_owner = exact_identity
+            || self.sessions.get(transport).is_some_and(|session| {
+                compatible_connection
+                    && session
+                        .owner_sender_fingerprints
+                        .iter()
+                        .any(|owner| owner.peer_host == fingerprint.peer_host)
+            });
+        if !matches_owner {
+            return None;
+        }
+        let had_deadline = self.sender_disconnect_deadlines.remove(transport).is_some();
+        let owner_was_detached = self
+            .sessions
+            .get(transport)
+            .is_some_and(|session| session.owner_connections.is_empty());
+        let reconnecting = exact_identity || had_deadline || owner_was_detached;
+        if let Some(session) = self.sessions.get_mut(transport) {
+            session.owner_connections.insert(conn_id);
+            session.superseded_senders.remove(&conn_id);
+            session.superseded_sender_fingerprints.remove(&fingerprint);
+            session.superseded_peer_hosts.remove(&fingerprint.peer_host);
+            session.weak_rejoin_after.remove(&fingerprint.peer_host);
+            session
+                .owner_sender_fingerprints
+                .insert(fingerprint.clone());
+        }
+        tracing::info!(
+            session_id = transport,
+            conn_id,
+            peer_host = %fingerprint.peer_host,
+            reconnecting,
+            "sender transport attached to existing owner device"
+        );
+        Some(if reconnecting {
+            SenderAttachment::Reconnected
+        } else {
+            SenderAttachment::Initial
+        })
+    }
+
+    /// Read-side queue bootstrap is a weaker ownership signal than an app
+    /// handshake. It is accepted only after a fresh app CONNECT from an active
+    /// SDK-like controller. A still-open connection displaced by the current
+    /// owner remains revoked; reconnecting alone grants no media controls.
+    fn sender_may_join(&self, transport: &str, conn_id: u64, source: &str) -> bool {
+        if self
+            .subscriptions
+            .get(&(conn_id, source.to_owned()))
+            .map(String::as_str)
+            != Some(transport)
+        {
+            return false;
+        }
+        let Some(fingerprint) = self.sender_fingerprint(conn_id, source) else {
+            return false;
+        };
+        let allowed = self.sender_is_active_controller(conn_id, source)
+            && self.sessions.get(transport).is_some_and(|session| {
+                !session.superseded_senders.contains(&conn_id)
+                    && session
+                        .weak_rejoin_after
+                        .get(&fingerprint.peer_host)
+                        .is_none_or(|deadline| *deadline <= tokio::time::Instant::now())
+            });
+        if !allowed {
+            tracing::debug!(
+                session_id = transport,
+                conn_id,
+                peer_host = %fingerprint.peer_host,
+                "guarded sender join rejected"
+            );
+        }
+        allowed
+    }
+
+    async fn claim_sender(&mut self, transport: &str, conn_id: u64, source: &str) {
+        if let Some(attachment) = self.try_attach_owner_sender(transport, conn_id, source) {
+            if let Some(session) = self.sessions.get(transport) {
+                let ctx = self.callback_context(session, Some((conn_id, source.to_owned())));
+                let jobs = session.jobs.clone();
+                self.enqueue_app_job(
+                    transport,
+                    jobs,
+                    AppJob::SenderConnected {
+                        ctx,
+                        sender_id: source.to_owned(),
+                        attachment,
+                    },
+                )
+                .await;
+            }
+            return;
+        }
+        let incoming_fingerprints = self.connection_fingerprints(transport, conn_id, source);
+        let previous_owners = self
+            .sessions
+            .get(transport)
+            .map(|session| session.owner_connections.clone())
+            .unwrap_or_default();
+        if let Some(session) = self.sessions.get_mut(transport) {
+            session.superseded_senders.extend(
+                previous_owners
+                    .iter()
+                    .copied()
+                    .filter(|owner| *owner != conn_id),
+            );
+            session.superseded_senders.remove(&conn_id);
+            session.owner_connections.clear();
+            session.owner_connections.insert(conn_id);
+            for old in session.owner_sender_fingerprints.drain() {
+                session.weak_rejoin_after.insert(
+                    old.peer_host.clone(),
+                    tokio::time::Instant::now() + WEAK_REJOIN_COOLDOWN,
+                );
+                session.superseded_peer_hosts.insert(old.peer_host.clone());
+                session.superseded_sender_fingerprints.insert(old);
+            }
+            for incoming in incoming_fingerprints {
+                session.superseded_sender_fingerprints.remove(&incoming);
+                session.superseded_peer_hosts.remove(&incoming.peer_host);
+                session.weak_rejoin_after.remove(&incoming.peer_host);
+                session.owner_sender_fingerprints.insert(incoming);
+            }
+        }
         self.sender_disconnect_deadlines.remove(transport);
-        // Only close the previous controller; status observers remain subscribed.
+        // Close every proven socket of the previous physical controller;
+        // unrelated status observers remain subscribed.
         let stale: Vec<_> = self
             .subscriptions
             .iter()
             .filter(|((other, _), target)| {
-                target.as_str() == transport && Some(*other) == previous_owner
+                target.as_str() == transport && previous_owners.contains(other)
             })
             .map(|((other, sender), _)| (*other, sender.clone()))
             .collect();
         self.subscriptions.retain(|(other, _), target| {
-            target.as_str() != transport || Some(*other) != previous_owner
+            target.as_str() != transport || !previous_owners.contains(other)
         });
         self.subscriptions
             .insert((conn_id, source.to_owned()), transport.to_owned());
@@ -1973,20 +2431,20 @@ impl DeviceHub {
         // each platform sender on the displaced controller that its app
         // session ended before closing its app channels. Other subscribers
         // (including the incoming controller) keep the real receiver status.
-        if let Some(previous) = previous_owner {
-            let mut ended = self.receiver_status(0);
-            ended
-                .status
-                .applications
-                .retain(|app| app.transport_id != transport);
+        let mut ended = self.receiver_status(0);
+        ended
+            .status
+            .applications
+            .retain(|app| app.transport_id != transport);
+        for previous in &previous_owners {
             let platform_senders: Vec<_> = self
                 .platform_subscriptions
                 .iter()
-                .filter(|(connection, _)| *connection == previous)
+                .filter(|(connection, _)| connection == previous)
                 .map(|(_, sender)| sender.clone())
                 .collect();
             for sender in platform_senders {
-                self.send_to(previous, RECEIVER_0, &sender, ns::RECEIVER, &ended)
+                self.send_to(*previous, RECEIVER_0, &sender, ns::RECEIVER, &ended)
                     .await;
             }
         }
@@ -2002,7 +2460,7 @@ impl DeviceHub {
         }
         tracing::info!(
             session_id = transport,
-            ?previous_owner,
+            ?previous_owners,
             new_owner = conn_id,
             "active sender handshake claimed session"
         );
@@ -2015,6 +2473,7 @@ impl DeviceHub {
                 AppJob::SenderConnected {
                     ctx,
                     sender_id: source.to_owned(),
+                    attachment: SenderAttachment::Takeover,
                 },
             )
             .await;
@@ -2026,7 +2485,26 @@ impl DeviceHub {
             .sessions
             .get(transport)
             .is_some_and(|session| session.app.exclusive_sender_takeover())
-            || self.session_owners.get(transport) == Some(&conn_id)
+            || self
+                .sessions
+                .get(transport)
+                .is_some_and(|session| session.owner_connections.contains(&conn_id))
+    }
+
+    /// Receiver-level volume is intentionally available to passive observers
+    /// such as Home Assistant. Only a connection or network identity already
+    /// proven to belong to a displaced exclusive owner is denied.
+    fn sender_is_superseded(&self, conn_id: u64, source: &str) -> bool {
+        let fingerprint = self.sender_fingerprint(conn_id, source);
+        self.sessions.values().any(|session| {
+            session.superseded_senders.contains(&conn_id)
+                || fingerprint.as_ref().is_some_and(|fingerprint| {
+                    session.superseded_sender_fingerprints.contains(fingerprint)
+                        || session
+                            .superseded_peer_hosts
+                            .contains(&fingerprint.peer_host)
+                })
+        })
     }
 
     /// Basic transport controls do not acquire app/playlist ownership. Require
@@ -2039,15 +2517,28 @@ impl DeviceHub {
         source: &str,
         payload: &Value,
     ) -> bool {
-        matches!(payload["type"].as_str(), Some("PLAY" | "PAUSE" | "SEEK"))
-            && self
-                .subscriptions
-                .get(&(conn_id, source.to_owned()))
-                .map(String::as_str)
-                == Some(transport)
+        let Some(fingerprint) = self.sender_fingerprint(conn_id, source) else {
+            return false;
+        };
+        matches!(
+            payload["type"].as_str(),
+            Some("PLAY" | "PAUSE" | "SEEK" | "STOP" | "SET_VOLUME" | "QUEUE_UPDATE")
+        ) && self
+            .subscriptions
+            .get(&(conn_id, source.to_owned()))
+            .map(String::as_str)
+            == Some(transport)
             && self.sessions.get(transport).is_some_and(|session| {
                 !session.superseded_senders.contains(&conn_id)
+                    && !session
+                        .superseded_sender_fingerprints
+                        .contains(&fingerprint)
+                    && !session
+                        .superseded_peer_hosts
+                        .contains(&fingerprint.peer_host)
                     && session.coordinator.current_media.is_some()
+                    && (payload["type"] != "QUEUE_UPDATE"
+                        || session.app.supports_queue_navigation())
                     && payload["mediaSessionId"].as_i64()
                         == Some(session.coordinator.media_session_id)
             })

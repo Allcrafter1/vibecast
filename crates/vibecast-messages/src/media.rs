@@ -19,6 +19,13 @@ pub mod media_command {
     pub const STREAM_VOLUME: i64 = 4;
     /// Stream mute is supported.
     pub const STREAM_MUTE: i64 = 8;
+    /// Advance to the next queue item.
+    pub const QUEUE_NEXT: i64 = 64;
+    /// Return to the previous queue item.
+    pub const QUEUE_PREVIOUS: i64 = 128;
+
+    /// Queue navigation commands advertised by apps with a real queue.
+    pub const QUEUE_NAVIGATION: i64 = QUEUE_NEXT | QUEUE_PREVIOUS;
 
     /// Commands offered while IDLE (no PAUSE — nothing to pause).
     pub const IDLE: i64 = SEEK | STREAM_VOLUME;
@@ -155,6 +162,18 @@ pub struct QueueGetItemIdsRequest {
     pub media_session_id: Option<i64>,
 }
 
+/// QUEUE_UPDATE request used by Cast controllers for next/previous.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueUpdateRequest {
+    /// Request id.
+    pub request_id: i64,
+    /// Media session id.
+    pub media_session_id: i64,
+    /// Relative queue movement (`1` = next, `-1` = previous).
+    pub jump: i64,
+}
+
 /// Discriminated union of inbound media namespace requests.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -177,6 +196,8 @@ pub enum MediaRequest {
     QueueLoad(QueueLoadRequest),
     /// QUEUE_GET_ITEM_IDS.
     QueueGetItemIds(QueueGetItemIdsRequest),
+    /// QUEUE_UPDATE.
+    QueueUpdate(QueueUpdateRequest),
 }
 
 impl MediaRequest {
@@ -193,6 +214,7 @@ impl MediaRequest {
             MediaRequest::SetVolume(r) => r.request_id,
             MediaRequest::QueueLoad(r) => r.request_id,
             MediaRequest::QueueGetItemIds(r) => r.request_id,
+            MediaRequest::QueueUpdate(r) => r.request_id,
         }
     }
 }
@@ -391,6 +413,19 @@ mod tests {
         .unwrap();
         assert_eq!(request.request_id(), 3);
         assert!(matches!(request, MediaRequest::Seek(_)));
+    }
+
+    #[test]
+    fn parses_queue_update_and_reports_request_id() {
+        let request: MediaRequest = serde_json::from_value(json!({
+            "type": "QUEUE_UPDATE", "requestId": 4, "mediaSessionId": 2, "jump": -1
+        }))
+        .unwrap();
+        assert_eq!(request.request_id(), 4);
+        assert!(matches!(
+            request,
+            MediaRequest::QueueUpdate(QueueUpdateRequest { jump: -1, .. })
+        ));
     }
 
     #[test]
